@@ -54,8 +54,8 @@ pub(crate) enum EffectiveVerdict {
 /// One policy verdict an enforcement point observed, with what it was about.
 #[derive(Clone)]
 pub(crate) struct ObservedDecision {
-    action: String,
-    resource: String,
+    pub(crate) action: String,
+    pub(crate) resource: String,
     decision: Decision,
 }
 
@@ -294,6 +294,17 @@ impl ObservationCapture {
     /// the last permit stands when every leg allowed.
     pub(crate) fn last(self) -> Option<ObservedDecision> {
         self.finish().pop()
+    }
+
+    /// The deciding verdict, where a permitting pack refinement defers to the `shell:spawn`
+    /// permit beneath it and a refusing one stands.
+    pub(crate) fn deciding(self) -> Option<ObservedDecision> {
+        let mut observed = self.finish();
+        let last = observed.pop()?;
+        if last.action.starts_with("Pack::") && last.decision.is_allow() {
+            return observed.pop().or(Some(last));
+        }
+        Some(last)
     }
 
     fn finish(mut self) -> Vec<ObservedDecision> {

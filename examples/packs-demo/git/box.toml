@@ -1,0 +1,22 @@
+# Rendered by demo.sh: <DEMO> becomes the scratch directory.
+name = "packs-demo-git"
+box_dir = "<DEMO>/state"
+policy = "policy.dw"
+packs = ["git.pack.toml"]
+
+[agent]
+command = ["/bin/bash", "-c", """
+zsh -c 'git status --short --branch; echo "git status exit=$?"'
+zsh -c 'git push origin main; echo "git push exit=$?"'
+zsh -c 'git log --oneline -1; echo "git log (unmodeled) exit=$?"'
+"""]
+workspace = "<DEMO>/work/repo"
+env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
+
+[tool.git]
+command = ["/usr/bin/git"]
+env = { HOME = "<DEMO>/home" }
+
+[tool.git.filesystem]
+read = ["<DEMO>/work", "<DEMO>/home"]
+write = ["<DEMO>/work"]

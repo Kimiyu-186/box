@@ -373,6 +373,42 @@ impl EffectInterceptor for ShellPolicyInterceptor {
             }
         };
 
+        // A permitted spawn of a program a pack binds is decided a second time, as the pack action.
+        let decision = match (effect, decision) {
+            (
+                EffectAttempt::ShellSpawn {
+                    program,
+                    program_path,
+                    args,
+                    cwd,
+                    ..
+                },
+                allowed @ Decision::Allow { .. },
+            ) => match self.policy.pack_bound_to(program_path) {
+                Some(pack) => {
+                    let parsed = pack.grammar().parse(args, Path::new(cwd));
+                    let refined = self.policy.refine_pack_action(
+                        &self.governed,
+                        &self.principal,
+                        &crate::pack::PackInvocation {
+                            pack,
+                            parsed: &parsed,
+                            program,
+                            program_path: reported_program_path.as_deref().unwrap_or(program_path),
+                            args,
+                            cwd,
+                        },
+                    );
+                    match refined {
+                        Decision::Allow { .. } => allowed,
+                        denied => denied,
+                    }
+                }
+                None => allowed,
+            },
+            (_, decision) => decision,
+        };
+
         match decision {
             Decision::Allow { .. } => Ok(Box::new(PolicyEffectPermit {
                 policy: Arc::clone(&self.policy),

@@ -1,0 +1,16 @@
+# A minimal git pack. The shell grammar is literal for now: `git push ...` is the push action.
+pack = "git"
+program = "git"
+
+[effects]
+force_push = "Replaces commits on a remote branch"
+
+[shell.push]
+usage = "git push [options] [<remote> [<refspec>...]]"
+options.force            = { flag = ["-f", "--force"], adds = ["force_push"] }
+options.force_with_lease = { flag = ["--force-with-lease"], value = "optional", adds = ["force_push"] }
+options.dry_run          = { flag = ["-n", "--dry-run"], removes = ["force_push"] }
+operands.refspec         = { like = "+*", adds = ["force_push"] }
+
+[shell.status]
+usage = "git status [options]"

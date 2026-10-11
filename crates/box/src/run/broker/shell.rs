@@ -349,7 +349,7 @@ fn mutates(operation: FsOperation) -> bool {
 }
 
 struct DecisionSubject {
-    action: &'static str,
+    action: std::borrow::Cow<'static, str>,
     resource: String,
     /// What the decision was about, under the standard names. `None` where the resource says it all.
     reported: Option<telemetry::Subject>,
@@ -364,7 +364,7 @@ fn decision_subject(effect: &EffectAttempt<'_>, home: Option<&Path>) -> Option<D
             cwd,
             ..
         } => Some(DecisionSubject {
-            action: r#"Box::Action::"shell:exec""#,
+            action: r#"Box::Action::"shell:exec""#.into(),
             resource: (*program).to_string(),
             reported: Some(telemetry::Subject::process(program, args, literal, cwd)),
         }),
@@ -375,7 +375,7 @@ fn decision_subject(effect: &EffectAttempt<'_>, home: Option<&Path>) -> Option<D
             cwd,
             ..
         } => Some(DecisionSubject {
-            action: r#"Box::Action::"shell:spawn""#,
+            action: r#"Box::Action::"shell:spawn""#.into(),
             resource: reported_path(program_path, home),
             reported: Some(telemetry::Subject::process(
                 &reported_path(program_path, home),
@@ -390,7 +390,7 @@ fn decision_subject(effect: &EffectAttempt<'_>, home: Option<&Path>) -> Option<D
             ..
         } => None,
         EffectAttempt::Filesystem { path, operation } => Some(DecisionSubject {
-            action: fs_action(*operation),
+            action: fs_action(*operation).into(),
             resource: reported_path(path, home),
             reported: None,
         }),
@@ -399,7 +399,8 @@ fn decision_subject(effect: &EffectAttempt<'_>, home: Option<&Path>) -> Option<D
                 strands_shell::FsPairOperation::Rename { .. } => r#"Box::Action::"fs:move""#,
                 strands_shell::FsPairOperation::Symlink => r#"Box::Action::"fs:write""#,
                 _ => r#"Box::Action::"fs:other""#,
-            },
+            }
+            .into(),
             resource: reported_path(to, home),
             reported: None,
         }),
@@ -453,7 +454,17 @@ impl EffectInterceptor for ReachFloor {
             // it first would let an unreachable path skip the decision — so a rule counting
             let capture = ObservationCapture::begin();
             let intercepted = self.inner.intercept(effect).await;
-            let determined = capture.last();
+            let determined = capture.deciding();
+            // A pack refinement names its own action, not `shell:spawn`.
+            let subject = subject.map(|mut subject| {
+                if let Some(observed) = &determined
+                    && observed.action.starts_with("Pack::")
+                {
+                    subject.action = observed.action.clone().into();
+                    subject.resource = observed.resource.clone();
+                }
+                subject
+            });
             let permit = match intercepted {
                 Ok(permit) => permit,
                 Err(error) => {
