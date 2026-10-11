@@ -1,23 +1,23 @@
-# Rendered by demo.sh: <DEMO> becomes the scratch directory, and <DEVELOPER_DIR> the macOS developer
-# tools that the /usr/bin/git shim runs (`xcode-select -p`).
+# Rendered by demo.sh: <DEMO> becomes the scratch directory, <DEVELOPER_DIR> the macOS developer
+# tools that the /usr/bin/git shim runs (`xcode-select -p`), and the AGENT_SCRIPT marker the commands of
+# the chosen mode. The pack is the full example pack, examples/packs/git.pack.toml.
 name = "packs-demo-git"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
 packs = ["git.pack.toml"]
 
 [agent]
-command = ["/bin/bash", "-c", """
-zsh -c 'git status --short --branch; echo "git status exit=$?"'
-zsh -c 'git push origin main; echo "git push exit=$?"'
-zsh -c 'git log --oneline -1; echo "git log (unmodeled) exit=$?"'
-"""]
+command = ["/bin/bash", "-c", '''
+run() { zsh -c "$1"; echo "    -> exit=$? : $1"; }
+<AGENT_SCRIPT>
+''']
 workspace = "<DEMO>/work/repo"
 env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
 
 [tool.git]
 command = ["/usr/bin/git"]
-env = { HOME = "<DEMO>/home", DEVELOPER_DIR = "<DEVELOPER_DIR>" }
+env = { HOME = "<DEMO>/home", DEVELOPER_DIR = "<DEVELOPER_DIR>", TMPDIR = "<DEMO>/tmp" }
 
 [tool.git.filesystem]
-read = ["<DEMO>/work", "<DEMO>/home", "<DEVELOPER_DIR>"]
-write = ["<DEMO>/work"]
+read = ["<DEMO>/work", "<DEMO>/home", "<DEMO>/tmp", "<DEVELOPER_DIR>"]
+write = ["<DEMO>/work", "<DEMO>/tmp"]

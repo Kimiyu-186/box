@@ -1,0 +1,24 @@
+# Rendered by demo.sh: <DEMO> becomes the scratch directory, <AWS_HOME> the AWS CLI v2 install
+# directory that /usr/local/bin/aws links to, and the AGENT_SCRIPT marker the commands to run.
+# The pack is the full example pack, examples/packs/aws.pack.toml. The credentials are dummies,
+# and every endpoint is 127.0.0.1:9, so no command reaches AWS: the demo shows the decision.
+name = "packs-demo-aws"
+box_dir = "<DEMO>/state"
+policy = "policy.dw"
+packs = ["aws.pack.toml"]
+
+[agent]
+command = ["/bin/bash", "-c", '''
+run() { zsh -c "$1"; echo "    -> exit=$? : $1"; }
+<AGENT_SCRIPT>
+''']
+workspace = "<DEMO>/work"
+env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
+
+[tool.aws]
+command = ["<AWS_HOME>/aws"]
+env = { HOME = "<DEMO>/home", TMPDIR = "<DEMO>/tmp", AWS_ACCESS_KEY_ID = "AKIAEXAMPLEDUMMY0000", AWS_SECRET_ACCESS_KEY = "dummy-secret-not-real", AWS_DEFAULT_REGION = "us-east-1", AWS_ENDPOINT_URL = "http://127.0.0.1:9", AWS_EC2_METADATA_DISABLED = "true", AWS_PAGER = "", AWS_MAX_ATTEMPTS = "1", AWS_CONFIG_FILE = "<DEMO>/home/aws-config", AWS_SHARED_CREDENTIALS_FILE = "<DEMO>/home/aws-credentials" }
+
+[tool.aws.filesystem]
+read = ["<DEMO>/work", "<DEMO>/home", "<DEMO>/tmp", "<AWS_HOME>"]
+write = ["<DEMO>/home", "<DEMO>/tmp"]

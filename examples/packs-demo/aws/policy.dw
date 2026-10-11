@@ -1,0 +1,24 @@
+// The Strands Shell may run its builtins, and may start aws.
+@id("shell_builtins")
+permit (principal, action == Box::Action::"shell:exec", resource);
+
+@id("spawn_aws")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program == "aws" };
+
+@id("demo_read")
+permit (principal, action == Box::Action::"fs:read", resource)
+when { context.input.path like "*packs-demo-aws*" };
+
+@id("dev_null")
+permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
+when { context.input.path == "/dev/null" };
+
+// One rule over an effect, for every aws action that raises it.
+@id("no_data_deletion")
+@description("The agent may not delete data in AWS.")
+forbid (principal, action, resource)
+when {
+  context.input has effects &&
+  context.input.effects.contains(Pack::aws::Effect::"delete_data")
+};

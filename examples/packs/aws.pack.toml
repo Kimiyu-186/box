@@ -1,5 +1,5 @@
 # Draft pack for the AWS CLI v2 (checked against aws-cli 2.36 `help` synopses).
-# Extensions to design.md section 3 are marked "EXT-n"; GRAMMAR-NOTES.md defines each one.
+# Keys beyond design.md section 3 are marked "EXT-n"; crates/policy/src/pack/grammar.rs reads them.
 #
 # Shape: `aws [global options] <service> <operation> [parameters]`. An action is one
 # service/operation pair. Its usage line names both words as literals (EXT-3 lets literals be
@@ -10,7 +10,7 @@
 # Every aws parameter is a long option. aws accepts `--opt value` and `--opt=value`, and
 # global options anywhere on the line, also between the service and the operation.
 # aws (argparse) also accepts any unique prefix of an option (`--dry` for `--dryrun`).
-# The parser does not, so a prefix makes the line unmodeled. GRAMMAR-NOTES.md, "Abbreviations".
+# The parser does not, so a prefix makes the line unmodeled. No prefix matching.
 #
 # Not seen by the parser (L1): AWS_PROFILE, AWS_REGION, AWS_ENDPOINT_URL, ~/.aws/config
 # (profiles, `endpoint_url`, `cli_pager`, aliases in ~/.aws/cli/alias), and the contents of a

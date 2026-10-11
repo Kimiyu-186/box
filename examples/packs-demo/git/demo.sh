@@ -1,16 +1,18 @@
 #!/bin/bash
-# Run the git pack demo in a real box.
+# Run the git pack demo in a real box, with the full pack in examples/packs/git.pack.toml.
 #
-#   demo.sh forbid   # the policy forbids Pack::git::Action::"push": status runs, push is refused
-#   demo.sh allow    # the same box without the forbid: the push reaches the bare remote
-#   demo.sh nopack   # the forbid stays but box.toml installs no pack: the box refuses to start
-#   demo.sh unmodeled  # also forbid Pack::git::Action::"unmodeled": `git log` is refused
-#   demo.sh baseline # no pack and no pack rule: every command decides as it does without packs
+#   demo.sh force      # no_force_push: every force spelling is refused; -n -f and a plain push run
+#   demo.sh upstream   # a forbid on remote == "upstream": pushes to upstream are refused
+#   demo.sh forbid     # forbid Pack::git::Action::"push": status runs, push is refused
+#   demo.sh allow      # no pack rule: the push reaches the bare remote
+#   demo.sh nopack     # the push forbid stays but box.toml installs no pack: the box refuses to start
+#   demo.sh unmodeled  # forbid Pack::git::Action::"unmodeled": `git log -1` (the -<n> form) is refused
+#   demo.sh baseline   # no pack and no pack rule: every command decides as it does without packs
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
 # DEMO names the scratch directory (default: /tmp/packs-demo-git). Both are recreated per run.
 set -eu
-MODE=${1:-forbid}
+MODE=${1:-force}
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 REPO_ROOT=$(cd "$HERE/../../.." && pwd -P)
 BOX=${BOX:-$REPO_ROOT/target/release/strands-box}
@@ -21,57 +23,91 @@ case "$DEMO" in
 esac
 
 rm -rf "$DEMO"
-mkdir -p "$DEMO/config" "$DEMO/home" "$DEMO/work"
+mkdir -p "$DEMO/config" "$DEMO/home" "$DEMO/work" "$DEMO/tmp"
 DEMO=$(cd "$DEMO" && pwd -P)
 
-# A scratch repository with one commit, and a bare remote a push would really update.
+# A scratch repository whose main is pushed to origin, plus one unpushed commit, so a plain
+# `git push` has work to do. `upstream` is a second bare remote.
+G="git -c user.name=demo -c user.email=demo@example.com"
 git init -q --bare "$DEMO/work/remote.git"
+git init -q --bare "$DEMO/work/upstream.git"
 git init -q -b main "$DEMO/work/repo"
 cd "$DEMO/work/repo" || exit 1
-git -c user.name=demo -c user.email=demo@example.com commit -q --allow-empty -m "first commit"
+$G commit -q --allow-empty -m "first commit"
 git remote add origin "$DEMO/work/remote.git"
+git remote add upstream "$DEMO/work/upstream.git"
+git push -q -u origin main
+$G commit -q --allow-empty -m "second commit"
 cd "$DEMO" || exit 1
+
+case "$MODE" in
+  force)
+    RULES='@id("no_force_push")
+@description("Force pushes are not allowed.")
+forbid (principal, action == Pack::git::Action::"push", resource)
+when { context.input.effects.contains(Pack::git::Effect::"force_push") };'
+    SCRIPT='run "git push -f origin main"
+run "git push --force origin main"
+run "git push --force-with-lease origin main"
+run "git push -uf origin main"
+run "git push origin +main"
+run "cd .. && git -C repo push -f origin main"
+run "git push -n -f origin main"
+run "git push"' ;;
+  upstream)
+    RULES='@id("no_upstream")
+@description("Nothing is pushed to upstream.")
+forbid (principal, action == Pack::git::Action::"push", resource)
+when { context.input has remote && context.input.remote == "upstream" };'
+    SCRIPT='run "git push upstream main"
+run "cd .. && git -C repo push upstream"
+run "git push origin main"' ;;
+  forbid|nopack)
+    RULES='@id("no_push")
+@description("Pushes are not allowed in this box.")
+forbid (principal, action == Pack::git::Action::"push", resource);'
+    SCRIPT='run "git status --short --branch"
+run "git push origin main"' ;;
+  unmodeled)
+    RULES='@id("no_unmodeled_git")
+forbid (principal, action == Pack::git::Action::"unmodeled", resource);'
+    SCRIPT='run "git status --short --branch"
+run "git log -1 --oneline"
+run "git log -n 1 --oneline"' ;;
+  allow|baseline)
+    RULES=''
+    SCRIPT='run "git status --short --branch"
+run "git push origin main"' ;;
+  *) echo "unknown mode $MODE" >&2; exit 1 ;;
+esac
 
 # macOS: the /usr/bin/git shim runs the developer tools' git. Elsewhere, any readable directory.
 DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || echo "$DEMO/config")
-render() { sed -e "s#<DEMO>#$DEMO#g" -e "s#<DEVELOPER_DIR>#$DEVELOPER_DIR#g" "$HERE/$1"; }
-render box.toml > "$DEMO/config/box.toml"
-render policy.dw > "$DEMO/config/policy.dw"
-cp "$HERE/git.pack.toml" "$DEMO/config/git.pack.toml"
+python3 - "$HERE" "$DEMO" "$DEVELOPER_DIR" "$SCRIPT" "$RULES" <<'PY'
+import sys
+here, demo, developer, script, rules = sys.argv[1:]
+def render(name):
+    text = open(f"{here}/{name}").read()
+    return text.replace("<DEMO>", demo).replace("<DEVELOPER_DIR>", developer).replace("<AGENT_SCRIPT>", script)
+open(f"{demo}/config/box.toml", "w").write(render("box.toml"))
+open(f"{demo}/config/policy.dw", "w").write(render("policy.dw") + rules + "\n")
+PY
+cp "$REPO_ROOT/examples/packs/git.pack.toml" "$DEMO/config/git.pack.toml"
 case "$MODE" in
-  forbid) ;;
-  allow) sed -i.bak '/@id("no_push")/,$d' "$DEMO/config/policy.dw" ;;
-  nopack) sed -i.bak '/^packs = /d' "$DEMO/config/box.toml" ;;
-  unmodeled) printf '\n@id("no_unmodeled_git")\nforbid (principal, action == Pack::git::Action::"unmodeled", resource);\n' >> "$DEMO/config/policy.dw" ;;
-  baseline)
-    sed -i.bak '/^packs = /d' "$DEMO/config/box.toml"
-    sed -i.bak '/@id("no_push")/,$d' "$DEMO/config/policy.dw" ;;
-  *) echo "unknown mode $MODE" >&2; exit 1 ;;
+  nopack|baseline) sed -i.bak '/^packs = /d' "$DEMO/config/box.toml"; rm -f "$DEMO/config/"*.bak ;;
 esac
-rm -f "$DEMO/config/"*.bak
 
 echo "=== mode: $MODE"
-echo "--- policy.dw forbids:"; grep -n "forbid" "$DEMO/config/policy.dw" || echo "(no forbid)"
+echo "--- policy.dw mode rules:"; sed -n '/MODE RULES/,$p' "$DEMO/config/policy.dw" | tail -n +2 | sed 's/^/    /'
 echo "--- box.toml packs:"; grep -n "^packs" "$DEMO/config/box.toml" || echo "(no packs key)"
 echo "--- strands-box run"
 set +e
-"$BOX" run --config "$DEMO/config/box.toml"
-status=$?
+# The startup disclosure of filesystem grants is long; FULL=1 shows it.
+"$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
+  grep -Ev '^strands-box: \[|^  (read|write|metadata|exec|enter|list|deny|read_file|write_file|\(no) '; fi
+status=${PIPESTATUS[0]}
 set -e
 echo "--- strands-box exit=$status"
-echo "--- policy decision records naming git (action, category, verdict, rule, args):"
-python3 - "$DEMO/state/private/telemetry/records.jsonl" <<'PY' || echo "(could not read records)"
-import json, sys
-for line in open(sys.argv[1]):
-    for batch in json.loads(line).get("resourceLogs", []):
-        for scope in batch["scopeLogs"]:
-            for record in scope["logRecords"]:
-                a = {x["key"]: x["value"] for x in record["attributes"]}
-                get = lambda k: a.get(k, {}).get("stringValue", "")
-                args = [v.get("stringValue") for v in a.get("process.command_args", {}).get("arrayValue", {}).get("values", [])]
-                if "git" not in " ".join(args or [""]):
-                    continue
-                print(" ", get("strands.box.policy.action"), "|", get("strands.box.policy.category"), "|",
-                      get("strands.box.policy.verdict"), "|", get("strands.box.policy.rule"), "|", " ".join(args))
-PY
-echo "--- remote main after the run: $(git --git-dir="$DEMO/work/remote.git" rev-parse --verify -q main || echo '<none>')"
+python3 "$REPO_ROOT/examples/packs-demo/records.py" "$DEMO/state/private/telemetry/records.jsonl" git
+echo "--- origin main: $(git --git-dir="$DEMO/work/remote.git" log --oneline -1 main 2>/dev/null || echo '<none>')"
+echo "--- upstream main: $(git --git-dir="$DEMO/work/upstream.git" log --oneline -1 main 2>/dev/null || echo '<none>')"

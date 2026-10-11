@@ -1,0 +1,24 @@
+// The Strands Shell may run its builtins, and may start cargo.
+@id("shell_builtins")
+permit (principal, action == Box::Action::"shell:exec", resource);
+
+@id("spawn_cargo")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program == "cargo" };
+
+@id("demo_read")
+permit (principal, action == Box::Action::"fs:read", resource)
+when { context.input.path like "*packs-demo-cargo*" };
+
+@id("dev_null")
+permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
+when { context.input.path == "/dev/null" };
+
+// One rule over an effect, for every cargo action that raises it.
+@id("lockfile_is_frozen")
+@description("Cargo.lock may not change: pass --locked or --frozen.")
+forbid (principal, action, resource)
+when {
+  context.input has effects &&
+  context.input.effects.contains(Pack::cargo::Effect::"update_lockfile")
+};

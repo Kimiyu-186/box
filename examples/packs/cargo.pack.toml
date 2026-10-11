@@ -1,5 +1,5 @@
 # Draft pack for cargo (checked against cargo 1.98 `--help` and behaviour).
-# Extensions to design.md section 3 are marked "EXT-n"; GRAMMAR-NOTES.md defines each one.
+# Keys beyond design.md section 3 are marked "EXT-n"; crates/policy/src/pack/grammar.rs reads them.
 #
 # Only `--locked` and `--frozen` stop a lockfile write. `--offline` alone does not: cargo can
 # still resolve from the local cache and rewrite Cargo.lock. `--offline` removes `network`.

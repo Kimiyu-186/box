@@ -1,5 +1,5 @@
 # Draft pack for git (checked against git 2.50 behaviour).
-# Extensions to design.md section 3 are marked "EXT-n"; GRAMMAR-NOTES.md defines each one.
+# Keys beyond design.md section 3 are marked "EXT-n"; crates/policy/src/pack/grammar.rs reads them.
 
 pack    = "git"
 program = "git"
@@ -239,7 +239,7 @@ operands.pathspec = {}
 
 # ---------------------------------------------------------------- log
 # The `-<n>` count form (`git log -5`) is not expressible and makes the line unmodeled.
-# Use `-n 5` or `--max-count=5`. GRAMMAR-NOTES.md, "Not proposed".
+# Use `-n 5` or `--max-count=5`. No `-<n>` form.
 [shell.log]
 usage = "git [global options] log [options] [<revision>...] [--] [<path>...]"
 options.max_count     = { flag = ["-n", "--max-count"], value = "required" }

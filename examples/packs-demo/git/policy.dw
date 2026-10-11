@@ -15,7 +15,5 @@ when { context.input.path like "*packs-demo-git*" };
 permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
 when { context.input.path == "/dev/null" };
 
-// The pack refines the spawn: a push is refused.
-@id("no_push")
-@description("Pushes are not allowed in this box.")
-forbid (principal, action == Pack::git::Action::"push", resource);
+// demo.sh appends the rules of the chosen mode below this line.
+// MODE RULES
