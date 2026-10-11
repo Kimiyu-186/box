@@ -170,6 +170,7 @@ impl Pack {
         }
         let base = "program: String, program_path: String, cwd: String, args: Set<String>, \
                     effects: Set<Effect>";
+        let _ = writeln!(schema, "  type Output = {{ status: Long }};");
         let typed = self.grammar.action_fields();
         let unmodeled: (&str, Vec<(&str, FieldKind)>) = (UNMODELED_ACTION, Vec::new());
         for (action, fields) in typed.iter().chain(std::iter::once(&unmodeled)) {
@@ -185,7 +186,7 @@ impl Pack {
             let _ = writeln!(
                 schema,
                 "  action {action:?} appliesTo {{\n    principal: [Box::Agent],\n    \
-                 resource: [Box::Resource],\n    context: {{ input: {action}Input }}\n  }};"
+                 resource: [Box::Resource],\n    context: {{ input: {action}Input, output?: Output }}\n  }};"
             );
         }
         schema.push_str("}\n");
@@ -247,6 +248,24 @@ fn field_json(value: &FieldValue) -> serde_json::Value {
         FieldValue::Bool(value) => serde_json::Value::Bool(*value),
         FieldValue::String(value) => serde_json::Value::String(value.clone()),
         FieldValue::Set(values) => serde_json::json!(values),
+    }
+}
+
+/// What a permitted pack action needs to record its `::response` once the command ends.
+#[derive(Debug, Clone)]
+pub(crate) struct PackResponse {
+    pub(crate) pack: String,
+    pub(crate) action: String,
+    pub(crate) input: serde_json::Value,
+}
+
+impl PackInvocation<'_> {
+    pub(crate) fn response(&self) -> PackResponse {
+        PackResponse {
+            pack: self.pack.name().to_string(),
+            action: self.action().to_string(),
+            input: self.input(),
+        }
     }
 }
 

@@ -376,6 +376,20 @@ impl Authority {
         live.engine.observe_outcome(governed, principal, outcome)
     }
 
+    /// Records the `::response` of one completed pack action.
+    pub(super) fn record_pack_response(
+        &self,
+        identity: &ActionIdentity,
+        input: &serde_json::Value,
+        status: i32,
+    ) -> Result<(), PolicyError> {
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| PolicyError::Evaluation("policy authority lock poisoned".to_string()))?;
+        live.engine.observe_pack_response(identity, input, status)
+    }
+
     /// Returns whether the live authority declares a tool action, or true when its lock is unavailable.
     pub(super) fn declares_tool_action(&self, action: &cedar_policy::EntityUid) -> bool {
         match self.live.lock() {

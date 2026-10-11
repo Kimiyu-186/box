@@ -1,0 +1,9 @@
+# A minimal git pack. The shell grammar is literal: `git push ...` is the push action.
+pack = "git"
+program = "git"
+
+[shell.push]
+usage = "git push [options] [<remote> [<refspec>...]]"
+
+[shell.status]
+usage = "git status [options]"
