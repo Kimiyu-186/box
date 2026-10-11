@@ -1,0 +1,26 @@
+// The Strands Shell may run its builtins, and may start git and cargo.
+@id("shell_builtins")
+permit (principal, action == Box::Action::"shell:exec", resource);
+
+@id("spawn_git")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program == "git" };
+
+@id("spawn_cargo")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program == "cargo" };
+
+// The shell reads the demo tree, so it can enter the repository.
+@id("demo_read")
+permit (principal, action == Box::Action::"fs:read", resource)
+when { context.input.path like "*packs-demo-temporal*" };
+
+@id("dev_null")
+permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
+when { context.input.path == "/dev/null" };
+
+// A push needs a passing `cargo test` (or `cargo t`) in the last hour.
+@id("push_after_tests")
+@description("Run the tests first: git push needs a passing cargo test in the last hour.")
+forbid (principal, action == Pack::git::Action::"push", resource)
+unless temporal { formerly within 1h (Pack::cargo::Action::"test"::response{ output.status: 0 }) };

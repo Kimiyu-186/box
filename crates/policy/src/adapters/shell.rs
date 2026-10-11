@@ -374,6 +374,7 @@ impl EffectInterceptor for ShellPolicyInterceptor {
         };
 
         // A permitted spawn of a program a pack binds is decided a second time, as the pack action.
+        let mut pack_response = None;
         let decision = match (effect, decision) {
             (
                 EffectAttempt::ShellSpawn {
@@ -387,20 +388,24 @@ impl EffectInterceptor for ShellPolicyInterceptor {
             ) => match self.policy.pack_bound_to(program_path) {
                 Some(pack) => {
                     let parsed = pack.grammar().parse(args, Path::new(cwd));
+                    let invocation = crate::pack::PackInvocation {
+                        pack,
+                        parsed: &parsed,
+                        program,
+                        program_path: reported_program_path.as_deref().unwrap_or(program_path),
+                        args,
+                        cwd,
+                    };
                     let refined = self.policy.refine_pack_action(
                         &self.governed,
                         &self.principal,
-                        &crate::pack::PackInvocation {
-                            pack,
-                            parsed: &parsed,
-                            program,
-                            program_path: reported_program_path.as_deref().unwrap_or(program_path),
-                            args,
-                            cwd,
-                        },
+                        &invocation,
                     );
                     match refined {
-                        Decision::Allow { .. } => allowed,
+                        Decision::Allow { .. } => {
+                            pack_response = Some(invocation.response());
+                            allowed
+                        }
                         denied => denied,
                     }
                 }
@@ -418,6 +423,7 @@ impl EffectInterceptor for ShellPolicyInterceptor {
                     effect,
                     credential_reads,
                     reported_program_path.as_deref(),
+                    pack_response,
                 ),
                 home: self.home.clone(),
             })),
@@ -446,6 +452,8 @@ enum Admitted {
         credential_reads: Vec<String>,
         args: Vec<String>,
         cwd: String,
+        /// The pack action this spawn also completes, if a pack binds its program.
+        pack: Option<crate::pack::PackResponse>,
     },
     /// One filesystem effect. A two-path operation is recorded against its *target* —
     /// the path the effect mutates — under the same operation both legs were authorized
@@ -471,6 +479,7 @@ impl Admitted {
         effect: &EffectAttempt<'_>,
         credential_reads: &[String],
         reported_program_path: Option<&str>,
+        pack: Option<crate::pack::PackResponse>,
     ) -> Self {
         match effect {
             EffectAttempt::ShellRun {
@@ -499,6 +508,7 @@ impl Admitted {
                 credential_reads: credential_reads.to_vec(),
                 args: args.to_vec(),
                 cwd: (*cwd).to_string(),
+                pack,
             },
             EffectAttempt::Filesystem { path, operation } => Self::Filesystem {
                 path: (*path).to_string(),
@@ -608,19 +618,28 @@ impl PolicyEffectPermit {
                 credential_reads,
                 args,
                 cwd,
-            } => self.policy.record(
-                &self.governed,
-                &self.principal,
-                &Outcome::ShellSpawn {
-                    command,
-                    program,
-                    program_path,
-                    credential_reads,
-                    args,
-                    cwd,
-                    status: reported_status.unwrap_or(-1),
-                },
-            ),
+                pack,
+            } => self
+                .policy
+                .record(
+                    &self.governed,
+                    &self.principal,
+                    &Outcome::ShellSpawn {
+                        command,
+                        program,
+                        program_path,
+                        credential_reads,
+                        args,
+                        cwd,
+                        status: reported_status.unwrap_or(-1),
+                    },
+                )
+                .and_then(|()| match pack {
+                    Some(pack) => self
+                        .policy
+                        .record_pack_response(pack, reported_status.unwrap_or(-1)),
+                    None => Ok(()),
+                }),
             // **The REPORTED spelling, so both events agree.** The request event carries
             // `~/<relative>` and the resolution event is built from this one — and the engine keeps
             // them in two separate bags, so a value written to one and not the other leaves a

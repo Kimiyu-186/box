@@ -227,6 +227,21 @@ impl PolicyEngine {
         decision
     }
 
+    /// Record the `::response` of one completed pack action, with its exit status.
+    #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+    pub(crate) fn record_pack_response(
+        &self,
+        response: &crate::pack::PackResponse,
+        status: i32,
+    ) -> Result<(), PolicyError> {
+        let identity = crate::schema::ActionIdentity::PackAction {
+            pack: response.pack.clone(),
+            action: response.action.clone(),
+        };
+        self.authority
+            .record_pack_response(&identity, &response.input, status)
+    }
+
     /// Open with a fault injector on the durable log, for tests that pause the store.
     #[cfg(test)]
     pub(crate) fn open_with_faults(

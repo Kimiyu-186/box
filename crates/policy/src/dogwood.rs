@@ -443,6 +443,21 @@ impl DogwoodEngine {
             .map_err(PolicyError::Evaluation)
     }
 
+    /// Submit the `::response` of one completed pack action.
+    pub(crate) fn observe_pack_response(
+        &self,
+        identity: &ActionIdentity,
+        input: &serde_json::Value,
+        status: i32,
+    ) -> Result<(), PolicyError> {
+        self.submit(|| {
+            let builder = with_input(identity.event_builder(KIND_RESPONSE), json_value(input));
+            with_output_fields(builder, vec![(attr::STATUS, Value::Int(i64::from(status)))])
+        })
+        .map(|_| ())
+        .map_err(PolicyError::Evaluation)
+    }
+
     /// Feed one event through the durable engine under the scope lock.
     fn submit(&self, build: impl FnOnce() -> EventBuilder) -> Result<Option<Decision>, String> {
         let mut engine = self

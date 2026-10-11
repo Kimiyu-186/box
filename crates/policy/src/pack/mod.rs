@@ -203,7 +203,8 @@ impl Pack {
         let _ = writeln!(
             schema,
             "  type Input = {{\n    program: String,\n    program_path: String,\n    \
-             cwd: String,\n    args: Set<String>,\n    effects: Set<Effect>\n  }};"
+             cwd: String,\n    args: Set<String>,\n    effects: Set<Effect>\n  }};\n  \
+             type Output = {{ status: Long }};"
         );
         for action in self
             .actions
@@ -214,7 +215,7 @@ impl Pack {
             let _ = writeln!(
                 schema,
                 "  action {action:?} appliesTo {{\n    principal: [Box::Agent],\n    \
-                 resource: [Box::Resource],\n    context: {{ input: Input }}\n  }};"
+                 resource: [Box::Resource],\n    context: {{ input: Input, output?: Output }}\n  }};"
             );
         }
         schema.push_str("}\n");
@@ -273,6 +274,24 @@ impl PackInvocation<'_> {
             }
         }
         input
+    }
+}
+
+/// What a permitted pack action needs to record its `::response` once the command ends.
+#[derive(Debug, Clone)]
+pub(crate) struct PackResponse {
+    pub(crate) pack: String,
+    pub(crate) action: String,
+    pub(crate) input: serde_json::Value,
+}
+
+impl PackInvocation<'_> {
+    pub(crate) fn response(&self) -> PackResponse {
+        PackResponse {
+            pack: self.pack.name().to_string(),
+            action: self.action().to_string(),
+            input: self.input(),
+        }
     }
 }
 
