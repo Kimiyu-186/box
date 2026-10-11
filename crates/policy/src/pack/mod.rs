@@ -1,0 +1,336 @@
+//! Policy packs: an operator-installed action vocabulary for one third-party program.
+//!
+//! | Module | Owns |
+//! |---|---|
+//! | `format` | the `*.pack.toml` document as written |
+//! | `grammar` | the shell grammar that turns a command line into a pack action |
+
+#![cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+
+mod format;
+mod grammar;
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+pub(crate) use grammar::{FieldValue, Parsed, ShellGrammar};
+
+use crate::schema::cedar_identifier;
+
+/// The namespace every pack's vocabulary lives under.
+pub(crate) const PACK_NAMESPACE: &str = "Pack";
+
+/// The action a command for a pack's program raises when no shell action matches it.
+pub(crate) const UNMODELED_ACTION: &str = "unmodeled";
+
+/// A pack file could not be loaded.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("pack {origin}: {reason}")]
+pub struct PackError {
+    origin: String,
+    reason: String,
+}
+
+impl PackError {
+    fn new(origin: &Path, reason: impl Into<String>) -> Self {
+        Self {
+            origin: origin.display().to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// One loaded and validated policy pack.
+#[derive(Debug, Clone)]
+pub struct Pack {
+    origin: PathBuf,
+    name: String,
+    program: String,
+    effects: Vec<String>,
+    actions: Vec<String>,
+    grammar: ShellGrammar,
+}
+
+impl Pack {
+    /// Parse and validate one pack document.
+    pub fn parse(text: &str, origin: &Path) -> Result<Self, PackError> {
+        let file: format::PackFile =
+            toml::from_str(text).map_err(|error| PackError::new(origin, error.to_string()))?;
+        let refuse = |reason: String| Err(PackError::new(origin, reason));
+
+        if !is_identifier(&file.pack) {
+            return refuse(format!(
+                "`pack = {:?}` must be a plain identifier (letters, digits, '_')",
+                file.pack
+            ));
+        }
+        if file.program.is_empty()
+            || file.program.contains('/')
+            || file.program.chars().any(char::is_whitespace)
+        {
+            return refuse(format!(
+                "`program = {:?}` must be one program name, not a path",
+                file.program
+            ));
+        }
+        for effect in file.effects.keys() {
+            if !is_identifier(effect) {
+                return refuse(format!(
+                    "effect {effect:?} must be a plain identifier (letters, digits, '_')"
+                ));
+            }
+        }
+        let declared: BTreeSet<&str> = file.effects.keys().map(String::as_str).collect();
+        let mut grammar_actions = Vec::new();
+        for (action, spec) in &file.shell {
+            if !is_identifier(action) {
+                return refuse(format!(
+                    "`[shell.{action}]` must be named by a plain identifier (letters, digits, '_')"
+                ));
+            }
+            if action == UNMODELED_ACTION {
+                return refuse(format!(
+                    "`[shell.{UNMODELED_ACTION}]` is reserved for a command no action matches"
+                ));
+            }
+            let first = spec.usage.split_whitespace().next().unwrap_or_default();
+            if first != file.program {
+                return refuse(format!(
+                    "`[shell.{action}] usage` starts with {first:?}, but the pack's program is {:?}",
+                    file.program
+                ));
+            }
+            let references = spec
+                .options
+                .iter()
+                .flat_map(|(name, option)| {
+                    option
+                        .adds
+                        .iter()
+                        .chain(&option.removes)
+                        .map(move |effect| (format!("options.{name}"), effect))
+                })
+                .chain(spec.operands.iter().flat_map(|(name, operand)| {
+                    operand
+                        .adds
+                        .iter()
+                        .chain(&operand.removes)
+                        .map(move |effect| (format!("operands.{name}"), effect))
+                }));
+            for (owner, effect) in references {
+                if !declared.contains(effect.as_str()) {
+                    return refuse(format!(
+                        "`[shell.{action}] {owner}` names effect {effect:?}, which `[effects]` \
+                         does not declare"
+                    ));
+                }
+            }
+            for (name, option) in &spec.options {
+                if option
+                    .flag
+                    .spellings()
+                    .iter()
+                    .any(|flag| !flag.starts_with('-'))
+                {
+                    return refuse(format!(
+                        "`[shell.{action}] options.{name}` has a flag that does not start with '-'"
+                    ));
+                }
+            }
+            grammar_actions.push((
+                action.clone(),
+                grammar::subcommand_words(&spec.usage),
+                spec.aliases.clone(),
+            ));
+        }
+
+        Ok(Self {
+            origin: origin.to_path_buf(),
+            name: file.pack,
+            program: file.program,
+            effects: file.effects.into_keys().collect(),
+            actions: file.shell.into_keys().collect(),
+            grammar: ShellGrammar::new(grammar_actions),
+        })
+    }
+
+    /// Where this pack was read from.
+    #[must_use]
+    pub fn origin(&self) -> &Path {
+        &self.origin
+    }
+
+    /// The pack's name, which is its `Pack::<name>` namespace.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The program the pack's shell grammar covers.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The Cedar namespace of this pack's vocabulary.
+    pub(crate) fn namespace(&self) -> String {
+        format!("{PACK_NAMESPACE}::{}", self.name)
+    }
+
+    pub(crate) fn grammar(&self) -> &ShellGrammar {
+        &self.grammar
+    }
+
+    /// The generated Cedar schema fragment for this pack's vocabulary.
+    #[must_use]
+    pub fn schema(&self) -> String {
+        let mut schema = String::new();
+        let namespace = self.namespace();
+        let _ = writeln!(schema, "// Generated from {}", self.origin.display());
+        let _ = writeln!(schema, "namespace {namespace} {{");
+        if self.effects.is_empty() {
+            let _ = writeln!(schema, "  entity Effect;");
+        } else {
+            let values = self
+                .effects
+                .iter()
+                .map(|effect| format!("{effect:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(schema, "  entity Effect enum [{values}];");
+        }
+        let _ = writeln!(
+            schema,
+            "  type Input = {{\n    program: String,\n    program_path: String,\n    \
+             cwd: String,\n    args: Set<String>,\n    effects: Set<Effect>\n  }};"
+        );
+        for action in self
+            .actions
+            .iter()
+            .map(String::as_str)
+            .chain([UNMODELED_ACTION])
+        {
+            let _ = writeln!(
+                schema,
+                "  action {action:?} appliesTo {{\n    principal: [Box::Agent],\n    \
+                 resource: [Box::Resource],\n    context: {{ input: Input }}\n  }};"
+            );
+        }
+        schema.push_str("}\n");
+        schema
+    }
+}
+
+/// One pack-action request, as the shell adapter hands it to the engine.
+pub(crate) struct PackInvocation<'a> {
+    pub(crate) pack: &'a Pack,
+    pub(crate) parsed: &'a Parsed,
+    pub(crate) program: &'a str,
+    pub(crate) program_path: &'a str,
+    pub(crate) args: &'a [String],
+    pub(crate) cwd: &'a str,
+}
+
+impl PackInvocation<'_> {
+    pub(crate) fn action(&self) -> &str {
+        match self.parsed {
+            Parsed::Action { action, .. } => action,
+            Parsed::Unmodeled => UNMODELED_ACTION,
+        }
+    }
+
+    /// The `context.input` record as Cedar's JSON form, entities in `__entity` escapes.
+    pub(crate) fn input(&self) -> serde_json::Value {
+        let effect_type = format!("{}::Effect", self.pack.namespace());
+        let (fields, effects) = match self.parsed {
+            Parsed::Action {
+                fields, effects, ..
+            } => (Some(fields), effects.iter().collect::<Vec<_>>()),
+            Parsed::Unmodeled => (None, Vec::new()),
+        };
+        let mut args = self.args.to_vec();
+        args.sort();
+        args.dedup();
+        let mut input = serde_json::json!({
+            "program": self.program,
+            "program_path": self.program_path,
+            "cwd": self.cwd,
+            "args": args,
+            "effects": effects
+                .into_iter()
+                .map(|effect| serde_json::json!({ "__entity": { "type": effect_type, "id": effect } }))
+                .collect::<Vec<_>>(),
+        });
+        if let (Some(fields), Some(object)) = (fields, input.as_object_mut()) {
+            for (name, value) in fields {
+                let value = match value {
+                    FieldValue::Bool(value) => serde_json::Value::Bool(*value),
+                    FieldValue::String(value) => serde_json::Value::String(value.clone()),
+                    FieldValue::Set(values) => serde_json::json!(values),
+                };
+                object.insert(name.clone(), value);
+            }
+        }
+        input
+    }
+}
+
+fn is_identifier(raw: &str) -> bool {
+    !raw.is_empty() && cedar_identifier(raw) == raw
+}
+
+/// The installed packs, and the resolved program paths each one is bound to.
+#[derive(Debug, Clone, Default)]
+pub struct PackBindings {
+    packs: Vec<std::sync::Arc<Pack>>,
+    by_path: std::collections::BTreeMap<String, usize>,
+}
+
+impl PackBindings {
+    /// Install `packs`, bound to no program yet.
+    #[must_use]
+    pub fn new(packs: Vec<Pack>) -> Self {
+        Self {
+            packs: packs.into_iter().map(std::sync::Arc::new).collect(),
+            by_path: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Bind the pack named `pack` to one resolved program path.
+    pub fn bind(&mut self, program_path: impl Into<String>, pack: &str) {
+        if let Some(index) = self.packs.iter().position(|loaded| loaded.name() == pack) {
+            self.by_path.insert(program_path.into(), index);
+        }
+    }
+
+    /// Every installed pack.
+    #[must_use]
+    pub fn packs(&self) -> &[std::sync::Arc<Pack>] {
+        &self.packs
+    }
+
+    /// The resolved program paths each pack is bound to.
+    #[must_use]
+    pub fn bound_paths(&self) -> Vec<(&str, &str)> {
+        self.by_path
+            .iter()
+            .filter_map(|(path, index)| {
+                self.packs
+                    .get(*index)
+                    .map(|pack| (path.as_str(), pack.name()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn schemas(&self) -> Vec<String> {
+        self.packs.iter().map(|pack| pack.schema()).collect()
+    }
+
+    pub(crate) fn bound_to(&self, program_path: &str) -> Option<&Pack> {
+        self.by_path
+            .get(program_path)
+            .and_then(|index| self.packs.get(*index))
+            .map(std::convert::AsRef::as_ref)
+    }
+}

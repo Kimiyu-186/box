@@ -54,6 +54,9 @@ impl ActionIdentity {
             Self::McpTool { namespace, tool } => {
                 Event::builder_for(&[namespace, "Action"], tool, kind)
             }
+            Self::PackAction { pack, action } => {
+                Event::builder_for(&[crate::pack::PACK_NAMESPACE, pack, "Action"], action, kind)
+            }
         }
     }
 }
@@ -846,6 +849,19 @@ fn json_value(value: &serde_json::Value) -> Value {
             .map_or_else(|| Value::Decimal(value.to_string()), Value::Int),
         serde_json::Value::String(value) => Value::String(value.clone()),
         serde_json::Value::Array(values) => Value::Array(values.iter().map(json_value).collect()),
+        serde_json::Value::Object(values)
+            if values.len() == 1
+                && let Some(serde_json::Value::Object(entity)) = values.get("__entity")
+                && let (
+                    Some(serde_json::Value::String(ty)),
+                    Some(serde_json::Value::String(id)),
+                ) = (entity.get("type"), entity.get("id")) =>
+        {
+            Value::Entity {
+                ty: ty.clone(),
+                id: id.clone(),
+            }
+        }
         serde_json::Value::Object(values) => Value::Object(
             values
                 .iter()

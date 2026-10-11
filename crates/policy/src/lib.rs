@@ -12,6 +12,7 @@ mod error;
 mod mcp_schema;
 mod observe;
 mod outcome;
+mod pack;
 mod path;
 mod policy;
 mod request;
@@ -36,10 +37,12 @@ pub use decision::{Decision, DenyReason, PolicyAttribution, RuleId};
 pub use dogwood::event_schema_source;
 pub use error::{PolicyDiagnostic, PolicyError, PolicyStagingError};
 pub use mcp_schema::{
-    McpSchemaError, compose_action_schema, generate_mcp_schema, validate_mcp_schema_composition,
+    McpSchemaError, compose_action_schema, compose_action_schema_with_packs, generate_mcp_schema,
+    validate_mcp_schema_composition,
 };
 pub use observe::DecisionObserver;
 pub use outcome::{Delivery, FsResult, Outcome};
+pub use pack::{Pack, PackBindings, PackError};
 pub use path::{ApprovedPath, PathRefusal, PathResolver};
 pub use policy::{
     ENGINE_ID, EffectivePolicy, Policy, PolicyEngine, SELF_DEFENDED_FILES, SchemaStage,

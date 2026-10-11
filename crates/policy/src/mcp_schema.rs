@@ -418,6 +418,11 @@ fn validate_mcp_schema_namespaces(
             reason: "the Box namespace is reserved for the canonical policy schema".to_string(),
         });
     }
+    if namespace == crate::pack::PACK_NAMESPACE {
+        return Err(McpSchemaError::Composition {
+            reason: "the Pack namespace is reserved for policy packs".to_string(),
+        });
+    }
     if let Some(server) = server {
         let expected = mcp_action_namespace(server);
         if namespace != &expected {
@@ -601,6 +606,24 @@ pub fn compose_action_schema(generated: &[(&str, &str)]) -> Result<String, McpSc
         })
 }
 
+/// Compose the canonical action schema with installed packs and ordered generated MCP schemas.
+pub fn compose_action_schema_with_packs(
+    generated: &[(&str, &str)],
+    packs: &[crate::pack::Pack],
+) -> Result<String, McpSchemaError> {
+    validate_mcp_schema_composition(generated)?;
+    let fragments = packs
+        .iter()
+        .map(crate::pack::Pack::schema)
+        .chain(generated.iter().map(|(_, source)| (*source).to_string()))
+        .collect::<Vec<_>>();
+    crate::schema::action_schema(&fragments)
+        .map(|schema| schema.source)
+        .map_err(|source| McpSchemaError::Composition {
+            reason: source.to_string(),
+        })
+}
+
 fn make_unsupported_schema_references_opaque(tools_list: &str) -> Cow<'_, str> {
     let Ok(mut response) = serde_json::from_str::<serde_json::Value>(tools_list) else {
         return Cow::Borrowed(tools_list);
@@ -670,6 +693,12 @@ fn refuse_reserved_namespace(server: &str) -> Result<(), McpSchemaError> {
         return Err(McpSchemaError::GeneratedShape {
             server: server.to_string(),
             reason: "the normalized server namespace is reserved for the Box schema",
+        });
+    }
+    if mcp_action_namespace(server) == crate::pack::PACK_NAMESPACE {
+        return Err(McpSchemaError::GeneratedShape {
+            server: server.to_string(),
+            reason: "the normalized server namespace is reserved for policy packs",
         });
     }
     Ok(())

@@ -482,16 +482,32 @@ pub(crate) struct HostedBox {
 }
 
 impl HostedBox {
+    #[cfg(test)]
     pub(crate) fn prepare_policy(
         root: &BoxRoot,
         operator: &policy::Operator,
         sources: Vec<policy::Policy>,
     ) -> Result<Arc<PolicyEngine>, BoxError> {
+        Self::prepare_policy_with_packs(root, operator, sources, policy::PackBindings::default())
+    }
+
+    pub(crate) fn prepare_policy_with_packs(
+        root: &BoxRoot,
+        operator: &policy::Operator,
+        sources: Vec<policy::Policy>,
+        packs: policy::PackBindings,
+    ) -> Result<Arc<PolicyEngine>, BoxError> {
         let database_path = root.dogwood_database();
         let database = root.open_dogwood_database()?;
         Ok(Arc::new(
-            PolicyEngine::open_staged_file(operator, sources, database, database_path)?
-                .observed_by(Arc::new(telemetry::PolicyDecisionObserver)),
+            PolicyEngine::open_staged_file_with_packs(
+                operator,
+                sources,
+                packs,
+                database,
+                database_path,
+            )?
+            .observed_by(Arc::new(telemetry::PolicyDecisionObserver)),
         ))
     }
 
@@ -806,6 +822,7 @@ mod tests {
             remote_mcp: Default::default(),
             mcp,
             contained_mcp: Default::default(),
+            packs: Default::default(),
             telemetry: Default::default(),
         }
     }
@@ -1729,6 +1746,7 @@ while :; do :; done"#
             remote_mcp: Default::default(),
             mcp: Vec::new(),
             contained_mcp: Default::default(),
+            packs: Default::default(),
             telemetry: Default::default(),
         }
     }

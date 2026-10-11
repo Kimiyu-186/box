@@ -57,6 +57,8 @@ pub struct PolicyEngine {
     authority: Authority,
     effective: EffectivePolicy,
     observer: Option<Arc<dyn crate::observe::DecisionObserver>>,
+    #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+    packs: crate::pack::PackBindings,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -89,6 +91,7 @@ impl PolicyEngine {
             authority: Authority::open_complete(sources, mcp_schemas, history)?,
             effective,
             observer: None,
+            packs: crate::pack::PackBindings::default(),
         })
     }
 
@@ -106,6 +109,7 @@ impl PolicyEngine {
             authority: Authority::open_staged(operator, sources, history)?,
             effective,
             observer: None,
+            packs: crate::pack::PackBindings::default(),
         })
     }
 
@@ -121,10 +125,106 @@ impl PolicyEngine {
             policy_id: effective_policy_id(&sources),
         };
         Ok(Self {
-            authority: Authority::open_staged_file(operator, sources, history, label)?,
+            authority: Authority::open_staged_file(operator, sources, Vec::new(), history, label)?,
             effective,
             observer: None,
+            packs: crate::pack::PackBindings::default(),
         })
+    }
+
+    /// Open durable history through an already-open file with installed policy packs.
+    pub fn open_staged_file_with_packs(
+        operator: &Operator,
+        sources: Vec<Policy>,
+        packs: crate::pack::PackBindings,
+        history: File,
+        label: PathBuf,
+    ) -> Result<Self, PolicyStagingError> {
+        let effective = EffectivePolicy {
+            engine: ENGINE_ID,
+            policy_id: effective_policy_id(&sources),
+        };
+        Ok(Self {
+            authority: Authority::open_staged_file(
+                operator,
+                sources,
+                packs.schemas(),
+                history,
+                label,
+            )?,
+            effective,
+            observer: None,
+            packs,
+        })
+    }
+
+    /// Strict-validate candidate sources against the vocabulary of `packs`.
+    pub fn validate_with_packs(
+        operator: &Operator,
+        sources: &[Policy],
+        packs: &[crate::pack::Pack],
+    ) -> Result<(), PolicyError> {
+        let schemas = packs
+            .iter()
+            .map(crate::pack::Pack::schema)
+            .collect::<Vec<_>>();
+        Self::validate_with_mcp_schemas(operator, sources, &schemas)
+    }
+
+    #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+    pub(crate) fn pack_bound_to(&self, program_path: &str) -> Option<&crate::pack::Pack> {
+        self.packs.bound_to(program_path)
+    }
+
+    /// The pack refinement of one permitted `shell:spawn`: only a `forbid` or a fault refuses it.
+    #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+    pub(crate) fn refine_pack_action(
+        &self,
+        governed: &GovernedBox,
+        principal: &Principal,
+        invocation: &crate::pack::PackInvocation<'_>,
+    ) -> Decision {
+        let identity = crate::schema::ActionIdentity::PackAction {
+            pack: invocation.pack.name().to_string(),
+            action: invocation.action().to_string(),
+        };
+        let input = invocation.input();
+        let request = Request::McpCall {
+            server: invocation.pack.name(),
+            method: "pack",
+            tool: Some(invocation.action()),
+            prompt: None,
+            uri: None,
+            arguments: Some(&input),
+        };
+        let decision = match self
+            .authority
+            .decide(governed, principal, &request, &identity)
+        {
+            Decision::Deny {
+                reason: crate::DenyReason::NoMatch,
+                ..
+            } => Decision::Allow {
+                rule: crate::RuleId::default_deny(),
+                attribution: Vec::new(),
+                resource: String::new(),
+            },
+            other => other,
+        };
+        let decision = decision.naming(format!(
+            "{}::{}::Action::{}",
+            crate::pack::PACK_NAMESPACE,
+            invocation.pack.name(),
+            invocation.action()
+        ));
+        if let Some(observer) = &self.observer {
+            observer.observed(
+                identity.observer_action().as_ref(),
+                decision.resource(),
+                &decision,
+            );
+        }
+        decision
     }
 
     /// Open with a fault injector on the durable log, for tests that pause the store.
@@ -142,6 +242,7 @@ impl PolicyEngine {
             authority: Authority::open_with_faults(sources, history, faults)?,
             effective,
             observer: None,
+            packs: crate::pack::PackBindings::default(),
         })
     }
 
@@ -444,6 +545,7 @@ mod tests {
                 policy_id: effective_policy_id(&sources),
             },
             observer: None,
+            packs: crate::pack::PackBindings::default(),
         }
     }
 

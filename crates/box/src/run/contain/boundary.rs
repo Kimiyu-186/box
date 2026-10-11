@@ -1338,6 +1338,7 @@ mod tests {
                 remote_mcp: Default::default(),
                 mcp,
                 contained_mcp: Default::default(),
+                packs: Default::default(),
                 telemetry: Default::default(),
             };
             let attachment = Attachment {

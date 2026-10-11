@@ -383,10 +383,25 @@ impl RunContract {
         let policy_path = self.file.policy_path(self.source.path());
         let (mcp_servers, http_mcp) = crate::record::config::mcp::partition(&self.file.mcp)?;
         let contained_mcp = crate::record::config::mcp::contained_specs(&self.file.mcp);
+        let (packs, pack_sources) =
+            load_packs(&self.file.pack_paths(self.source.path()), &self.file.tool)?;
+        for source in &pack_sources {
+            if source.path().starts_with(root.root()) {
+                return Err(ConfigError::Contract {
+                    reason: format!(
+                        "pack source {} is inside `box_dir` {}",
+                        source.path().display(),
+                        root.root().display()
+                    ),
+                }
+                .into());
+            }
+        }
         let (policy, policy_source) = read_authored_policy(
             policy_path.as_deref(),
             mcp_servers.is_empty(),
             &policy_operator()?,
+            &packs,
         )?;
         if let Some(source) = &policy_source
             && source.path().starts_with(root.root())
@@ -440,6 +455,11 @@ impl RunContract {
         if let Some(source) = policy_source {
             sources.push(source);
         }
+        let pack_paths = pack_sources
+            .iter()
+            .map(|source| source.path().to_path_buf())
+            .collect();
+        sources.extend(pack_sources);
         Ok(ConfigureRequest {
             record: Record {
                 version: RECORD_VERSION,
@@ -447,6 +467,7 @@ impl RunContract {
                 box_dir: root.root().to_path_buf(),
                 name: self.file.name.clone(),
                 policy: policy.as_ref().map(|source| source.origin.clone()),
+                packs: pack_paths,
                 agent: self.file.agent.clone(),
                 tool: self.file.tool.clone(),
                 egress,
@@ -456,6 +477,7 @@ impl RunContract {
                 telemetry: telemetry::checked(&self.file.telemetry, root.root())?,
             },
             policy,
+            packs,
             sources,
         })
     }
@@ -465,6 +487,9 @@ impl RunContract {
 pub(crate) struct ConfigureRequest {
     /// The authored Dogwood text, or `None` for a box that grants nothing.
     pub(crate) policy: Option<Policy>,
+
+    /// The installed policy packs, read once for this run.
+    pub(crate) packs: Vec<policy::Pack>,
 
     /// The record to store, from which every later verb rebuilds the above.
     pub(crate) record: Record,
@@ -501,6 +526,10 @@ pub(crate) struct Record {
     /// Where the operator's policy came from. Diagnostics only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) policy: Option<PathBuf>,
+
+    /// Where each installed policy pack came from, canonical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) packs: Vec<PathBuf>,
 
     /// The agent this box runs, as `[agent]` declared it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,7 +569,7 @@ pub(crate) struct Record {
     pub(crate) telemetry: BTreeMap<String, telemetry::TelemetryEntry>,
 }
 
-/// The record format this build writes and accepts: version 21 adds `network` to each
+/// The record format this build writes and accepts: version 22 adds the `packs` paths. Version 21 adds `network` to each
 /// `[tool.<name>]`, and stores a stdio MCP server's network in its spec's `network`, where version
 /// 20 kept a separate `native_egress` flag on `ContainedMcp`. Version 20 names a secret's injection mode
 /// `secret.inject`, taking `phantom` or `always`, where version 19 took `secret.phantom` with
@@ -550,7 +579,7 @@ pub(crate) struct Record {
 /// stdio server is now contained), so a v16 record that predates it is refused with a version
 /// mismatch rather than silently losing containment. Version 16 dropped the credsd `secret.type`
 /// key.
-pub(crate) const RECORD_VERSION: u32 = 21;
+pub(crate) const RECORD_VERSION: u32 = 22;
 
 /// A key an earlier build read, and what replaced it.
 struct RemovedKey {
@@ -854,6 +883,28 @@ impl Record {
         paths
     }
 
+    /// Every pack bound to the resolved program identity of each `[tool]` that runs its program.
+    pub(crate) fn pack_bindings(&self, packs: &[policy::Pack]) -> policy::PackBindings {
+        let mut bindings = policy::PackBindings::new(packs.to_vec());
+        for pack in packs {
+            for spec in self.tool.values() {
+                if !runs_program(spec, pack.program()) {
+                    continue;
+                }
+                let Ok(program) =
+                    crate::run::contain::executable::resolve(spec.program(), &spec.search_path())
+                else {
+                    continue;
+                };
+                bindings.bind(
+                    program.granted_path().to_string_lossy().into_owned(),
+                    pack.name(),
+                );
+            }
+        }
+        bindings
+    }
+
     /// The record as TOML, for `configure` to write.
     pub(crate) fn to_toml(&self) -> Result<String, BoxError> {
         toml::to_string_pretty(self).map_err(|source| ConfigError::RecordWrite { source }.into())
@@ -880,6 +931,7 @@ fn read_authored_policy(
     path: Option<&Path>,
     validate_complete_schema: bool,
     operator: &policy::Operator,
+    packs: &[policy::Pack],
 ) -> Result<(Option<Policy>, Option<AuthoritySource>), BoxError> {
     let Some(path) = path else {
         return Ok((None, None));
@@ -890,7 +942,7 @@ fn read_authored_policy(
         text,
     };
     let validation = if validate_complete_schema {
-        PolicyEngine::validate(operator, std::slice::from_ref(&source))
+        PolicyEngine::validate_with_packs(operator, std::slice::from_ref(&source), packs)
     } else {
         PolicyEngine::validate_staged(std::slice::from_ref(&source))
     };
@@ -902,6 +954,72 @@ fn read_authored_policy(
         .into());
     }
     Ok((Some(source), Some(identity)))
+}
+
+/// Whether a `[tool]` table runs `program`: its `command[0]` is `program` or ends in `/program`.
+fn runs_program(spec: &ProcessSpec, program: &str) -> bool {
+    let first = spec.program();
+    first == program || first.ends_with(&format!("/{program}"))
+}
+
+/// Read, parse, and cross-check every pack the config names.
+fn load_packs(
+    paths: &[PathBuf],
+    tools: &BTreeMap<String, ProcessSpec>,
+) -> Result<(Vec<policy::Pack>, Vec<AuthoritySource>), BoxError> {
+    let mut packs: Vec<policy::Pack> = Vec::new();
+    let mut sources = Vec::new();
+    for path in paths {
+        let (source, text) = AuthoritySource::read(path, "pack")?;
+        let pack =
+            policy::Pack::parse(&text, source.path()).map_err(|error| ConfigError::Contract {
+                reason: error.to_string(),
+            })?;
+        if let Some(other) = packs.iter().find(|other| other.name() == pack.name()) {
+            return Err(ConfigError::Contract {
+                reason: format!(
+                    "packs {} and {} are both named {:?}",
+                    other.origin().display(),
+                    pack.origin().display(),
+                    pack.name()
+                ),
+            }
+            .into());
+        }
+        if let Some(other) = packs.iter().find(|other| other.program() == pack.program()) {
+            return Err(ConfigError::Contract {
+                reason: format!(
+                    "packs {:?} and {:?} both cover the program {:?}",
+                    other.name(),
+                    pack.name(),
+                    pack.program()
+                ),
+            }
+            .into());
+        }
+        if !tools
+            .values()
+            .any(|spec| runs_program(spec, pack.program()))
+        {
+            return Err(ConfigError::Contract {
+                reason: format!(
+                    "pack {:?} binds to no [tool]; declare a [tool] that runs {}",
+                    pack.name(),
+                    pack.program()
+                ),
+            }
+            .into());
+        }
+        packs.push(pack);
+        sources.push(source);
+    }
+    Ok((packs, sources))
+}
+
+/// Read the packs a config file names, for `policy generate-schema`.
+pub(crate) fn read_packs(config: &Path) -> Result<Vec<policy::Pack>, BoxError> {
+    let file = ConfigFile::read(config)?;
+    load_packs(&file.pack_paths(config), &file.tool).map(|(packs, _)| packs)
 }
 
 /// The name of one persistent box: a single safe path component.
@@ -980,6 +1098,10 @@ struct ConfigFile {
     #[serde(default)]
     policy: Option<PathBuf>,
 
+    /// Policy pack files, each relative to the config file's directory unless absolute.
+    #[serde(default)]
+    packs: Vec<PathBuf>,
+
     /// The agent this box runs.
     #[serde(default)]
     agent: Option<ProcessSpec>,
@@ -1032,6 +1154,21 @@ impl ConfigFile {
                 .unwrap_or_else(|| Path::new("."))
                 .join(policy),
         )
+    }
+
+    /// The pack paths, each resolved against the config file's directory.
+    fn pack_paths(&self, config_path: &Path) -> Vec<PathBuf> {
+        let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.packs
+            .iter()
+            .map(|pack| {
+                if pack.is_absolute() {
+                    pack.clone()
+                } else {
+                    directory.join(pack)
+                }
+            })
+            .collect()
     }
 
     /// Every declared destination as a validated [`EgressRoute`], one per destination.
@@ -1153,6 +1290,7 @@ mod tests {
             remote_mcp: BTreeMap::new(),
             mcp: Vec::new(),
             contained_mcp: BTreeMap::new(),
+            packs: Default::default(),
             telemetry: std::collections::BTreeMap::new(),
         }
     }

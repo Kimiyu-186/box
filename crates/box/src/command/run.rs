@@ -30,6 +30,7 @@ struct LockedRun {
     /// The arguments `run` appends to `[agent] command`.
     trailing: Vec<String>,
     policy: Option<Policy>,
+    packs: Vec<policy::Pack>,
     sources: Vec<AuthoritySource>,
     owned: Lock,
 }
@@ -112,26 +113,31 @@ async fn hosted(
     let sources: Vec<Policy> = locked.policy.into_iter().collect();
     let subject = policy_subject(&sources);
     let operator = crate::record::config::policy_operator()?;
-    let policy = match HostedBox::prepare_policy(&locked.root, &operator, sources) {
-        Ok(engine) => {
-            for warning in engine.warnings() {
-                eprintln!("strands-box: warning: {warning}");
+    let bindings = locked.record.pack_bindings(&locked.packs);
+    for (path, pack) in bindings.bound_paths() {
+        eprintln!("strands-box: pack {pack:?} binds {path}");
+    }
+    let policy =
+        match HostedBox::prepare_policy_with_packs(&locked.root, &operator, sources, bindings) {
+            Ok(engine) => {
+                for warning in engine.warnings() {
+                    eprintln!("strands-box: warning: {warning}");
+                }
+                collector.control(telemetry::ControlRecord::completed(
+                    telemetry::ControlOperation::PolicyInstalled,
+                    &subject,
+                ));
+                engine
             }
-            collector.control(telemetry::ControlRecord::completed(
-                telemetry::ControlOperation::PolicyInstalled,
-                &subject,
-            ));
-            engine
-        }
-        Err(refusal) => {
-            collector.control(telemetry::ControlRecord::refused(
-                telemetry::ControlOperation::PolicyRefused,
-                &subject,
-                &refusal.to_string(),
-            ));
-            return Err(refusal);
-        }
-    };
+            Err(refusal) => {
+                collector.control(telemetry::ControlRecord::refused(
+                    telemetry::ControlOperation::PolicyRefused,
+                    &subject,
+                    &refusal.to_string(),
+                ));
+                return Err(refusal);
+            }
+        };
 
     // Validate any declared credsd credential before the workload starts, so a missing daemon or an
     // unusable environment fails here rather than at the first signed request. The check does
@@ -262,6 +268,7 @@ fn prepare(config: &Path, argv: &[OsString]) -> Result<LockedRun, BoxError> {
         workspace,
         trailing: trailing_arguments(argv)?,
         policy: request.policy,
+        packs: request.packs,
         sources: request.sources,
         owned,
     })
@@ -327,6 +334,7 @@ mod tests {
             remote_mcp: BTreeMap::new(),
             mcp: Vec::new(),
             contained_mcp: BTreeMap::new(),
+            packs: Default::default(),
             telemetry: BTreeMap::new(),
         }
     }

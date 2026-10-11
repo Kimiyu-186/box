@@ -24,6 +24,8 @@ struct ProposalState {
     operator: Operator,
     candidates: Vec<CandidatePolicy>,
     schemas: BTreeMap<String, String>,
+    /// Pack schema fragments, fixed at open and always composed ahead of the MCP schemas.
+    pack_schemas: Vec<String>,
     ready: BTreeSet<usize>,
     pending: BTreeMap<usize, String>,
 }
@@ -90,18 +92,25 @@ impl Authority {
         sources: Vec<Policy>,
         history: &Path,
     ) -> Result<Self, PolicyStagingError> {
-        Self::open_staged_with_engine(operator, sources, DogwoodEngine::open_for_staging(history)?)
+        Self::open_staged_with_engine(
+            operator,
+            sources,
+            Vec::new(),
+            DogwoodEngine::open_for_staging(history)?,
+        )
     }
 
     pub(super) fn open_staged_file(
         operator: &Operator,
         sources: Vec<Policy>,
+        pack_schemas: Vec<String>,
         history: File,
         label: std::path::PathBuf,
     ) -> Result<Self, PolicyStagingError> {
         Self::open_staged_with_engine(
             operator,
             sources,
+            pack_schemas,
             DogwoodEngine::open_for_staging_file(history, label)?,
         )
     }
@@ -109,6 +118,7 @@ impl Authority {
     fn open_staged_with_engine(
         operator: &Operator,
         sources: Vec<Policy>,
+        pack_schemas: Vec<String>,
         mut engine: DogwoodEngine,
     ) -> Result<Self, PolicyStagingError> {
         let candidates = parse_policy_source(&authored(&sources))?
@@ -123,12 +133,14 @@ impl Authority {
             operator: operator.clone(),
             candidates,
             schemas: BTreeMap::new(),
+            pack_schemas,
             ready: BTreeSet::new(),
             pending: BTreeMap::new(),
         };
         let complete = proposal.complete_policy_set();
+        let base_schemas = proposal.schema_sources();
         let (readiness, pending_tools, warnings) =
-            match validate_canonical_policy_set(&complete, &[], operator) {
+            match validate_canonical_policy_set(&complete, &base_schemas, operator) {
                 Ok((effective_schema, warnings)) => {
                     engine
                         .commit_staged(&complete, effective_schema)
@@ -145,14 +157,14 @@ impl Authority {
                     return Err(inert.into());
                 }
                 Err(_) => {
-                    proposal.classify(&[])?;
+                    proposal.classify(&base_schemas)?;
                     // Serve the schema-independent subset while typed schemas stage
                     // (`Discovering`), instead of denying every request. A per-tool rule whose server
                     // never stages (its `tools/list` is denied) is not refused here;
                     // `finish_mcp_discovery` degrades that one server instead.
                     let subset = proposal.ready_policy_set();
                     let (effective_schema, warnings) =
-                        validate_canonical_policy_set(&subset, &[], operator)?;
+                        validate_canonical_policy_set(&subset, &base_schemas, operator)?;
                     engine
                         .commit_staged(&subset, effective_schema)
                         .map_err(|error| PolicyStagingError::Durable(error.to_string()))?;
@@ -563,7 +575,11 @@ impl ProposalState {
     }
 
     fn schema_sources(&self) -> Vec<String> {
-        self.schemas.values().cloned().collect()
+        self.pack_schemas
+            .iter()
+            .chain(self.schemas.values())
+            .cloned()
+            .collect()
     }
 }
 
@@ -598,7 +614,9 @@ fn collect_typed_actions(source: &str, out: &mut BTreeSet<(String, String)>) {
         let after = &rest[pos + MARKER.len()..];
         match after.find('"') {
             Some(end) => {
-                if !namespace.is_empty() && namespace != "Box" {
+                // A nested namespace (`Pack::<name>::Action`) is never an MCP server's.
+                let nested = rest[..pos - namespace.len()].ends_with("::");
+                if !namespace.is_empty() && namespace != "Box" && !nested {
                     out.insert((namespace, after[..end].to_string()));
                 }
                 rest = &after[end + 1..];

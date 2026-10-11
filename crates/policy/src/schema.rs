@@ -51,6 +51,8 @@ pub(crate) fn action_schema(mcp_schemas: &[String]) -> Result<ActionSchema, Poli
             action.type_name().basename() == "Action"
                 && action.type_name().namespace_components().next().is_some()
                 && action.type_name().to_string() != FIXED_ACTION_TYPE
+                && action.type_name().namespace_components().next()
+                    != Some(crate::pack::PACK_NAMESPACE)
         })
         .cloned()
         .collect();
@@ -118,8 +120,18 @@ pub(crate) mod action {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ActionIdentity {
-    Fixed { id: &'static str },
-    McpTool { namespace: String, tool: String },
+    Fixed {
+        id: &'static str,
+    },
+    McpTool {
+        namespace: String,
+        tool: String,
+    },
+    #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
+    PackAction {
+        pack: String,
+        action: String,
+    },
 }
 
 impl ActionIdentity {
@@ -147,6 +159,15 @@ impl ActionIdentity {
     pub(crate) fn cedar_uid(&self) -> Result<EntityUid, PolicyError> {
         match self {
             Self::Fixed { id } => fixed_action_uid(id),
+            Self::PackAction { pack, action } => {
+                let action_type = format!("{}::{pack}::Action", crate::pack::PACK_NAMESPACE)
+                    .parse::<EntityTypeName>()
+                    .map_err(|error| PolicyError::Schema(error.to_string()))?;
+                Ok(EntityUid::from_type_name_and_id(
+                    action_type,
+                    EntityId::new(action),
+                ))
+            }
             Self::McpTool { namespace, tool } => {
                 let action_type = format!("{namespace}::Action")
                     .parse::<EntityTypeName>()
@@ -168,6 +189,11 @@ impl ActionIdentity {
             Self::McpTool { namespace, tool } => Cow::Owned(format!(
                 "{namespace}::Action::\"{}\"",
                 EntityId::new(tool).escaped()
+            )),
+            Self::PackAction { pack, action } => Cow::Owned(format!(
+                "{}::{pack}::Action::\"{}\"",
+                crate::pack::PACK_NAMESPACE,
+                EntityId::new(action).escaped()
             )),
         }
     }
