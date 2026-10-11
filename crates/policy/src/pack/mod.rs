@@ -10,11 +10,10 @@
 mod format;
 mod grammar;
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-pub(crate) use grammar::{FieldValue, Parsed, ShellGrammar};
+pub(crate) use grammar::{FieldKind, FieldValue, Parsed, ShellGrammar};
 
 use crate::schema::cedar_identifier;
 
@@ -48,7 +47,6 @@ pub struct Pack {
     name: String,
     program: String,
     effects: Vec<String>,
-    actions: Vec<String>,
     grammar: ShellGrammar,
 }
 
@@ -81,9 +79,7 @@ impl Pack {
                 ));
             }
         }
-        let declared: BTreeSet<&str> = file.effects.keys().map(String::as_str).collect();
-        let mut grammar_actions = Vec::new();
-        for (action, spec) in &file.shell {
+        for action in file.shell.keys() {
             if !is_identifier(action) {
                 return refuse(format!(
                     "`[shell.{action}]` must be named by a plain identifier (letters, digits, '_')"
@@ -94,64 +90,18 @@ impl Pack {
                     "`[shell.{UNMODELED_ACTION}]` is reserved for a command no action matches"
                 ));
             }
-            let first = spec.usage.split_whitespace().next().unwrap_or_default();
-            if first != file.program {
-                return refuse(format!(
-                    "`[shell.{action}] usage` starts with {first:?}, but the pack's program is {:?}",
-                    file.program
-                ));
-            }
-            let references = spec
-                .options
-                .iter()
-                .flat_map(|(name, option)| {
-                    option
-                        .adds
-                        .iter()
-                        .chain(&option.removes)
-                        .map(move |effect| (format!("options.{name}"), effect))
-                })
-                .chain(spec.operands.iter().flat_map(|(name, operand)| {
-                    operand
-                        .adds
-                        .iter()
-                        .chain(&operand.removes)
-                        .map(move |effect| (format!("operands.{name}"), effect))
-                }));
-            for (owner, effect) in references {
-                if !declared.contains(effect.as_str()) {
-                    return refuse(format!(
-                        "`[shell.{action}] {owner}` names effect {effect:?}, which `[effects]` \
-                         does not declare"
-                    ));
-                }
-            }
-            for (name, option) in &spec.options {
-                if option
-                    .flag
-                    .spellings()
-                    .iter()
-                    .any(|flag| !flag.starts_with('-'))
-                {
-                    return refuse(format!(
-                        "`[shell.{action}] options.{name}` has a flag that does not start with '-'"
-                    ));
-                }
-            }
-            grammar_actions.push((
-                action.clone(),
-                grammar::subcommand_words(&spec.usage),
-                spec.aliases.clone(),
-            ));
         }
+        let grammar = match ShellGrammar::compile(&file) {
+            Ok(grammar) => grammar,
+            Err(reason) => return refuse(reason),
+        };
 
         Ok(Self {
             origin: origin.to_path_buf(),
             name: file.pack,
             program: file.program,
             effects: file.effects.into_keys().collect(),
-            actions: file.shell.into_keys().collect(),
-            grammar: ShellGrammar::new(grammar_actions),
+            grammar,
         })
     }
 
@@ -182,6 +132,24 @@ impl Pack {
         &self.grammar
     }
 
+    /// The parse of one command line as JSON, for checking a pack by hand.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn parse_command(&self, args: &[String]) -> serde_json::Value {
+        match self.grammar.parse(args, Path::new("")) {
+            Parsed::Unmodeled => serde_json::json!({ "action": UNMODELED_ACTION }),
+            Parsed::Action {
+                action,
+                fields,
+                effects,
+            } => serde_json::json!({
+                "action": action,
+                "fields": fields.iter().map(|(name, value)| (name.clone(), field_json(value))).collect::<serde_json::Map<_, _>>(),
+                "effects": effects,
+            }),
+        }
+    }
+
     /// The generated Cedar schema fragment for this pack's vocabulary.
     #[must_use]
     pub fn schema(&self) -> String {
@@ -200,21 +168,24 @@ impl Pack {
                 .join(", ");
             let _ = writeln!(schema, "  entity Effect enum [{values}];");
         }
-        let _ = writeln!(
-            schema,
-            "  type Input = {{\n    program: String,\n    program_path: String,\n    \
-             cwd: String,\n    args: Set<String>,\n    effects: Set<Effect>\n  }};"
-        );
-        for action in self
-            .actions
-            .iter()
-            .map(String::as_str)
-            .chain([UNMODELED_ACTION])
-        {
+        let base = "program: String, program_path: String, cwd: String, args: Set<String>, \
+                    effects: Set<Effect>";
+        let typed = self.grammar.action_fields();
+        let unmodeled: (&str, Vec<(&str, FieldKind)>) = (UNMODELED_ACTION, Vec::new());
+        for (action, fields) in typed.iter().chain(std::iter::once(&unmodeled)) {
+            let mut record = base.to_string();
+            for (name, kind) in fields {
+                let _ = match kind {
+                    FieldKind::Bool => write!(record, ", {name:?}: Bool"),
+                    FieldKind::String => write!(record, ", {name:?}?: String"),
+                    FieldKind::Set => write!(record, ", {name:?}: Set<String>"),
+                };
+            }
+            let _ = writeln!(schema, "  type {action}Input = {{ {record} }};");
             let _ = writeln!(
                 schema,
                 "  action {action:?} appliesTo {{\n    principal: [Box::Agent],\n    \
-                 resource: [Box::Resource],\n    context: {{ input: Input }}\n  }};"
+                 resource: [Box::Resource],\n    context: {{ input: {action}Input }}\n  }};"
             );
         }
         schema.push_str("}\n");
@@ -264,19 +235,22 @@ impl PackInvocation<'_> {
         });
         if let (Some(fields), Some(object)) = (fields, input.as_object_mut()) {
             for (name, value) in fields {
-                let value = match value {
-                    FieldValue::Bool(value) => serde_json::Value::Bool(*value),
-                    FieldValue::String(value) => serde_json::Value::String(value.clone()),
-                    FieldValue::Set(values) => serde_json::json!(values),
-                };
-                object.insert(name.clone(), value);
+                object.insert(name.clone(), field_json(value));
             }
         }
         input
     }
 }
 
-fn is_identifier(raw: &str) -> bool {
+fn field_json(value: &FieldValue) -> serde_json::Value {
+    match value {
+        FieldValue::Bool(value) => serde_json::Value::Bool(*value),
+        FieldValue::String(value) => serde_json::Value::String(value.clone()),
+        FieldValue::Set(values) => serde_json::json!(values),
+    }
+}
+
+pub(crate) fn is_identifier(raw: &str) -> bool {
     !raw.is_empty() && cedar_identifier(raw) == raw
 }
 
