@@ -1,4 +1,5 @@
-# Rendered by demo.sh: <DEMO> becomes the scratch directory.
+# Rendered by demo.sh: <DEMO> becomes the scratch directory, and <DEVELOPER_DIR> the macOS developer
+# tools that the /usr/bin/git shim runs (`xcode-select -p`).
 name = "packs-demo-git"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
@@ -15,8 +16,8 @@ env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
 
 [tool.git]
 command = ["/usr/bin/git"]
-env = { HOME = "<DEMO>/home" }
+env = { HOME = "<DEMO>/home", DEVELOPER_DIR = "<DEVELOPER_DIR>" }
 
 [tool.git.filesystem]
-read = ["<DEMO>/work", "<DEMO>/home"]
+read = ["<DEMO>/work", "<DEMO>/home", "<DEVELOPER_DIR>"]
 write = ["<DEMO>/work"]
