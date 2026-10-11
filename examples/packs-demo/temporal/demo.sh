@@ -1,12 +1,20 @@
 #!/bin/bash
-# Run the temporal pack demo: `git push` is allowed only after a passing `cargo test` in the last hour.
+# Run the temporal pack demo with two packs in one box, the full examples/packs/git.pack.toml and
+# examples/packs/cargo.pack.toml. `git push` is allowed only after a passing `cargo test` in the
+# last hour, and one rule over every cargo action refuses each one that can rewrite Cargo.lock.
 #
 # Run 1 (one box run, so one history):
-#   1. git push before any test         -> refused by push_after_tests
-#   2. cargo test that fails, git push  -> still refused
-#   3. cargo t that passes, git push    -> allowed, and the push lands in the bare remote
+#   1. git push before any test                 -> refused by push_after_tests
+#   2. cargo build, cargo test (no --locked)    -> refused by lockfile_is_frozen; git status runs
+#   3. cargo test --locked that fails, git push -> the push is still refused
+#   4. cargo +stable test --locked              -> decided as the test action; the toolchain cargo
+#                                                  is not the rustup proxy, so it exits non-zero
+#   5. cargo t --locked that passes, git push   -> allowed, and the push lands in the bare remote
 # Run 2 (a new `strands-box run` on the same box_dir): a new commit, and git push with no test in
 #   this run -> allowed, because the passing test from run 1 is in the durable history.
+#
+#   demo.sh unscoped  # the lockfile rule over `action` (every action): the box refuses to start,
+#                     # because Pack::git::Effect and Pack::cargo::Effect are not compatible types
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
 # DEMO names the scratch directory (default: /tmp/packs-demo-temporal). It is recreated.
@@ -19,10 +27,9 @@ case "$DEMO" in
   /tmp/*|/private/tmp/*) ;;
   *) echo "DEMO must be under /tmp" >&2; exit 1 ;;
 esac
-CARGO=${CARGO:-$(command -v cargo)}
-CARGO_BIN=$(cd "$(dirname "$CARGO")" && pwd -P)
-CARGO="$CARGO_BIN/$(basename "$CARGO")"
-RUSTUP_HOME=$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)
+MODE=${1:-run}
+# The toolchain outside this repository's rust-toolchain.toml.
+TOOLCHAIN=$(cd "$(dirname "$(cd /tmp && rustup which cargo)")/.." && pwd -P)
 
 rm -rf "$DEMO"
 mkdir -p "$DEMO/config" "$DEMO/home" "$DEMO/work" "$DEMO/cargo-home" "$DEMO/target" "$DEMO/tmp"
@@ -50,6 +57,7 @@ fn verdict_is_pass() {
 RS
 printf 'target/\nverdict.txt\nCargo.lock\n' > .gitignore
 : > verdict.txt
+CARGO_HOME="$DEMO/cargo-home" "$TOOLCHAIN/bin/cargo" generate-lockfile --offline -q
 git add . && git -c user.name=demo -c user.email=demo@example.com commit -q -m "first commit"
 git remote add origin "$DEMO/work/remote.git"
 cd "$DEMO" || exit 1
@@ -57,25 +65,37 @@ cd "$DEMO" || exit 1
 DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || echo "$DEMO/config")
 SDKROOT=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || echo "$DEMO/config")
 render() {
-  sed -e "s#<DEMO>#$DEMO#g" -e "s#<DEVELOPER_DIR>#$DEVELOPER_DIR#g" -e "s#<SDKROOT>#$SDKROOT#g" -e "s#<CARGO_BIN>#$CARGO_BIN#g" \
-      -e "s#<CARGO>#$CARGO#g" -e "s#<RUSTUP_HOME>#$RUSTUP_HOME#g" -e "s#<AGENT_SCRIPT>#$2#g" "$HERE/$1"
+  sed -e "s#<DEMO>#$DEMO#g" -e "s#<DEVELOPER_DIR>#$DEVELOPER_DIR#g" -e "s#<SDKROOT>#$SDKROOT#g" \
+      -e "s#<TOOLCHAIN>#$TOOLCHAIN#g" -e "s#<AGENT_SCRIPT>#$2#g" "$HERE/$1"
 }
-cp "$HERE/policy.dw" "$HERE/git.pack.toml" "$HERE/cargo.pack.toml" "$DEMO/config/"
+cp "$HERE/policy.dw" "$DEMO/config/"
+cp "$REPO_ROOT/examples/packs/git.pack.toml" "$REPO_ROOT/examples/packs/cargo.pack.toml" "$DEMO/config/"
+if [ "$MODE" = unscoped ]; then
+  sed -i.bak 's#^forbid (principal, action in Pack::cargo::Action::"\*", resource)#forbid (principal, action, resource)#; s#^when { context.input.effects#when { context.input has effects \&\& context.input.effects#' "$DEMO/config/policy.dw"
+  grep -A1 'action, resource)' "$DEMO/config/policy.dw"
+fi
 
 cat > "$DEMO/config/run1.sh" <<'SH'
 echo "### 1. git push before any test"
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
-echo "### 2. a failing cargo test, then git push"
-echo fail > verdict.txt
+echo "### 2. cargo without --locked can rewrite Cargo.lock; git is not affected"
+zsh -c 'cargo build -q; echo "cargo build exit=$?"'
 zsh -c 'cargo test -q; echo "cargo test exit=$?"'
+zsh -c 'git status --short; echo "git status exit=$?"'
+echo "### 3. a failing cargo test --locked, then git push"
+echo fail > verdict.txt
+zsh -c 'cargo test -q --locked; echo "cargo test --locked exit=$?"'
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
-echo "### 3. a passing cargo t, then git push"
+echo "### 4. cargo +stable test --locked (the toolchain cargo is not the rustup proxy)"
 echo pass > verdict.txt
-zsh -c 'cargo t -q; echo "cargo t exit=$?"'
+zsh -c 'cargo +stable test -q --locked; echo "cargo +stable test --locked exit=$?"'
+zsh -c 'git push -q origin main; echo "git push exit=$?"'
+echo "### 5. a passing cargo t --locked, then git push"
+zsh -c 'cargo t -q --locked; echo "cargo t --locked exit=$?"'
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
 SH
 cat > "$DEMO/config/run2.sh" <<'SH'
-echo "### 4. a new box run on the same box_dir: git push with no test in this run"
+echo "### 6. a new box run on the same box_dir: git push with no test in this run"
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
 SH
 
@@ -84,13 +104,15 @@ run_box() {
   render box.toml "$DEMO/config/$1.sh" > "$DEMO/config/box.toml"
   echo "=== strands-box run ($1)"
   set +e
-  "$BOX" run --config "$DEMO/config/box.toml"
-  echo "=== strands-box exit=$?"
+  PATH="$TOOLCHAIN/bin:$PATH" "$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
+    grep -Ev '^strands-box: \[|^  (read|write|metadata|exec|enter|list|deny|read_file|write_file|\(no) '; fi
+  echo "=== strands-box exit=${PIPESTATUS[0]}"
   set -e
 }
 
 echo "--- local main: $(git -C "$DEMO/work/repo" rev-parse --short main), remote main: $(remote_main)"
 run_box run1
+[ "$MODE" = unscoped ] && exit 0
 echo "--- remote main after run 1: $(remote_main)"
 git -C "$DEMO/work/repo" -c user.name=demo -c user.email=demo@example.com commit -q --allow-empty -m "second commit"
 echo "--- local main before run 2: $(git -C "$DEMO/work/repo" rev-parse --short main)"

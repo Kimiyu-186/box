@@ -1,7 +1,7 @@
 # Rendered by demo.sh: <DEMO> becomes the scratch directory, <DEVELOPER_DIR> the macOS developer
-# tools (`xcode-select -p`), <CARGO> the operator's cargo, and <RUSTUP_HOME> its toolchains.
-# <SDKROOT> is the macOS SDK, so rustc does not run xcrun to find it. <AGENT_SCRIPT> is the script
-# for this run.
+# tools (`xcode-select -p`), and <TOOLCHAIN> the rustup toolchain directory that `rustup which
+# cargo` names. <SDKROOT> is the macOS SDK, so rustc does not run xcrun to find it.
+# <AGENT_SCRIPT> is the script for this run. The packs are the full example packs.
 name = "packs-demo-temporal"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
@@ -24,10 +24,12 @@ env = { HOME = "<DEMO>/home", DEVELOPER_DIR = "<DEVELOPER_DIR>", TMPDIR = "<DEMO
 read = ["<DEMO>/work", "<DEMO>/home", "<DEVELOPER_DIR>", "<DEMO>/tmp"]
 write = ["<DEMO>/work", "<DEMO>/tmp"]
 
+# The toolchain's own cargo, not the rustup proxy: demo.sh starts `run` with <TOOLCHAIN>/bin first
+# on PATH, so the box's shell resolves `cargo` to this file.
 [tool.cargo]
-command = ["<CARGO>"]
-env = { HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", CARGO_HOME = "<DEMO>/cargo-home", RUSTUP_HOME = "<RUSTUP_HOME>", CARGO_TARGET_DIR = "<DEMO>/target", TMPDIR = "<DEMO>/tmp", DEVELOPER_DIR = "<DEVELOPER_DIR>", SDKROOT = "<SDKROOT>", CARGO_NET_OFFLINE = "true", CARGO_TERM_COLOR = "never" }
+command = ["<TOOLCHAIN>/bin/cargo"]
+env = { HOME = "<DEMO>/home", PATH = "<TOOLCHAIN>/bin:/usr/bin:/bin", CARGO_HOME = "<DEMO>/cargo-home", RUSTC = "<TOOLCHAIN>/bin/rustc", CARGO_TARGET_DIR = "<DEMO>/target", TMPDIR = "<DEMO>/tmp", DEVELOPER_DIR = "<DEVELOPER_DIR>", SDKROOT = "<SDKROOT>", CARGO_NET_OFFLINE = "true", CARGO_TERM_COLOR = "never" }
 
 [tool.cargo.filesystem]
-read = ["<DEMO>/work", "<DEMO>/home", "<CARGO_BIN>", "<RUSTUP_HOME>", "<DEVELOPER_DIR>", "<DEMO>/cargo-home", "<DEMO>/target", "<DEMO>/tmp"]
+read = ["<DEMO>/work", "<DEMO>/home", "<TOOLCHAIN>", "<DEVELOPER_DIR>", "<DEMO>/cargo-home", "<DEMO>/target", "<DEMO>/tmp"]
 write = ["<DEMO>/work/repo", "<DEMO>/cargo-home", "<DEMO>/target", "<DEMO>/tmp"]
