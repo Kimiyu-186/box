@@ -458,6 +458,7 @@ fn validate_mcp_schema_namespaces(
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flat_map(serde_json::Map::values)
+        .filter(|action| !(namespace.starts_with("Pack::") && action_is_pure_group(action)))
         .any(|action| {
             !action_applies_to(action, "principalTypes", "Box::Agent")
                 || !action_applies_to(action, "resourceTypes", "Box::Resource")
@@ -490,15 +491,29 @@ fn validate_mcp_schema_namespaces(
                 .to_string(),
         });
     }
-    if schema
-        .action_groups()
-        .any(|action| action.type_name().to_string() != "Box::Action")
-    {
+    if schema.action_groups().any(|action| {
+        action.type_name().to_string() != "Box::Action"
+            && !(namespace.starts_with("Pack::") && action.id().escaped() == "*")
+    }) {
         return Err(McpSchemaError::Composition {
             reason: "an MCP schema fragment declares an action group".to_string(),
         });
     }
     Ok(())
+}
+
+fn action_is_pure_group(action: &serde_json::Value) -> bool {
+    let empty = |field: &str| {
+        action
+            .get("appliesTo")
+            .and_then(|applies_to| applies_to.get(field))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    action
+        .get("appliesTo")
+        .is_none_or(serde_json::Value::is_null)
+        || (empty("principalTypes") && empty("resourceTypes"))
 }
 
 fn action_applies_to(action: &serde_json::Value, field: &str, expected: &str) -> bool {

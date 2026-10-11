@@ -22,6 +22,8 @@ pub(crate) const PACK_NAMESPACE: &str = "Pack";
 
 /// The action a command for a pack's program raises when no shell action matches it.
 pub(crate) const UNMODELED_ACTION: &str = "unmodeled";
+/// The pure action group every action of a pack belongs to: `Pack::<name>::Action::"*"`.
+pub(crate) const ALL_ACTIONS: &str = "*";
 
 /// A pack file could not be loaded.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -171,6 +173,7 @@ impl Pack {
         let base = "program: String, program_path: String, cwd: String, args: Set<String>, \
                     effects: Set<Effect>";
         let _ = writeln!(schema, "  type Output = {{ status: Long }};");
+        let _ = writeln!(schema, "  action {ALL_ACTIONS:?};");
         let typed = self.grammar.action_fields();
         let unmodeled: (&str, Vec<(&str, FieldKind)>) = (UNMODELED_ACTION, Vec::new());
         for (action, fields) in typed.iter().chain(std::iter::once(&unmodeled)) {
@@ -185,7 +188,7 @@ impl Pack {
             let _ = writeln!(schema, "  type {action}Input = {{ {record} }};");
             let _ = writeln!(
                 schema,
-                "  action {action:?} appliesTo {{\n    principal: [Box::Agent],\n    \
+                "  action {action:?} in [{ALL_ACTIONS:?}] appliesTo {{\n    principal: [Box::Agent],\n    \
                  resource: [Box::Resource],\n    context: {{ input: {action}Input, output?: Output }}\n  }};"
             );
         }

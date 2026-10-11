@@ -2,7 +2,8 @@
 //!
 //! With no argv after the pack, each stdin line is one command line, split on whitespace with
 //! single and double quotes grouping words, and the program word first. `PARSE_PACK_SCHEMA=1`
-//! prints the generated schema, and `PARSE_PACK_POLICY=<policy.dw>` validates a policy against it.
+//! prints the generated schema, and `PARSE_PACK_POLICY=<policy.dw>` validates a policy against it
+//! (with `PARSE_PACK_EXTRA=<a.pack.toml>:<b.pack.toml>` as more installed packs).
 
 use std::io::BufRead as _;
 use std::path::Path;
@@ -61,10 +62,21 @@ fn main() {
             origin: policy.clone().into(),
             text: std::fs::read_to_string(&policy).expect("read the policy"),
         };
+        let mut packs = vec![pack];
+        for extra in std::env::var("PARSE_PACK_EXTRA")
+            .unwrap_or_default()
+            .split(':')
+        {
+            if extra.is_empty() {
+                continue;
+            }
+            let text = std::fs::read_to_string(extra).expect("read the extra pack");
+            packs.push(policy::Pack::parse(&text, Path::new(extra)).expect("parse the extra pack"));
+        }
         match policy::PolicyEngine::validate_with_packs(
             &policy::Operator::unanchored(),
             &[source],
-            std::slice::from_ref(&pack),
+            &packs,
         ) {
             Ok(()) => println!("policy validates"),
             Err(error) => {
