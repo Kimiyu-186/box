@@ -182,6 +182,8 @@ impl LimitsInfo {
 pub struct ShellConfig {
     #[pyo3(get)]
     pub binds: Vec<BindInfo>,
+    #[pyo3(get)]
+    pub network_enabled: bool,
     /// List of `(key, value)` pairs, in declaration order.
     #[pyo3(get)]
     pub env: Vec<(String, String)>,
@@ -198,8 +200,9 @@ pub struct ShellConfig {
 impl ShellConfig {
     fn __repr__(&self) -> String {
         format!(
-            "ShellConfig(binds={} entries, env={} vars, umask={:#o}, timeout={:?})",
+            "ShellConfig(binds={} entries, network_enabled={}, env={} vars, umask={:#o}, timeout={:?})",
             self.binds.len(),
+            self.network_enabled,
             self.env.len(),
             self.umask,
             self.timeout
@@ -327,6 +330,11 @@ impl ShellBuilder {
         chain(slf, |b| b.max_inodes(n))
     }
 
+    /// Disable all network requests dispatched by this Shell.
+    fn disable_network(slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        chain(slf, crate::shell::ShellBuilder::disable_network)
+    }
+
     /// Load config from a TOML file.
     fn config_file<'py>(mut slf: PyRefMut<'py, Self>, path: &str) -> PyResult<PyRefMut<'py, Self>> {
         let b = slf
@@ -435,6 +443,7 @@ impl Shell {
                     readonly: b.readonly,
                 })
                 .collect(),
+            network_enabled: c.network_enabled,
             env: c.env.clone(),
             umask: c.umask,
             timeout: c.timeout_secs,

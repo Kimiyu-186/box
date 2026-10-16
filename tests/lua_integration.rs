@@ -1,3 +1,14 @@
+//! Functional behaviour of the `lua` builtin: does Lua run like Lua.
+//!
+//! Every case builds an allow-all `Shell` and asserts stdout, exit status, or stderr. It
+//! covers `print`, arithmetic, the `string`/`table`/`math` libraries, control flow, and the
+//! shimmed `io.*`/`os.*`/`require`/`dofile`/`loadfile` surface behaving as a script expects.
+//!
+//! It does **not** test the security boundary. Whether a Lua effect is admitted by the box's
+//! policy, fails closed when denied, or leaks the operator environment lives in
+//! `lua_policy_admission.rs`, which builds a Shell with an `EffectInterceptor` — a different
+//! harness for a different question.
+
 use strands_shell::Shell;
 
 fn rt() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {

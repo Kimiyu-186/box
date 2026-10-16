@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mcp_client::NamedMcpClient;
-use crate::os::{Fd, FdReader, FdWriter, Kernel, OpenFlags, Process, STDERR, STDIN, STDOUT};
+use crate::mediate::Mediated;
+use crate::os::{Fd, FdReader, FdWriter, OpenFlags, Process, STDERR, STDIN, STDOUT};
 
 tokio::task_local! {
     pub static CURRENT_PROCESS: RefCell<Process>;
-    pub static CURRENT_KERNEL: Arc<dyn Kernel>;
+    pub static CURRENT_KERNEL: Arc<Mediated>;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,8 +18,12 @@ thread_local! {
     static MCP_CLIENTS: RefCell<Option<Rc<Vec<NamedMcpClient>>>> = const { RefCell::new(None) };
 }
 
-/// Get the current kernel Arc from the task-local context.
-pub fn kernel() -> Arc<dyn Kernel> {
+/// The mediating kernel handle for the current task.
+///
+/// Carries [`Mediated`], not a bare `Mediated`: this task-local is the ambient
+/// route by which re-entrant commands (`xargs`, `find -exec`, `lua`, `sed`) reach
+/// the kernel. Handing them the raw trait would leave those routes unadmitted.
+pub fn kernel() -> Arc<Mediated> {
     CURRENT_KERNEL.with(|k| k.clone())
 }
 
@@ -68,7 +73,7 @@ where
 }
 
 /// Open a file via the kernel, using the current process for path resolution.
-pub async fn open(os: &dyn Kernel, path: &str, flags: OpenFlags) -> std::io::Result<Fd> {
+pub async fn open(os: &Mediated, path: &str, flags: OpenFlags) -> std::io::Result<Fd> {
     // Borrow process only for the synchronous parts inside open.
     // The Kernel::open takes &mut Process, so we temporarily take it out.
     let mut proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
@@ -78,7 +83,7 @@ pub async fn open(os: &dyn Kernel, path: &str, flags: OpenFlags) -> std::io::Res
 }
 
 /// Change directory via the kernel on the current process.
-pub async fn change_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
+pub async fn change_dir(os: &Mediated, path: &str) -> std::io::Result<()> {
     let mut proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.change_dir(&mut proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -86,7 +91,7 @@ pub async fn change_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
 }
 
 /// List directory via the kernel using the current process for path resolution.
-pub async fn list_dir(os: &dyn Kernel, path: &str) -> std::io::Result<Vec<crate::os::DirEntry>> {
+pub async fn list_dir(os: &Mediated, path: &str) -> std::io::Result<Vec<crate::os::DirEntry>> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.list_dir(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -94,7 +99,7 @@ pub async fn list_dir(os: &dyn Kernel, path: &str) -> std::io::Result<Vec<crate:
 }
 
 /// Lstat a file (don't follow symlinks) via the kernel.
-pub async fn lstat(os: &dyn Kernel, path: &str) -> crate::os::FileStat {
+pub async fn lstat(os: &Mediated, path: &str) -> crate::os::FileStat {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.lstat(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -102,7 +107,7 @@ pub async fn lstat(os: &dyn Kernel, path: &str) -> crate::os::FileStat {
 }
 
 /// Stat a file via the kernel using the current process for path resolution.
-pub async fn stat(os: &dyn Kernel, path: &str) -> crate::os::FileStat {
+pub async fn stat(os: &Mediated, path: &str) -> crate::os::FileStat {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.stat(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -110,7 +115,7 @@ pub async fn stat(os: &dyn Kernel, path: &str) -> crate::os::FileStat {
 }
 
 /// Remove a file via the kernel.
-pub async fn remove_file(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
+pub async fn remove_file(os: &Mediated, path: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.remove_file(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -118,7 +123,7 @@ pub async fn remove_file(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
 }
 
 /// Remove an empty directory via the kernel.
-pub async fn remove_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
+pub async fn remove_dir(os: &Mediated, path: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.remove_dir(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -126,7 +131,7 @@ pub async fn remove_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
 }
 
 /// Create a directory via the kernel.
-pub async fn create_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
+pub async fn create_dir(os: &Mediated, path: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.create_dir(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -134,7 +139,7 @@ pub async fn create_dir(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
 }
 
 /// Rename (move) a file or directory via the kernel.
-pub async fn rename(os: &dyn Kernel, from: &str, to: &str) -> std::io::Result<()> {
+pub async fn rename(os: &Mediated, from: &str, to: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.rename(&proc, from, to).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -142,7 +147,7 @@ pub async fn rename(os: &dyn Kernel, from: &str, to: &str) -> std::io::Result<()
 }
 
 /// Create a symbolic link via the kernel.
-pub async fn symlink(os: &dyn Kernel, target: &str, link: &str) -> std::io::Result<()> {
+pub async fn symlink(os: &Mediated, target: &str, link: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.symlink(&proc, target, link).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -150,7 +155,7 @@ pub async fn symlink(os: &dyn Kernel, target: &str, link: &str) -> std::io::Resu
 }
 
 /// Read a symbolic link target via the kernel.
-pub async fn read_link(os: &dyn Kernel, path: &str) -> std::io::Result<String> {
+pub async fn read_link(os: &Mediated, path: &str) -> std::io::Result<String> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.read_link(&proc, path).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));
@@ -158,7 +163,7 @@ pub async fn read_link(os: &dyn Kernel, path: &str) -> std::io::Result<String> {
 }
 
 /// Set permissions on a path via the kernel.
-pub async fn set_permissions(os: &dyn Kernel, path: &str, mode: u32) -> std::io::Result<()> {
+pub async fn set_permissions(os: &Mediated, path: &str, mode: u32) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
     let result = os.set_permissions(&proc, path, mode).await;
     CURRENT_PROCESS.with(|p| p.replace(proc));

@@ -7,7 +7,7 @@ Options:
   -f  ignore nonexistent files
   -r  remove directories and their contents recursively";
 
-async fn remove_recursive(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
+async fn remove_recursive(os: &Mediated, path: &str) -> std::io::Result<()> {
     let st = io::lstat(os, path).await;
     if st.is_dir && !st.is_symlink {
         for entry in io::list_dir(os, path).await? {
@@ -21,7 +21,7 @@ async fn remove_recursive(os: &dyn Kernel, path: &str) -> std::io::Result<()> {
 }
 
 #[command("rm")]
-async fn cmd_rm(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_rm(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut force = false;
     let mut recursive = false;

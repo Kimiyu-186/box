@@ -7,7 +7,7 @@ Options:
   -s  create symbolic link";
 
 #[command("ln")]
-async fn cmd_ln(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_ln(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut symbolic = false;
     let mut paths = Vec::new();

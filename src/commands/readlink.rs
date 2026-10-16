@@ -4,7 +4,7 @@ const HELP: &str = "Usage: readlink FILE
 Print the target of a symbolic link.";
 
 #[command("readlink")]
-async fn cmd_readlink(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_readlink(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut path = None;
     while let Some(arg) = parser.next()? {

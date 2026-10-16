@@ -7,7 +7,7 @@ Options:
   -f, --force  do not prompt before overwriting (the default)";
 
 #[command("mv")]
-async fn cmd_mv(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_mv(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut paths = Vec::new();
     while let Some(arg) = parser.next()? {

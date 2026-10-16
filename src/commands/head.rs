@@ -8,7 +8,7 @@ Options:
   -c, --bytes BYTES   number of bytes to show";
 
 #[command("head")]
-async fn cmd_head(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_head(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(legacy_count(args));
     let mut n: usize = 10;
     let mut bytes: Option<u64> = None;

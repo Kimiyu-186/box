@@ -2,10 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::mediate::Mediated;
+use crate::os::Process;
 
 pub fn builtin_unset<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {

@@ -212,7 +212,7 @@ fn dir_excluded(name: &str, opts: &Opts) -> bool {
     opts.exclude_dir.iter().any(|g| glob_matches(g, name))
 }
 
-async fn collect_files_recursive(os: &dyn Kernel, path: &str, opts: &Opts, out: &mut Vec<String>) {
+async fn collect_files_recursive(os: &Mediated, path: &str, opts: &Opts, out: &mut Vec<String>) {
     let proc = io::with_process(|p| p.fork());
     let entries = match os.list_dir(&proc, path).await {
         Ok(e) => e,
@@ -445,7 +445,7 @@ async fn grep_reader<R: tokio::io::AsyncRead + Unpin + Send>(
 }
 
 #[command("grep")]
-async fn cmd_grep(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_grep(os: &Mediated, args: &[String]) -> CommandResult {
     let opts = match parse_args(args) {
         Ok(Some(o)) => o,
         Ok(None) => {

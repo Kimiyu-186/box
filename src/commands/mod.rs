@@ -35,7 +35,7 @@ mod wc;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::os::Kernel;
+use crate::mediate::Mediated;
 
 /// The result type for shell commands.
 /// Ok(code) = clean exit, Err = abnormal termination.
@@ -43,7 +43,7 @@ pub type CommandResult = Result<i32, Box<dyn std::error::Error + Send + Sync>>;
 
 /// The function signature for a shell command.
 pub type CommandFn = for<'a> fn(
-    &'a dyn Kernel,
+    &'a Mediated,
     &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + Send + 'a>>;
 

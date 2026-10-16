@@ -4,7 +4,7 @@ const HELP: &str = "Usage: sleep SECONDS
 Pause for SECONDS (accepts decimals).";
 
 #[command("sleep")]
-async fn cmd_sleep(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_sleep(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut secs = None;
     while let Some(arg) = parser.next()? {

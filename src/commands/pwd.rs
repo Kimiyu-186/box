@@ -4,7 +4,7 @@ const HELP: &str = "Usage: pwd
 Print the current working directory.";
 
 #[command("pwd")]
-async fn cmd_pwd(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_pwd(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     if let Some(arg) = parser.next()? {
         match arg {

@@ -31,6 +31,15 @@ test('the documented builder pattern works', async () => {
   assert.match(out.stdout, /\/home\/lash/)
 })
 
+test('disableNetwork blocks kernel network dispatch', async () => {
+  const shell = await native.Shell.builder().disableNetwork().build()
+  const out = await shell.run('curl -s https://example.com')
+  assert.notEqual(out.status, 0)
+  assert.match(out.stderr, /network access disabled/)
+  const config = await shell.config()
+  assert.equal(config.networkEnabled, false)
+})
+
 test('full chain spanning bind, limits, env, umask', async () => {
   const hostDir = await makeHostDir()
   try {

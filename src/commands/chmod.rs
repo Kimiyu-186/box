@@ -65,7 +65,7 @@ fn parse_symbolic_mode(
 }
 
 #[command("chmod")]
-async fn cmd_chmod(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_chmod(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut mode_str = None;
     let mut files = Vec::new();

@@ -4,7 +4,7 @@ const HELP: &str = "Usage: env
 Print the environment.";
 
 #[command("env")]
-async fn cmd_env(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_env(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     if let Some(arg) = parser.next()? {
         match arg {

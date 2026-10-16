@@ -7,7 +7,7 @@ Options:
   -a    append to files instead of overwriting";
 
 #[command("tee")]
-async fn cmd_tee(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_tee(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut append = false;
     let mut files = Vec::new();

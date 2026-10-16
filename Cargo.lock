@@ -1534,6 +1534,7 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "lexopt",
+ "libc",
  "mlua",
  "napi",
  "napi-build",

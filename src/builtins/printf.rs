@@ -2,11 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::os::Process;
 use crate::prelude::*;
 
 pub fn builtin_printf<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     _proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {

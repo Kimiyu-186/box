@@ -25,6 +25,9 @@ fn alloc_ino() -> Ino {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The error `Vfs::resolve` and `Vfs::canonicalize_path` report for a symlink loop.
+pub const SYMLINK_LOOP: &str = "too many levels of symbolic links";
+
 /// The data payload of an inode.
 #[derive(Clone)]
 pub enum InodeData {
@@ -126,7 +129,7 @@ impl Vfs {
 
     fn resolve_depth(&self, path: &str, follow_last: bool, depth: u32) -> io::Result<Ino> {
         if depth > 40 {
-            return Err(io::Error::other("too many levels of symbolic links"));
+            return Err(io::Error::other(SYMLINK_LOOP));
         }
         let path = normalize(path);
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
@@ -234,54 +237,84 @@ impl Vfs {
         self.canonicalize_depth(path, 0)
     }
 
+    /// The canonical path of the longest prefix of `path` that canonicalizes, and the number of
+    /// components of the normalized `path` that the prefix holds.
+    pub(crate) fn canonicalize_prefix(&self, path: &str) -> (String, usize) {
+        let (result, consumed, _) = self.canonicalize_walk(path, 0);
+        (format!("/{}", result.join("/")), consumed)
+    }
+
     fn canonicalize_depth(&self, path: &str, depth: u32) -> io::Result<String> {
+        match self.canonicalize_walk(path, depth) {
+            (result, _, None) => Ok(format!("/{}", result.join("/"))),
+            (_, _, Some(error)) => Err(error),
+        }
+    }
+
+    fn canonicalize_walk(&self, path: &str, depth: u32) -> (Vec<String>, usize, Option<io::Error>) {
         if depth > 40 {
-            return Err(io::Error::other("too many levels of symbolic links"));
+            return (Vec::new(), 0, Some(io::Error::other(SYMLINK_LOOP)));
         }
         let path = normalize(path);
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let mut result = Vec::new();
         let mut current = ROOT_INO;
 
-        for comp in &components {
-            let inode = self.get(current)?;
-            match &inode.data {
-                InodeData::Dir(entries) => {
-                    let child_ino = *entries.get(*comp).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "no such file or directory")
-                    })?;
-                    let child = self.get(child_ino)?;
-                    if let InodeData::Symlink(target) = &child.data {
-                        let base = if result.is_empty() {
-                            "/".to_string()
-                        } else {
-                            format!("/{}", result.join("/"))
-                        };
-                        let resolved = resolve_relative(&base, target);
-                        let canonical = self.canonicalize_depth(&resolved, depth + 1)?;
-                        // Replace result with the resolved canonical components
-                        result = canonical
-                            .split('/')
-                            .filter(|c| !c.is_empty())
-                            .map(String::from)
-                            .collect();
-                        // Update current to the resolved inode
-                        current = self.resolve(&canonical, true)?;
-                    } else {
-                        result.push(comp.to_string());
-                        current = child_ino;
-                    }
+        for (consumed, comp) in components.iter().enumerate() {
+            match self.canonicalize_step(current, &result, comp, depth) {
+                Ok((next, Some(canonical))) => {
+                    result = canonical;
+                    current = next;
                 }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotADirectory,
-                        "not a directory",
-                    ));
+                Ok((next, None)) => {
+                    result.push(comp.to_string());
+                    current = next;
                 }
+                Err(error) => return (result, consumed, Some(error)),
             }
         }
 
-        Ok(format!("/{}", result.join("/")))
+        (result, components.len(), None)
+    }
+
+    /// Resolve `comp` under `current`, whose canonical components are `result`.
+    ///
+    /// Returns the child inode, and the replacement components when `comp` is a symlink.
+    fn canonicalize_step(
+        &self,
+        current: Ino,
+        result: &[String],
+        comp: &str,
+        depth: u32,
+    ) -> io::Result<(Ino, Option<Vec<String>>)> {
+        let inode = self.get(current)?;
+        let InodeData::Dir(entries) = &inode.data else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        };
+        let child_ino = *entries
+            .get(comp)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file or directory"))?;
+        let child = self.get(child_ino)?;
+        let InodeData::Symlink(target) = &child.data else {
+            return Ok((child_ino, None));
+        };
+        let base = if result.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", result.join("/"))
+        };
+        let resolved = resolve_relative(&base, target);
+        let canonical = self.canonicalize_depth(&resolved, depth + 1)?;
+        let next = self.resolve(&canonical, true)?;
+        let components = canonical
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .collect();
+        Ok((next, Some(components)))
     }
 
     fn check_inode_limit(&self) -> io::Result<()> {
@@ -518,7 +551,10 @@ impl Vfs {
     /// Write file contents (replace entirely).
     pub fn write_file(&mut self, ino: Ino, data: Vec<u8>) -> io::Result<()> {
         if self.max_file_size > 0 && data.len() > self.max_file_size {
-            return Err(io::Error::other("file size limit exceeded"));
+            return Err(io::Error::other(format!(
+                "file size limit exceeded ({} bytes)",
+                self.max_file_size
+            )));
         }
         let inode = self.get_mut(ino)?;
         match &mut inode.data {
@@ -541,7 +577,9 @@ impl Vfs {
         match &mut inode.data {
             InodeData::File(buf) => {
                 if max > 0 && buf.len() + data.len() > max {
-                    return Err(io::Error::other("file size limit exceeded"));
+                    return Err(io::Error::other(format!(
+                        "file size limit exceeded ({max} bytes)"
+                    )));
                 }
                 buf.extend_from_slice(data);
                 inode.mtime = SystemTime::now();

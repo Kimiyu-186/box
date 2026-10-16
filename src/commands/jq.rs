@@ -155,7 +155,7 @@ fn run_filter(
 }
 
 #[command("jq")]
-async fn cmd_jq(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_jq(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut raw_output = false;
     let mut raw_input = false;

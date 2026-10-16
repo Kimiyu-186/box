@@ -4,7 +4,7 @@ const HELP: &str = "Usage: rmdir DIRECTORY...
 Remove empty directories.";
 
 #[command("rmdir")]
-async fn cmd_rmdir(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_rmdir(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut dirs = Vec::new();
     while let Some(arg) = parser.next()? {

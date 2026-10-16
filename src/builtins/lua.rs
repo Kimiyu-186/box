@@ -9,10 +9,11 @@ use mlua::prelude::*;
 use crate::commands::CommandResult;
 use crate::exec;
 use crate::io as sio;
-use crate::os::{self, Kernel, OpenFlags, Process};
+use crate::mediate::Mediated;
+use crate::os::{self, OpenFlags, Process};
 
 pub fn builtin_lua<'a>(
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
@@ -329,7 +330,7 @@ pub async fn repl_loop(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
-async fn run_repl(_os: &dyn Kernel, proc: &mut Process) -> CommandResult {
+async fn run_repl(_os: &Mediated, proc: &mut Process) -> CommandResult {
     let stdout_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let stderr_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -362,7 +363,7 @@ async fn run_repl(_os: &dyn Kernel, proc: &mut Process) -> CommandResult {
 }
 
 #[cfg(any(target_arch = "wasm32", not(feature = "cli")))]
-async fn run_repl(_os: &dyn Kernel, proc: &mut Process) -> CommandResult {
+async fn run_repl(_os: &Mediated, proc: &mut Process) -> CommandResult {
     let stdout_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let stderr_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -415,7 +416,7 @@ fn strip_shebang(code: &str) -> &str {
 }
 
 async fn read_vfs_file(
-    kernel: &Arc<dyn Kernel>,
+    kernel: &Arc<Mediated>,
     cwd: &str,
     env: &Arc<std::collections::HashMap<String, String>>,
     path: &str,
@@ -462,7 +463,7 @@ fn make_read_handle(lua: &Lua, data: Vec<u8>) -> LuaResult<LuaTable> {
 
 fn setup_sandbox(
     lua: &Lua,
-    kernel: Arc<dyn Kernel>,
+    kernel: Arc<Mediated>,
     proc: &mut Process,
     script_args: &[String],
     stdin_data: &str,

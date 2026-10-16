@@ -4,7 +4,7 @@ const HELP: &str = "Usage: basename NAME [SUFFIX]
 Strip directory and optional SUFFIX from NAME.";
 
 #[command("basename")]
-async fn cmd_basename(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_basename(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut values = Vec::new();
     while let Some(arg) = parser.next()? {

@@ -1,6 +1,17 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::ops::ControlFlow;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,15 +20,187 @@ use tokio::sync::Mutex;
 use crate::os::*;
 use crate::vfs::{self, InodeData, LASH_GID, LASH_UID, Vfs};
 
+/// The most dangling symlinks `resolved_target` replaces in one path.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
 /// A Kernel backed entirely by the in-memory VFS.
 pub struct VfsKernel {
     pub vfs: Arc<Mutex<Vfs>>,
+    pub network_enabled: bool,
+    resolution_generation: Arc<Mutex<u64>>,
+    pending_writes: std::sync::Mutex<Vec<PendingWrite>>,
+}
+
+/// Chunks a host writer may hold in flight before the writer waits for the drain.
+const HOST_WRITER_DEPTH: usize = 64;
+
+/// One file write whose drain task may still be running.
+struct PendingWrite {
+    path: String,
+    writer: tokio::sync::mpsc::WeakSender<bytes::Bytes>,
+    drain: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl VfsKernel {
     pub fn new(vfs: Vfs) -> Self {
         Self {
             vfs: Arc::new(Mutex::new(vfs)),
+            network_enabled: true,
+            resolution_generation: Arc::new(Mutex::new(0)),
+            pending_writes: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn track_write(
+        &self,
+        path: &str,
+        writer: tokio::sync::mpsc::WeakSender<bytes::Bytes>,
+        drain: tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        self.pending_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingWrite {
+                path: path.to_string(),
+                writer,
+                drain,
+            });
+    }
+
+    /// The drains whose writers are all closed, removed from the pending list.
+    fn closed_writes(&self) -> Vec<PendingWrite> {
+        let mut pending = self
+            .pending_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (closed, open): (Vec<_>, Vec<_>) = pending
+            .drain(..)
+            .partition(|write| write.writer.strong_count() == 0);
+        *pending = open;
+        closed
+    }
+
+    fn changed_resolution(generation: &mut u64) {
+        *generation = generation.wrapping_add(1);
+    }
+
+    fn stale_resolution() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "filesystem identity changed during effect admission",
+        )
+    }
+
+    async fn resolution_is_current(&self, path: &Resolved, generation: u64) -> bool {
+        if path.generation() != generation {
+            return false;
+        }
+        let vfs = self.vfs.lock().await;
+        Self::host_identity(&vfs, path.path(), path.follow()).as_ref() == path.host_identity()
+    }
+
+    async fn guard_resolution(
+        &self,
+        path: &Resolved,
+    ) -> io::Result<tokio::sync::MutexGuard<'_, u64>> {
+        let generation = self.resolution_generation.lock().await;
+        if !self.resolution_is_current(path, *generation).await {
+            return Err(Self::stale_resolution());
+        }
+        Ok(generation)
+    }
+
+    /// Resolve `abs_path` to the object an operation will actually act on.
+    ///
+    /// `abs` only normalizes the *string* — it applies the working directory and folds
+    /// `.` and `..`. It does not follow symlinks, so admitting its output would
+    /// authorize the link's own name while the operation reads the link's target. A
+    /// policy denying a path could then be evaded by reading a symlink to it.
+    ///
+    /// Operations with follow semantics are therefore admitted on the fully resolved
+    /// path. Operations that deliberately do not follow a final symlink — `lstat`,
+    /// `read_link`, `remove_file`, and the link side of a pair — keep the unresolved
+    /// spelling, because the link itself is the object they act on.
+    ///
+    /// A path whose leaf does not exist yet — a create, or `mkdir -p` several levels
+    /// deep — still has its **existing ancestors** resolved, and the missing tail is
+    /// appended to that canonical base. Resolving only the whole path would fall back
+    /// to the unresolved spelling for every create, which is exactly the case a
+    /// directory symlink exploits: `ln -s /secrets /alias` then writing
+    /// `/alias/newfile` must be authorized as `/secrets/newfile`.
+    ///
+    /// A dangling symlink on the path is replaced by the path it names. A path that has too many
+    /// symlinks for `Vfs::resolve` keeps its spelling.
+    async fn resolved_target(&self, abs_path: &str) -> String {
+        let vfs = self.vfs.lock().await;
+        if vfs
+            .resolve(abs_path, true)
+            .is_err_and(|error| error.to_string() == vfs::SYMLINK_LOOP)
+        {
+            return abs_path.to_string();
+        }
+        let mut path = abs_path.to_string();
+        for _ in 0..=MAX_SYMLINK_HOPS {
+            match Self::resolve_existing_prefix(&vfs, &path) {
+                ControlFlow::Break(resolved) => return resolved,
+                ControlFlow::Continue(named) => path = named,
+            }
+        }
+        abs_path.to_string()
+    }
+
+    /// Canonicalize the existing prefix of `abs_path` and re-append the missing tail.
+    ///
+    /// Continues with the path a dangling symlink names when the first missing component
+    /// is one.
+    fn resolve_existing_prefix(vfs: &Vfs, abs_path: &str) -> ControlFlow<String, String> {
+        let (canonical, consumed) = vfs.canonicalize_prefix(abs_path);
+        let normalized = vfs::normalize(abs_path);
+        let mut components = normalized
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .skip(consumed);
+        let Some(first) = components.next() else {
+            return ControlFlow::Break(canonical);
+        };
+        let base = canonical.trim_end_matches('/');
+        let child = format!("{base}/{first}");
+        let dangling = Self::symlink_target(vfs, &child);
+        let mut resolved = match &dangling {
+            Some(target) if target.starts_with('/') => vfs::normalize(target),
+            Some(target) => vfs::normalize(&format!("{base}/{target}")),
+            None => child,
+        };
+        for component in components {
+            resolved.push('/');
+            resolved.push_str(component);
+        }
+        match dangling {
+            Some(_) => ControlFlow::Continue(resolved),
+            None => ControlFlow::Break(resolved),
+        }
+    }
+
+    /// Whether the entry at `path` is itself a host bind.
+    fn is_bind_point(vfs: &Vfs, path: &str) -> bool {
+        vfs.resolve(path, false)
+            .and_then(|ino| vfs.get(ino))
+            .is_ok_and(|inode| {
+                matches!(inode.data, InodeData::HostFile(..) | InodeData::HostDir(..))
+            })
+    }
+
+    /// The refusal for removing or replacing a bind point.
+    fn bind_point_busy() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, "bind mount point is busy")
+    }
+
+    /// The target of the symlink at `path`, when the entry there is one.
+    fn symlink_target(vfs: &Vfs, path: &str) -> Option<String> {
+        let inode = vfs.get(vfs.resolve(path, false).ok()?).ok()?;
+        match &inode.data {
+            InodeData::Symlink(target) => Some(target.clone()),
+            _ => None,
         }
     }
 
@@ -119,39 +302,181 @@ impl VfsKernel {
         None
     }
 
+    fn resolve_host_for(
+        vfs: &Vfs,
+        abs_path: &str,
+        follow: Follow,
+    ) -> Option<(PathBuf, bool, PathBuf)> {
+        if follow == Follow::Yes || Self::is_bind_point(vfs, abs_path) {
+            return Self::resolve_host(vfs, abs_path);
+        }
+        let (parent, leaf) = match abs_path.rfind('/') {
+            Some(0) => ("/", &abs_path[1..]),
+            Some(index) => (&abs_path[..index], &abs_path[index + 1..]),
+            None => ("", abs_path),
+        };
+        if leaf.is_empty() {
+            return Self::resolve_host(vfs, abs_path);
+        }
+        let (host_parent, readonly, base) = Self::resolve_host(vfs, parent)?;
+        Some((host_parent.join(leaf), readonly, base))
+    }
+
+    fn host_identity(vfs: &Vfs, abs_path: &str, follow: Follow) -> Option<HostIdentity> {
+        let (path, _, _) = Self::resolve_host_for(vfs, abs_path, follow)?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        let parent_metadata = std::fs::metadata(&parent).ok()?;
+        let metadata = if follow == Follow::Yes {
+            std::fs::metadata(&path)
+        } else {
+            std::fs::symlink_metadata(&path)
+        };
+        match metadata {
+            Ok(metadata) => Some(HostIdentity::Present {
+                path,
+                parent,
+                #[cfg(unix)]
+                device: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                parent_device: parent_metadata.dev(),
+                #[cfg(unix)]
+                parent_inode: parent_metadata.ino(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(HostIdentity::Missing {
+                path,
+                parent,
+                #[cfg(unix)]
+                parent_device: parent_metadata.dev(),
+                #[cfg(unix)]
+                parent_inode: parent_metadata.ino(),
+            }),
+            Err(_) => Some(HostIdentity::Unavailable { path }),
+        }
+    }
+
+    #[cfg(unix)]
+    fn opened_parent(host_path: &Path, expected: &HostIdentity) -> io::Result<(File, CString)> {
+        let (identity_path, parent, parent_device, parent_inode) = match expected {
+            HostIdentity::Present {
+                path,
+                parent,
+                parent_device,
+                parent_inode,
+                ..
+            }
+            | HostIdentity::Missing {
+                path,
+                parent,
+                parent_device,
+                parent_inode,
+            } => (path, parent, *parent_device, *parent_inode),
+            HostIdentity::Unavailable { .. } => return Err(Self::stale_resolution()),
+        };
+        if identity_path != host_path {
+            return Err(Self::stale_resolution());
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)?;
+        let metadata = directory.metadata()?;
+        if metadata.dev() != parent_device || metadata.ino() != parent_inode {
+            return Err(Self::stale_resolution());
+        }
+        let leaf = host_path.file_name().ok_or_else(Self::stale_resolution)?;
+        let leaf = CString::new(leaf.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "host path contains a NUL byte")
+        })?;
+        Ok((directory, leaf))
+    }
+
+    #[cfg(unix)]
+    fn open_host_file(
+        host_path: &Path,
+        flags: &OpenFlags,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<File> {
+        let expected = expected.ok_or_else(Self::stale_resolution)?;
+        let (parent, leaf) = Self::opened_parent(host_path, expected)?;
+        let mut open_flags = if flags.write && (flags.read || flags.append) {
+            libc::O_RDWR
+        } else if flags.write {
+            libc::O_WRONLY
+        } else {
+            libc::O_RDONLY
+        };
+        open_flags |= libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if flags.create {
+            open_flags |= libc::O_CREAT;
+        }
+        match expected {
+            HostIdentity::Present { .. } => {}
+            HostIdentity::Missing { .. } => {
+                if !flags.create {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "host path does not exist",
+                    ));
+                }
+                open_flags |= libc::O_EXCL;
+            }
+            HostIdentity::Unavailable { .. } => return Err(Self::stale_resolution()),
+        }
+        // SAFETY: parent and leaf are owned, valid handles. The returned descriptor is checked.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                open_flags,
+                0o666 as libc::c_uint,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned this owned descriptor and File closes it once.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if let HostIdentity::Present { device, inode, .. } = expected {
+            let metadata = file.metadata()?;
+            if metadata.dev() != *device || metadata.ino() != *inode {
+                return Err(Self::stale_resolution());
+            }
+        }
+        if flags.truncate {
+            file.set_len(0)?;
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn open_host_file(
+        host_path: &Path,
+        flags: &OpenFlags,
+        _expected: Option<&HostIdentity>,
+    ) -> io::Result<File> {
+        OpenOptions::new()
+            .read(flags.read || flags.append)
+            .write(flags.write)
+            .create(flags.create)
+            .append(flags.append)
+            .truncate(flags.truncate)
+            .open(host_path)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     async fn open_host(
         &self,
         proc: &mut Process,
+        spelled: &str,
         host_path: &std::path::Path,
         flags: &OpenFlags,
-        canon_base: &std::path::Path,
+        expected: Option<&HostIdentity>,
     ) -> io::Result<Fd> {
+        let mut file = Self::open_host_file(host_path, flags, expected)?;
         if flags.read && !flags.write {
-            let file = std::fs::File::open(host_path)?;
-
-            // Defense-in-depth TOCTOU re-check (Linux-only): /proc/self/fd has
-            // no portable equivalent, and the canonical-path check above is the
-            // primary guard, so this extra layer is simply skipped elsewhere.
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-                if let Ok(real) = std::fs::read_link(&fd_path)
-                    && !real.starts_with(canon_base)
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "access denied: path escaped bind mount",
-                    ));
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = canon_base; // only consumed by the Linux-only check above
-
-            use std::io::Read;
             let mut data = Vec::new();
-            let mut file = file;
             file.read_to_end(&mut data)?;
             let (tx, rx) = crate::os::pipe(data.len().max(64));
             let _ = tx.send(bytes::Bytes::from(data)).await;
@@ -161,31 +486,31 @@ impl VfsKernel {
                 buf: Vec::new(),
             })
         } else if flags.write {
-            let (tx, rx) = crate::os::pipe(8192);
-            let size_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, rx) = crate::os::pipe(HOST_WRITER_DEPTH);
+            let writer = tx.downgrade();
             let fd = proc.alloc_fd(FdKind::ChannelWriter {
                 tx,
-                error_flag: Some(size_error.clone()),
+                limit: Some(WriteLimit::new(0, 0)),
             })?;
-            let path = host_path.to_path_buf();
             let append = flags.append;
-            let max_file_size = self.vfs.lock().await.max_file_size;
-            tokio::task::spawn_local(async move {
+            let drain = tokio::task::spawn_local(async move {
                 let mut rx = rx;
-                let mut buf = if append {
-                    tokio::fs::read(&path).await.unwrap_or_default()
+                let mut written = if append {
+                    file.seek(SeekFrom::End(0))?
                 } else {
-                    Vec::new()
+                    0
                 };
                 while let Some(chunk) = rx.recv().await {
-                    if max_file_size > 0 && buf.len() + chunk.len() > max_file_size {
-                        size_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk);
+                    file.write_all(&chunk)?;
+                    written += chunk.len() as u64;
                 }
-                let _ = tokio::fs::write(&path, &buf).await;
+                if append {
+                    Ok(())
+                } else {
+                    file.set_len(written)
+                }
             });
+            self.track_write(spelled, writer, drain);
             Ok(fd)
         } else {
             Err(io::Error::new(
@@ -195,13 +520,218 @@ impl VfsKernel {
         }
     }
 
+    #[cfg(unix)]
+    fn unlink_host(
+        host_path: &Path,
+        expected: Option<&HostIdentity>,
+        directory: bool,
+    ) -> io::Result<()> {
+        let expected = expected.ok_or_else(Self::stale_resolution)?;
+        let (parent, leaf) = Self::opened_parent(host_path, expected)?;
+        let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: parent and leaf are owned, valid handles.
+        let result = unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unlink_host(
+        host_path: &Path,
+        _expected: Option<&HostIdentity>,
+        directory: bool,
+    ) -> io::Result<()> {
+        if directory {
+            std::fs::remove_dir(host_path)
+        } else {
+            std::fs::remove_file(host_path)
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_host_directory(host_path: &Path, expected: Option<&HostIdentity>) -> io::Result<()> {
+        let expected = expected.ok_or_else(Self::stale_resolution)?;
+        let (parent, leaf) = Self::opened_parent(host_path, expected)?;
+        // SAFETY: parent and leaf are owned, valid handles.
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o777) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn create_host_directory(host_path: &Path, _expected: Option<&HostIdentity>) -> io::Result<()> {
+        std::fs::create_dir(host_path)
+    }
+
+    #[cfg(unix)]
+    fn rename_host(
+        from: &Path,
+        from_expected: Option<&HostIdentity>,
+        to: &Path,
+        to_expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
+        let from_expected = from_expected.ok_or_else(Self::stale_resolution)?;
+        let to_expected = to_expected.ok_or_else(Self::stale_resolution)?;
+        let (from_parent, from_leaf) = Self::opened_parent(from, from_expected)?;
+        let (to_parent, to_leaf) = Self::opened_parent(to, to_expected)?;
+        // SAFETY: both parent and leaf pairs are owned, valid handles.
+        let result = unsafe {
+            libc::renameat(
+                from_parent.as_raw_fd(),
+                from_leaf.as_ptr(),
+                to_parent.as_raw_fd(),
+                to_leaf.as_ptr(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn rename_host(
+        from: &Path,
+        _from_expected: Option<&HostIdentity>,
+        to: &Path,
+        _to_expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    #[cfg(unix)]
+    fn create_host_symlink(
+        target: &str,
+        link: &Path,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
+        let expected = expected.ok_or_else(Self::stale_resolution)?;
+        let (parent, leaf) = Self::opened_parent(link, expected)?;
+        let target = CString::new(target.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "symlink target contains a NUL byte",
+            )
+        })?;
+        // SAFETY: target, parent, and leaf are owned, valid handles.
+        let result = unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_host_permissions(
+        host_path: &Path,
+        mode: u32,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
+        let expected = expected.ok_or_else(Self::stale_resolution)?;
+        let (expected_device, expected_inode) = match expected {
+            HostIdentity::Present { device, inode, .. } => (*device, *inode),
+            HostIdentity::Missing { .. } | HostIdentity::Unavailable { .. } => {
+                return Err(Self::stale_resolution());
+            }
+        };
+        let (parent, leaf) = Self::opened_parent(host_path, expected)?;
+        #[cfg(target_os = "linux")]
+        {
+            // `O_PATH` opens the leaf with no access check, and `/proc/self/fd` then names that exact
+            // descriptor for `chmod`, so a leaf swapped for a symlink cannot redirect the change.
+            let open_flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_PATH;
+            // SAFETY: parent and leaf are owned, valid handles. The returned descriptor is checked.
+            let descriptor =
+                unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), open_flags, 0) };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned this owned descriptor and File closes it once.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = file.metadata()?;
+            if metadata.dev() != expected_device || metadata.ino() != expected_inode {
+                return Err(Self::stale_resolution());
+            }
+            let descriptor_path = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .expect("descriptor path has no NUL byte");
+            // SAFETY: the proc path names the exact open descriptor whose identity was verified.
+            let result = unsafe { libc::chmod(descriptor_path.as_ptr(), mode as libc::mode_t) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no permission-free `O_PATH`: `O_EVTONLY` still needs read authorization and
+            // fails `EACCES` on a mode-0 file the process owns. So verify the leaf identity with
+            // `fstatat` and change it with `fchmodat`, both under the parent fd `opened_parent`
+            // pinned by (device, inode), and both `AT_SYMLINK_NOFOLLOW` so a leaf swapped for a
+            // symlink is not followed.
+            let mut leaf_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: parent and leaf are owned, valid handles; leaf_stat is written before it is read.
+            let statted = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    leaf_stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if statted < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat returned 0, so leaf_stat is initialized.
+            let leaf_stat = unsafe { leaf_stat.assume_init() };
+            if leaf_stat.st_dev as u64 != expected_device || leaf_stat.st_ino != expected_inode {
+                return Err(Self::stale_resolution());
+            }
+            // SAFETY: parent and leaf are owned, valid handles.
+            let result = unsafe {
+                libc::fchmodat(
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    mode as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn set_host_permissions(
+        _host_path: &Path,
+        _mode: u32,
+        _expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "descriptor-bound host chmod requires Linux or macOS",
+        ))
+    }
+
     #[cfg(target_arch = "wasm32")]
     async fn open_host(
         &self,
         proc: &mut Process,
+        spelled: &str,
         host_path: &std::path::Path,
         flags: &OpenFlags,
-        _canon_base: &std::path::Path,
+        _expected: Option<&HostIdentity>,
     ) -> io::Result<Fd> {
         if flags.read && !flags.write {
             use std::io::Read;
@@ -216,31 +746,28 @@ impl VfsKernel {
                 buf: Vec::new(),
             })
         } else if flags.write {
-            let (tx, rx) = crate::os::pipe(8192);
-            let size_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, rx) = crate::os::pipe(HOST_WRITER_DEPTH);
+            let writer = tx.downgrade();
             let fd = proc.alloc_fd(FdKind::ChannelWriter {
                 tx,
-                error_flag: Some(size_error.clone()),
+                limit: Some(WriteLimit::new(0, 0)),
             })?;
             let path = host_path.to_path_buf();
             let append = flags.append;
-            let max_file_size = self.vfs.lock().await.max_file_size;
-            tokio::task::spawn_local(async move {
+            let drain = tokio::task::spawn_local(async move {
                 let mut rx = rx;
-                let mut buf = if append {
-                    std::fs::read(&path).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(append)
+                    .truncate(!append)
+                    .open(&path)?;
                 while let Some(chunk) = rx.recv().await {
-                    if max_file_size > 0 && buf.len() + chunk.len() > max_file_size {
-                        size_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk);
+                    file.write_all(&chunk)?;
                 }
-                let _ = std::fs::write(&path, &buf);
+                Ok(())
             });
+            self.track_write(spelled, writer, drain);
             Ok(fd)
         } else {
             Err(io::Error::new(
@@ -251,8 +778,9 @@ impl VfsKernel {
     }
 }
 
-#[async_trait]
-impl Kernel for VfsKernel {
+/// The effect implementations. Each performs one effect on an already-resolved
+/// path. Admission happened above the trait, in `Mediated`; nothing here decides.
+impl VfsKernel {
     fn new_process(&self) -> Process {
         let cwd = PathBuf::from("/home/lash");
         let mut env = HashMap::new();
@@ -263,13 +791,19 @@ impl Kernel for VfsKernel {
         Process::new(cwd, env)
     }
 
-    async fn open(&self, proc: &mut Process, path: &str, flags: OpenFlags) -> io::Result<Fd> {
+    async fn open_effect(
+        &self,
+        proc: &mut Process,
+        path: &str,
+        flags: OpenFlags,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<Fd> {
         let abs = Self::abs(proc, path);
 
         // Check for host-backed path (bind_direct passthrough)
         {
             let vfs = self.vfs.lock().await;
-            if let Some((host_path, ro, canon_base)) = Self::resolve_host(&vfs, &abs) {
+            if let Some((host_path, ro, _)) = Self::resolve_host(&vfs, &abs) {
                 drop(vfs);
                 if ro && (flags.write || flags.create || flags.truncate) {
                     return Err(io::Error::new(
@@ -277,7 +811,9 @@ impl Kernel for VfsKernel {
                         "read-only bind mount",
                     ));
                 }
-                return self.open_host(proc, &host_path, &flags, &canon_base).await;
+                return self
+                    .open_host(proc, &abs, &host_path, &flags, expected)
+                    .await;
             }
         }
 
@@ -375,19 +911,21 @@ impl Kernel for VfsKernel {
             // For writes, we use a channel that collects data and flushes to VFS
             let vfs_ref = self.vfs.clone();
             let max_file_size = self.vfs.lock().await.max_file_size;
-            // Check if file already exceeds limit (catches append loops)
-            if flags.append && max_file_size > 0 && data.len() >= max_file_size {
-                return Err(io::Error::other("file size limit exceeded"));
+            let held = if flags.append { data.len() } else { 0 };
+            let limit = WriteLimit::new(max_file_size, held);
+            // A file already at the cap cannot grow, so the append is refused at open.
+            if max_file_size > 0 && held >= max_file_size {
+                return Err(limit.exceeded());
             }
             let (tx, rx) = crate::os::pipe(8192);
-            let size_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = tx.downgrade();
             let fd = proc.alloc_fd(FdKind::ChannelWriter {
                 tx,
-                error_flag: Some(size_error.clone()),
+                limit: Some(limit.clone()),
             })?;
             let append = flags.append;
             // Spawn a task to collect writes and flush to VFS
-            tokio::task::spawn_local(async move {
+            let drain = tokio::task::spawn_local(async move {
                 let mut rx = rx;
                 let mut buf = if append {
                     let v = vfs_ref.lock().await;
@@ -396,15 +934,12 @@ impl Kernel for VfsKernel {
                     Vec::new()
                 };
                 while let Some(chunk) = rx.recv().await {
-                    if max_file_size > 0 && buf.len() + chunk.len() > max_file_size {
-                        size_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
                     buf.extend_from_slice(&chunk);
                 }
                 let mut v = vfs_ref.lock().await;
-                let _ = v.write_file(ino, buf);
+                v.write_file(ino, buf)
             });
+            self.track_write(&abs, writer, drain);
             Ok(fd)
         } else {
             Err(io::Error::new(
@@ -414,7 +949,7 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn list_dir(&self, proc: &Process, path: &str) -> io::Result<Vec<DirEntry>> {
+    async fn list_dir_effect(&self, proc: &Process, path: &str) -> io::Result<Vec<DirEntry>> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -446,7 +981,7 @@ impl Kernel for VfsKernel {
             .collect())
     }
 
-    async fn change_dir(&self, proc: &mut Process, path: &str) -> io::Result<()> {
+    async fn change_dir_effect(&self, proc: &mut Process, path: &str) -> io::Result<()> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -475,7 +1010,7 @@ impl Kernel for VfsKernel {
         Ok(())
     }
 
-    async fn stat(&self, proc: &Process, path: &str) -> FileStat {
+    async fn stat_effect(&self, proc: &Process, path: &str) -> FileStat {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -493,7 +1028,7 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn lstat(&self, proc: &Process, path: &str) -> FileStat {
+    async fn lstat_effect(&self, proc: &Process, path: &str) -> FileStat {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -511,7 +1046,7 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn access(&self, proc: &Process, path: &str, mode: i32) -> bool {
+    async fn access_effect(&self, proc: &Process, path: &str, mode: i32) -> bool {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -546,7 +1081,7 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn canonicalize(&self, proc: &Process, path: &str) -> io::Result<PathBuf> {
+    async fn canonicalize_effect(&self, proc: &Process, path: &str) -> io::Result<PathBuf> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
         // Resolve to verify the path exists and follow symlinks
@@ -554,7 +1089,7 @@ impl Kernel for VfsKernel {
         Ok(PathBuf::from(vfs.canonicalize_path(&abs)?))
     }
 
-    async fn is_executable(&self, proc: &Process, path: &str) -> bool {
+    async fn is_executable_effect(&self, proc: &Process, path: &str) -> bool {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
 
@@ -582,7 +1117,7 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn glob(&self, proc: &Process, pattern: &str) -> Vec<String> {
+    async fn glob_effect(&self, proc: &Process, pattern: &str) -> Vec<String> {
         let abs_pattern = Self::abs(proc, pattern);
         let vfs = self.vfs.lock().await;
         let mut results = Vec::new();
@@ -603,10 +1138,18 @@ impl Kernel for VfsKernel {
         false
     }
 
-    async fn remove_file(&self, proc: &Process, path: &str) -> io::Result<()> {
+    async fn remove_file_effect(
+        &self,
+        proc: &Process,
+        path: &str,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
-        if let Some((host_path, ro, _)) = Self::resolve_host(&vfs, &abs) {
+        if Self::is_bind_point(&vfs, &abs) {
+            return Err(Self::bind_point_busy());
+        }
+        if let Some((host_path, ro, _)) = Self::resolve_host_for(&vfs, &abs, Follow::No) {
             drop(vfs);
             if ro {
                 return Err(io::Error::new(
@@ -614,14 +1157,19 @@ impl Kernel for VfsKernel {
                     "read-only bind mount",
                 ));
             }
-            return std::fs::remove_file(&host_path);
+            return Self::unlink_host(&host_path, expected, false);
         }
         Self::check_parent_write(&vfs, &abs)?;
         drop(vfs);
         self.vfs.lock().await.unlink(&abs)
     }
 
-    async fn remove_dir(&self, proc: &Process, path: &str) -> io::Result<()> {
+    async fn remove_dir_effect(
+        &self,
+        proc: &Process,
+        path: &str,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
         if let Some((host_path, ro, _)) = Self::resolve_host(&vfs, &abs) {
@@ -632,17 +1180,22 @@ impl Kernel for VfsKernel {
                     "read-only bind mount",
                 ));
             }
-            return std::fs::remove_dir(&host_path);
+            return Self::unlink_host(&host_path, expected, true);
         }
         Self::check_parent_write(&vfs, &abs)?;
         drop(vfs);
         self.vfs.lock().await.rmdir(&abs)
     }
 
-    async fn create_dir(&self, proc: &Process, path: &str) -> io::Result<()> {
+    async fn create_dir_effect(
+        &self,
+        proc: &Process,
+        path: &str,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
-        if let Some((host_path, ro, _)) = Self::resolve_host(&vfs, &abs) {
+        if let Some((host_path, ro, _)) = Self::resolve_host_for(&vfs, &abs, Follow::No) {
             drop(vfs);
             if ro {
                 return Err(io::Error::new(
@@ -650,7 +1203,7 @@ impl Kernel for VfsKernel {
                     "read-only bind mount",
                 ));
             }
-            return std::fs::create_dir(&host_path);
+            return Self::create_host_directory(&host_path, expected);
         }
         Self::check_parent_write(&vfs, &abs)?;
         drop(vfs);
@@ -661,12 +1214,32 @@ impl Kernel for VfsKernel {
         Ok(())
     }
 
-    async fn rename(&self, proc: &Process, from: &str, to: &str) -> io::Result<()> {
+    async fn rename_effect(
+        &self,
+        proc: &Process,
+        from: &str,
+        from_expected: Option<&HostIdentity>,
+        to: &str,
+        to_expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs_from = Self::abs(proc, from);
         let abs_to = Self::abs(proc, to);
         let vfs = self.vfs.lock().await;
         let host_from = Self::resolve_host(&vfs, &abs_from);
-        let host_to = Self::resolve_host(&vfs, &abs_to);
+        let host_to = Self::resolve_host_for(&vfs, &abs_to, Follow::No);
+        if let Some((host_path, _, _)) = &host_to {
+            match host_path.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "cannot rename onto a host symlink",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         if host_from.is_none() && host_to.is_none() {
             Self::check_parent_write(&vfs, &abs_from)?;
             Self::check_parent_write(&vfs, &abs_to)?;
@@ -677,7 +1250,9 @@ impl Kernel for VfsKernel {
                 io::ErrorKind::PermissionDenied,
                 "read-only bind mount",
             )),
-            (Some((hf, _, _)), Some((ht, _, _))) => std::fs::rename(&hf, &ht),
+            (Some((hf, _, _)), Some((ht, _, _))) => {
+                Self::rename_host(&hf, from_expected, &ht, to_expected)
+            }
             (None, None) => self.vfs.lock().await.rename(&abs_from, &abs_to),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -686,17 +1261,67 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn symlink(&self, proc: &Process, target: &str, link: &str) -> io::Result<()> {
+    async fn symlink_effect(
+        &self,
+        proc: &Process,
+        target: &str,
+        link: &str,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs_link = Self::abs(proc, link);
         let mut vfs = self.vfs.lock().await;
+        if Self::is_bind_point(&vfs, &abs_link) {
+            return Err(Self::bind_point_busy());
+        }
+        if let Some((host_link, ro, canon_base)) =
+            Self::resolve_host_for(&vfs, &abs_link, Follow::No)
+        {
+            drop(vfs);
+            if ro {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "read-only bind mount",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let _ = &canon_base;
+                return Self::create_host_symlink(target, &host_link, expected);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (&target, &host_link, &canon_base);
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "host-backed symlink requires a unix target",
+                ));
+            }
+        }
+        // One lock across the permission check and the create, as the original did, so a
+        // concurrent task cannot change the parent's permissions between them.
         Self::check_parent_write(&vfs, &abs_link)?;
         vfs.symlink(&abs_link, target, LASH_UID, LASH_GID)?;
         Ok(())
     }
 
-    async fn read_link(&self, proc: &Process, path: &str) -> io::Result<String> {
+    async fn read_link_effect(&self, proc: &Process, path: &str) -> io::Result<String> {
         let abs = Self::abs(proc, path);
         let vfs = self.vfs.lock().await;
+        // `readlink` reads the link itself, so resolve the parent to its host directory and
+        // read the leaf there — resolving the full path would follow the final link and return
+        // its target instead.
+        let (parent, leaf) = match abs.rfind('/') {
+            Some(0) => ("/".to_string(), &abs[1..]),
+            Some(i) => (abs[..i].to_string(), &abs[i + 1..]),
+            None => (String::new(), abs.as_str()),
+        };
+        if !leaf.is_empty()
+            && let Some((host_parent, _ro, _)) = Self::resolve_host(&vfs, &parent)
+        {
+            drop(vfs);
+            let target = std::fs::read_link(host_parent.join(leaf))?;
+            return Ok(target.to_string_lossy().into_owned());
+        }
         let ino = vfs.resolve(&abs, false)?;
         match &vfs.get(ino)?.data {
             InodeData::Symlink(target) => Ok(target.clone()),
@@ -707,9 +1332,36 @@ impl Kernel for VfsKernel {
         }
     }
 
-    async fn set_permissions(&self, proc: &Process, path: &str, mode: u32) -> io::Result<()> {
+    async fn set_permissions_effect(
+        &self,
+        proc: &Process,
+        path: &str,
+        mode: u32,
+        expected: Option<&HostIdentity>,
+    ) -> io::Result<()> {
         let abs = Self::abs(proc, path);
         let mut vfs = self.vfs.lock().await;
+        if let Some((host_path, ro, _)) = Self::resolve_host(&vfs, &abs) {
+            drop(vfs);
+            if ro {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "read-only bind mount",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                return Self::set_host_permissions(&host_path, mode & 0o7777, expected);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &host_path;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "host-backed chmod requires a unix target",
+                ));
+            }
+        }
         let ino = vfs.resolve(&abs, true)?;
         let inode = vfs.get_mut(ino)?;
         // Only the file owner can chmod
@@ -728,25 +1380,41 @@ impl Kernel for VfsKernel {
         std::time::SystemTime::now()
     }
 
-    fn check_url(&self, url: &str) -> io::Result<()> {
+    /// The two controls every outbound URL passes, in order.
+    ///
+    /// Neither is authorization. `network_enabled` is the embedder's blanket
+    /// off-switch, and [`check_url_safe`] is the SSRF floor — a deny-only guard
+    /// against reaching IMDS, link-local, loopback, and RFC1918 addresses. Both
+    /// hold unconditionally; neither can grant. The authorization decision for a
+    /// request belongs to the egress boundary the workload is confined to.
+    fn check_url_effect(&self, url: &str) -> io::Result<()> {
+        if !self.network_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network access disabled",
+            ));
+        }
         check_url_safe(url)
     }
 
-    async fn http_request(&self, req: HttpRequest) -> io::Result<HttpResponse> {
+    async fn http_request_effect(&self, req: HttpRequest) -> io::Result<HttpResponse> {
+        // The floor runs before any transport, direct or supplied, so a routed
+        // request cannot reach an address a direct one could not.
+        self.check_url_effect(&req.url)?;
+
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // 1. Check URL via self.check_url
-            self.check_url(&req.url)?;
-
-            // 2. Build reqwest client
-            let client = reqwest::Client::builder()
+            // 1. Build reqwest client, guarding DNS with the SSRF-aware resolver so a name
+            // cannot resolve onto a floored address.
+            let client_builder = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(req.insecure)
-                .dns_resolver(std::sync::Arc::new(SafeResolver))
+                .dns_resolver(std::sync::Arc::new(SafeResolver));
+            let client = client_builder
                 .build()
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
-            // 4. Build the request
+            // 2. Build the request
             let method: reqwest::Method = req.method.parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -755,23 +1423,23 @@ impl Kernel for VfsKernel {
             })?;
             let mut http_req = client.request(method, &req.url);
 
-            // 5. Set headers (including injected credentials)
+            // 3. Set headers
             for (name, value) in &req.headers {
                 http_req = http_req.header(name.as_str(), value.as_str());
             }
 
-            // 6. Set body
+            // 4. Set body
             if let Some(body) = req.body {
                 http_req = http_req.body(body);
             }
 
-            // 7. Send
+            // 5. Send
             let mut resp = http_req
                 .send()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-            // 8. Build response
+            // 6. Build response
             let status = resp.status().as_u16();
             let version = match resp.version() {
                 reqwest::Version::HTTP_11 => "1.1",
@@ -821,14 +1489,11 @@ impl Kernel for VfsKernel {
                 Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, Scheme,
             };
 
-            // 1. Check URL
-            self.check_url(&req.url)?;
-
-            // 2. Parse URL
+            // 1. Parse URL
             let parsed = url::Url::parse(&req.url)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-            // 3. Build method
+            // 2. Build method
             let method = match req.method.to_uppercase().as_str() {
                 "GET" => Method::Get,
                 "POST" => Method::Post,
@@ -991,6 +1656,258 @@ impl Kernel for VfsKernel {
     }
 }
 
+#[async_trait]
+impl Kernel for VfsKernel {
+    fn new_process(&self) -> Process {
+        VfsKernel::new_process(self)
+    }
+
+    /// Applies the working directory, then resolves per `follow`.
+    ///
+    /// `Self::abs` normalizes the string only. `Self::resolved_target` additionally
+    /// follows symlinks and handles a not-yet-existing leaf by canonicalizing its
+    /// existing ancestors — which is what makes a create authorize under its real
+    /// parent rather than under a symlink's name.
+    async fn resolve(&self, proc: &Process, path: &str, follow: Follow) -> Resolved {
+        let generation = self.resolution_generation.lock().await;
+        let abs = Self::abs(proc, path);
+        let resolved = match follow {
+            Follow::Yes => self.resolved_target(&abs).await,
+            // `Follow::No` exempts the *final* component only. Intermediate symlinks
+            // are still traversed, exactly as `lstat` and `unlink` traverse them — so
+            // the parent is resolved and the leaf re-appended verbatim. Leaving the
+            // whole path unresolved would let `rm /alias/f` be judged on the alias
+            // while unlinking `/vault/f`.
+            Follow::No => match abs.rfind('/') {
+                Some(0) | None => abs,
+                Some(slash) => {
+                    let (parent, leaf) = abs.split_at(slash);
+                    let base = self.resolved_target(parent).await;
+                    format!("{}{leaf}", base.trim_end_matches('/'))
+                }
+            },
+        };
+        let host_identity = {
+            let vfs = self.vfs.lock().await;
+            Self::host_identity(&vfs, &resolved, follow)
+        };
+        Resolved::new(resolved, follow, *generation, host_identity)
+    }
+
+    async fn settle_writes(&self) -> Vec<WriteFailure> {
+        let mut failures = Vec::new();
+        for write in self.closed_writes() {
+            let outcome = match write.drain.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(io::Error::other("write task failed")),
+            };
+            if let Err(error) = outcome {
+                failures.push(WriteFailure {
+                    path: write.path,
+                    error,
+                });
+            }
+        }
+        failures
+    }
+
+    fn isatty(&self, fd: i32) -> bool {
+        VfsKernel::isatty(self, fd)
+    }
+
+    fn now(&self) -> std::time::SystemTime {
+        VfsKernel::now(self)
+    }
+
+    async fn open(&self, proc: &mut Process, path: Resolved, flags: OpenFlags) -> io::Result<Fd> {
+        debug_assert_eq!(
+            path.follow(),
+            Follow::Yes,
+            "open acts on a symlink's target"
+        );
+        let mut generation = self.guard_resolution(&path).await?;
+        let result = self
+            .open_effect(proc, path.path(), flags, path.host_identity())
+            .await;
+        if result.is_ok() && flags.create {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn list_dir(&self, proc: &Process, path: Resolved) -> io::Result<Vec<DirEntry>> {
+        debug_assert_eq!(path.follow(), Follow::Yes, "list_dir follows to its target");
+        let _generation = self.guard_resolution(&path).await?;
+        self.list_dir_effect(proc, path.path()).await
+    }
+
+    async fn change_dir(&self, proc: &mut Process, path: Resolved) -> io::Result<()> {
+        debug_assert_eq!(
+            path.follow(),
+            Follow::Yes,
+            "change_dir follows to its target"
+        );
+        let _generation = self.guard_resolution(&path).await?;
+        self.change_dir_effect(proc, path.path()).await
+    }
+
+    async fn stat(&self, proc: &Process, path: Resolved) -> FileStat {
+        debug_assert_eq!(path.follow(), Follow::Yes, "stat follows a final symlink");
+        let Ok(_generation) = self.guard_resolution(&path).await else {
+            return FileStat::default();
+        };
+        self.stat_effect(proc, path.path()).await
+    }
+
+    async fn lstat(&self, proc: &Process, path: Resolved) -> FileStat {
+        debug_assert_eq!(path.follow(), Follow::No, "lstat acts on the link itself");
+        let Ok(_generation) = self.guard_resolution(&path).await else {
+            return FileStat::default();
+        };
+        self.lstat_effect(proc, path.path()).await
+    }
+
+    async fn access(&self, proc: &Process, path: Resolved, mode: i32) -> bool {
+        debug_assert_eq!(path.follow(), Follow::Yes, "access follows to its target");
+        let Ok(_generation) = self.guard_resolution(&path).await else {
+            return false;
+        };
+        self.access_effect(proc, path.path(), mode).await
+    }
+
+    async fn canonicalize(&self, proc: &Process, path: Resolved) -> io::Result<PathBuf> {
+        debug_assert_eq!(path.follow(), Follow::Yes, "canonicalize resolves symlinks");
+        let _generation = self.guard_resolution(&path).await?;
+        self.canonicalize_effect(proc, path.path()).await
+    }
+
+    async fn is_executable(&self, proc: &Process, path: Resolved) -> bool {
+        debug_assert_eq!(path.follow(), Follow::Yes, "exec follows to its target");
+        let Ok(_generation) = self.guard_resolution(&path).await else {
+            return false;
+        };
+        self.is_executable_effect(proc, path.path()).await
+    }
+
+    /// Takes a pattern, not a path: a glob has no single identity to resolve.
+    ///
+    /// [`crate::Mediated::glob`] admits the directory being enumerated and then each
+    /// match individually, so the expansion is mediated without a token here.
+    async fn glob(&self, proc: &Process, pattern: &str) -> Vec<String> {
+        self.glob_effect(proc, pattern).await
+    }
+
+    async fn remove_file(&self, proc: &Process, path: Resolved) -> io::Result<()> {
+        debug_assert_eq!(path.follow(), Follow::No, "unlink removes the name given");
+        let mut generation = self.guard_resolution(&path).await?;
+        let result = self
+            .remove_file_effect(proc, path.path(), path.host_identity())
+            .await;
+        if result.is_ok() {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn remove_dir(&self, proc: &Process, path: Resolved) -> io::Result<()> {
+        debug_assert_eq!(path.follow(), Follow::Yes, "rmdir follows to its target");
+        let mut generation = self.guard_resolution(&path).await?;
+        let result = self
+            .remove_dir_effect(proc, path.path(), path.host_identity())
+            .await;
+        if result.is_ok() {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn create_dir(&self, proc: &Process, path: Resolved) -> io::Result<()> {
+        debug_assert_eq!(
+            path.follow(),
+            Follow::No,
+            "mkdir creates the final name itself"
+        );
+        let mut generation = self.guard_resolution(&path).await?;
+        let result = self
+            .create_dir_effect(proc, path.path(), path.host_identity())
+            .await;
+        if result.is_ok() {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn rename(&self, proc: &Process, from: Resolved, to: Resolved) -> io::Result<()> {
+        debug_assert_eq!(from.follow(), Follow::No, "rename moves the link itself");
+        debug_assert_eq!(
+            to.follow(),
+            Follow::No,
+            "rename replaces the destination name"
+        );
+        let mut generation = self.resolution_generation.lock().await;
+        if !self.resolution_is_current(&from, *generation).await
+            || !self.resolution_is_current(&to, *generation).await
+        {
+            return Err(Self::stale_resolution());
+        }
+        let result = self
+            .rename_effect(
+                proc,
+                from.path(),
+                from.host_identity(),
+                to.path(),
+                to.host_identity(),
+            )
+            .await;
+        if result.is_ok() {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn symlink(&self, proc: &Process, target: &str, link: Resolved) -> io::Result<()> {
+        debug_assert_eq!(
+            link.follow(),
+            Follow::No,
+            "the link is created, not followed"
+        );
+        let mut generation = self.guard_resolution(&link).await?;
+        let result = self
+            .symlink_effect(proc, target, link.path(), link.host_identity())
+            .await;
+        if result.is_ok() {
+            Self::changed_resolution(&mut generation);
+        }
+        result
+    }
+
+    async fn read_link(&self, proc: &Process, path: Resolved) -> io::Result<String> {
+        debug_assert_eq!(path.follow(), Follow::No, "read_link acts on the link");
+        let _generation = self.guard_resolution(&path).await?;
+        self.read_link_effect(proc, path.path()).await
+    }
+
+    async fn set_permissions(&self, proc: &Process, path: Resolved, mode: u32) -> io::Result<()> {
+        debug_assert_eq!(path.follow(), Follow::Yes, "chmod follows to its target");
+        let _generation = self.guard_resolution(&path).await?;
+        self.set_permissions_effect(proc, path.path(), mode, path.host_identity())
+            .await
+    }
+
+    /// The SSRF floor — a deny-only control, not an authorization decision.
+    fn check_url(&self, url: &str) -> io::Result<()> {
+        self.check_url_effect(url)
+    }
+
+    /// Dispatches through the floor and then the embedder's transport.
+    ///
+    /// Raises no admission: the Shell does not authorize egress. The transport's own
+    /// boundary decides, with the request vocabulary that decision needs.
+    async fn http_request(&self, req: HttpRequest) -> io::Result<HttpResponse> {
+        self.http_request_effect(req).await
+    }
+}
+
 // --- host stat helper ---
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1066,10 +1983,7 @@ fn make_dev_null_fd(proc: &mut Process, flags: &OpenFlags) -> io::Result<Fd> {
             let mut _rx = _rx;
             while _rx.recv().await.is_some() {}
         });
-        proc.alloc_fd(FdKind::ChannelWriter {
-            tx,
-            error_flag: None,
-        })
+        proc.alloc_fd(FdKind::ChannelWriter { tx, limit: None })
     }
 }
 

@@ -4,7 +4,7 @@ const HELP: &str = "Usage: echo [STRING]...
 Display a line of text.";
 
 #[command("echo")]
-async fn cmd_echo(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_echo(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut parts = Vec::new();
     while let Some(arg) = parser.next()? {

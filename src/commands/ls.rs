@@ -93,7 +93,7 @@ fn epoch_days_to_date(mut days: i64) -> (i64, i64, i64) {
 }
 
 async fn list_one(
-    os: &dyn Kernel,
+    os: &Mediated,
     w: &mut crate::os::FdWriter,
     path: &str,
     name_prefix: &str,
@@ -162,7 +162,7 @@ async fn list_one(
 }
 
 #[command("ls")]
-async fn cmd_ls(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_ls(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut long = false;
     let mut show_all = false;

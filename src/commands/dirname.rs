@@ -4,7 +4,7 @@ const HELP: &str = "Usage: dirname NAME
 Strip last component from NAME.";
 
 #[command("dirname")]
-async fn cmd_dirname(_os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_dirname(_os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut name = None;
     while let Some(arg) = parser.next()? {

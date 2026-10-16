@@ -3,7 +3,8 @@ pub use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 pub use crate::commands::CommandResult;
 pub use crate::io;
-pub use crate::os::{Kernel, OpenFlags};
+pub use crate::mediate::Mediated;
+pub use crate::os::OpenFlags;
 pub use crate::{wprint, wprintln};
 
 /// Re-export lexopt for argument parsing in commands.

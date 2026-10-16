@@ -44,7 +44,7 @@ async fn count_stream<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Re
 }
 
 #[command("wc")]
-async fn cmd_wc(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_wc(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut opt_l = false;
     let mut opt_w = false;

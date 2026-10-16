@@ -6,7 +6,7 @@ Copy files and directories.
 Options:
   -r, -R  copy directories recursively";
 
-async fn copy_file(os: &dyn Kernel, src: &str, dst: &str) -> std::io::Result<()> {
+async fn copy_file(os: &Mediated, src: &str, dst: &str) -> std::io::Result<()> {
     let sfd = io::open(os, src, OpenFlags::read()).await?;
     let dfd = io::open(os, dst, OpenFlags::write()).await?;
     let mut reader = io::take_reader(sfd)?;
@@ -15,7 +15,7 @@ async fn copy_file(os: &dyn Kernel, src: &str, dst: &str) -> std::io::Result<()>
     Ok(())
 }
 
-async fn copy_recursive(os: &dyn Kernel, src: &str, dst: &str) -> std::io::Result<()> {
+async fn copy_recursive(os: &Mediated, src: &str, dst: &str) -> std::io::Result<()> {
     let st = io::stat(os, src).await;
     if st.is_dir {
         io::create_dir(os, dst).await?;
@@ -31,7 +31,7 @@ async fn copy_recursive(os: &dyn Kernel, src: &str, dst: &str) -> std::io::Resul
 }
 
 #[command("cp")]
-async fn cmd_cp(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_cp(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut recursive = false;
     let mut paths = Vec::new();

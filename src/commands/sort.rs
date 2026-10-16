@@ -14,7 +14,7 @@ Options:
   -b    ignore leading blanks in sort keys";
 
 async fn read_lines(
-    os: &dyn Kernel,
+    os: &Mediated,
     files: &[String],
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut lines = Vec::new();
@@ -124,7 +124,7 @@ fn extract_key(line: &str, field: usize, sep: Option<char>) -> &str {
 }
 
 #[command("sort")]
-async fn cmd_sort(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_sort(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut reverse = false;
     let mut numeric = false;

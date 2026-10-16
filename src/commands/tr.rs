@@ -67,7 +67,7 @@ fn expand_set(s: &str) -> Vec<char> {
 }
 
 #[command("tr")]
-async fn cmd_tr(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_tr(os: &Mediated, args: &[String]) -> CommandResult {
     let _ = os;
     let mut parser = lexopt::Parser::from_args(args);
     let mut delete = false;

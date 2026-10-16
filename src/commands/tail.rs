@@ -8,7 +8,7 @@ Options:
   -n LINES    number of lines (default: 10); +N means starting from line N";
 
 #[command("tail")]
-async fn cmd_tail(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_tail(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(legacy_count(args));
     let mut count: usize = 10;
     let mut from_start = false;

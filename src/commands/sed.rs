@@ -427,7 +427,7 @@ fn expand_replacement(replacement: &str, caps: &regex::Captures) -> String {
 }
 
 #[command("sed")]
-async fn cmd_sed(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_sed(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut scripts: Vec<String> = Vec::new();
     let mut suppress = false;

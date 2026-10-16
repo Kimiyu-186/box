@@ -2,11 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::os::Process;
 use crate::prelude::*;
 
 pub fn builtin_alias<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
@@ -38,7 +38,7 @@ pub fn builtin_alias<'a>(
 }
 
 pub fn builtin_unalias<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {

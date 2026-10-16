@@ -3435,6 +3435,32 @@ fn builder_max_output() {
 }
 
 #[test]
+fn max_output_bounds_repeated_stderr_messages() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().max_output(32).build().unwrap();
+        let out = shell
+            .run("set -x; for i in 1 2 3 4 5 6 7 8 9 10; do :; done")
+            .await;
+
+        assert!(out.stderr.len() <= 32, "stderr bytes: {}", out.stderr.len());
+    }));
+}
+
+#[test]
+fn max_output_bounds_cumulative_pipeline_stderr() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().max_output(8).build().unwrap();
+        let out = shell
+            .run("echo aa >&2 | echo bb >&2 | echo cc >&2 | echo dd >&2")
+            .await;
+
+        assert!(out.stderr.len() <= 8, "stderr bytes: {}", out.stderr.len());
+    }));
+}
+
+#[test]
 fn builder_max_depth() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
@@ -4080,15 +4106,16 @@ fn builder_max_file_size() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let mut shell = Shell::builder().max_file_size(5).build().unwrap();
-        // Writing more than 5 bytes — the write-back task truncates
-        shell.run("echo 'hello world' > /tmp/big").await;
+        let out = shell.run("echo 'hello world' > /tmp/big").await;
+        assert_ne!(out.status, 0, "a write over the cap fails");
+        assert!(
+            out.stderr.contains("file size limit exceeded (5 bytes)"),
+            "the refusal names the limit; stderr was {:?}",
+            out.stderr
+        );
         let out = shell.run("wc -c < /tmp/big").await;
         let size: usize = out.stdout.trim().parse().unwrap_or(999);
-        assert!(
-            size <= 5,
-            "expected file truncated to <=5 bytes, got {}",
-            size
-        );
+        assert!(size <= 5, "the file holds at most the cap; size was {size}");
     }));
 }
 
@@ -4786,17 +4813,22 @@ max_file_size = 16
             .build()
             .unwrap();
 
-        // Writing past the 16-byte cap is bounded: the over-cap content does
-        // not land in full. (Shell redirection truncates at the cap rather
-        // than failing the command, unlike the binding's write_file.)
-        shell
+        // Writing past the 16-byte cap fails the command, and the over-cap
+        // content does not land.
+        let out = shell
             .run("printf '%s' 0123456789abcdefXYZ > /tmp/big.txt")
             .await;
+        assert_ne!(out.status, 0, "a write over the TOML cap fails");
+        assert!(
+            out.stderr.contains("file size limit exceeded (16 bytes)"),
+            "the refusal names the limit; stderr was {:?}",
+            out.stderr
+        );
         let out = shell.run("wc -c < /tmp/big.txt").await;
         let written: usize = out.stdout.trim().parse().unwrap_or(usize::MAX);
         assert!(
             written <= 16,
-            "TOML max_file_size should cap the write to <=16 bytes; wrote {written}"
+            "the file holds at most the TOML cap; wrote {written}"
         );
 
         // A small write within the cap lands intact.
@@ -7647,11 +7679,16 @@ fn max_file_size_single_write_error() {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
-        // Single write exceeding limit — the error flag should trigger
-        let out = shell.run("echo 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' > /tmp/big; cat /tmp/big | wc -c").await;
-        // File should be truncated or empty
+        let out = shell.run("echo 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' > /tmp/big").await;
+        assert_ne!(out.status, 0, "a single write over the cap fails");
+        assert!(
+            out.stderr.contains("file size limit exceeded (50 bytes)"),
+            "the refusal names the limit; stderr was {:?}",
+            out.stderr
+        );
+        let out = shell.run("cat /tmp/big | wc -c").await;
         let size: usize = out.stdout.trim().parse().unwrap_or(999);
-        assert!(size <= 50, "file should be truncated; size: {}", size);
+        assert!(size <= 50, "the file holds at most the cap; size was {size}");
     }));
 }
 
@@ -7664,10 +7701,21 @@ fn max_file_size_append_loop_blocked() {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
-        // Append loop — once file exceeds limit, further appends should fail
-        let out = shell.run("for i in 1 2 3 4 5 6 7 8 9 10; do echo 'padding padding' >> /tmp/apptest; done; cat /tmp/apptest | wc -c").await;
+        let out = shell
+            .run("for i in 1 2 3 4 5 6 7 8 9 10; do echo 'padding padding' >> /tmp/apptest; done")
+            .await;
+        assert_ne!(out.status, 0, "the append that crosses the cap fails");
+        assert!(
+            out.stderr.contains("file size limit exceeded (50 bytes)"),
+            "the refusal names the limit; stderr was {:?}",
+            out.stderr
+        );
+        let out = shell.run("cat /tmp/apptest | wc -c").await;
         let size: usize = out.stdout.trim().parse().unwrap_or(999);
-        assert!(size <= 50, "appended file should be capped; size: {}", size);
+        assert!(
+            size <= 50,
+            "the appended file holds at most the cap; size was {size}"
+        );
     }));
 }
 

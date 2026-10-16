@@ -2,10 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::mediate::Mediated;
+use crate::os::Process;
 
 pub fn builtin_wait<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     proc: &'a mut Process,
     _args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
@@ -15,9 +16,10 @@ pub fn builtin_wait<'a>(
         for handle in jobs {
             let (code, stdout, stderr) = handle.await.unwrap_or((1, String::new(), String::new()));
             last = code;
-            if proc.capture {
-                proc.captured_output.push_str(&stdout);
-                proc.captured_stderr.push_str(&stderr);
+            if proc.capture
+                && (!proc.append_captured_output(&stdout) || !proc.append_captured_stderr(&stderr))
+            {
+                last = 1;
             }
         }
         proc.last_exit = last;

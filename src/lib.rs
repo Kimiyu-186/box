@@ -92,15 +92,16 @@
 //! ## Custom Kernel Backends
 //!
 //! For full control, implement the [`os::Kernel`] trait and pass it to
-//! [`Shell::with_kernel`]:
+//! [`ShellBuilder::kernel`], which applies every configured limit to the
+//! resulting shell:
 //!
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use strands_shell::Shell;
 //! use strands_shell::os::Kernel;
 //!
-//! fn from_custom_kernel(kernel: Arc<dyn Kernel>) -> Shell {
-//!     Shell::with_kernel(kernel)
+//! fn from_custom_kernel(kernel: Arc<dyn Kernel>) -> std::io::Result<Shell> {
+//!     Shell::builder().kernel(kernel).build()
 //! }
 //! ```
 //!
@@ -121,12 +122,14 @@ pub mod builtins;
 #[cfg(all(not(target_arch = "wasm32"), feature = "cli"))]
 pub mod cli;
 pub mod commands;
+mod effect;
 pub mod exec;
 pub mod io;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp_client;
+mod mediate;
 pub mod os;
 pub mod parser;
 pub mod prelude;
@@ -142,6 +145,12 @@ pub mod python;
 pub mod js;
 
 // Primary public API
+pub use effect::{
+    EffectAttempt, EffectInterceptor, EffectOutcome, EffectPermit, EffectResult, FsOperation,
+    FsPairOperation,
+};
+pub use mediate::Mediated;
+pub use os::{Follow, ObjectIdentity, Resolved};
 pub use shell::{
     BindInfo, FileInfo, FileOpErrorKind, LimitsInfo, Output, Shell, ShellBuilder, ShellConfig,
 };

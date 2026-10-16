@@ -2,10 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{ACCESS_R, ACCESS_W, ACCESS_X, Kernel, Process};
+use crate::mediate::Mediated;
+use crate::os::{ACCESS_R, ACCESS_W, ACCESS_X, Process};
 
 pub fn builtin_test<'a>(
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
@@ -24,7 +25,7 @@ pub fn builtin_test<'a>(
 fn parse_or<'a>(
     args: &'a [String],
     pos: &'a mut usize,
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a Process,
 ) -> Pin<Box<dyn Future<Output = bool> + 'a>> {
     Box::pin(async move {
@@ -41,7 +42,7 @@ fn parse_or<'a>(
 fn parse_and<'a>(
     args: &'a [String],
     pos: &'a mut usize,
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a Process,
 ) -> Pin<Box<dyn Future<Output = bool> + 'a>> {
     Box::pin(async move {
@@ -58,7 +59,7 @@ fn parse_and<'a>(
 async fn parse_not<'a>(
     args: &'a [String],
     pos: &mut usize,
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a Process,
 ) -> bool {
     if *pos < args.len() && args[*pos] == "!" {
@@ -72,7 +73,7 @@ async fn parse_not<'a>(
 async fn parse_primary<'a>(
     args: &'a [String],
     pos: &mut usize,
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a Process,
 ) -> bool {
     if *pos >= args.len() {
@@ -157,7 +158,7 @@ fn is_binary_op(s: &str) -> bool {
     )
 }
 
-async fn eval_unary(op: &str, arg: &str, os: &dyn Kernel, proc: &Process) -> bool {
+async fn eval_unary(op: &str, arg: &str, os: &Mediated, proc: &Process) -> bool {
     match op {
         "-n" => !arg.is_empty(),
         "-z" => arg.is_empty(),
@@ -186,7 +187,7 @@ async fn eval_unary(op: &str, arg: &str, os: &dyn Kernel, proc: &Process) -> boo
     }
 }
 
-async fn eval_binary(left: &str, op: &str, right: &str, os: &dyn Kernel, proc: &Process) -> bool {
+async fn eval_binary(left: &str, op: &str, right: &str, os: &Mediated, proc: &Process) -> bool {
     match op {
         "=" | "==" => left == right,
         "!=" => left != right,

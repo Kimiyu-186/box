@@ -174,7 +174,7 @@ async fn within<T>(
 }
 
 #[command("curl")]
-async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_curl(os: &Mediated, args: &[String]) -> CommandResult {
     let mut silent = false;
     let mut show_error = false;
     let mut output: Option<String> = None;

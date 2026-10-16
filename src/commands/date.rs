@@ -19,7 +19,7 @@ Options:
   -h  display this help";
 
 #[command("date")]
-async fn cmd_date(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_date(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut _utc = false;
     let mut format = String::new();

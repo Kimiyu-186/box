@@ -145,6 +145,21 @@ fn curl_unknown_flag_is_a_usage_error() {
     }));
 }
 
+// A network-off Shell (the default) refuses every curl, even to a public host: the floor is
+// not the only gate — with no egress route configured there is nowhere for the request to go.
+#[test]
+fn curl_on_a_network_off_shell_refuses() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        // A Shell built with `disable_network()` refuses every curl, even to a public host:
+        // with the network off there is no route out at all, floor or no floor. This pins that
+        // a network-off Shell does not silently reach the internet from a test.
+        let mut shell = Shell::builder().disable_network().build().unwrap();
+        let out = shell.run("curl http://example.com/").await;
+        assert_ne!(out.status, 0, "a network-off Shell must refuse curl");
+    }));
+}
+
 // ── Options the Strands harness `web_fetch` tool sends ──────────────
 // The server-backed cases are in `tests/egress_proxy.rs`.
 

@@ -31,7 +31,7 @@ async fn cat_stream<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[command("cat")]
-async fn cmd_cat(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_cat(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut files = Vec::new();
     let mut number = false;

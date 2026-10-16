@@ -103,18 +103,81 @@ pub enum FdKind {
     },
     ChannelWriter {
         tx: mpsc::Sender<Bytes>,
-        error_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        limit: Option<Arc<WriteLimit>>,
     },
     #[cfg(not(target_arch = "wasm32"))]
     File(tokio::fs::File),
 }
 
+/// The byte budget of one open file, shared by every descriptor that writes it.
+///
+/// `admit` and `record` are one read-modify-write split in two, correct because every
+/// `poll_write` runs them on the single-threaded `LocalSet` with no await between them, which is
+/// also why `Relaxed` ordering is enough.
+pub struct WriteLimit {
+    cap: usize,
+    written: std::sync::atomic::AtomicUsize,
+    state: std::sync::atomic::AtomicU8,
+}
+
+const LIMIT_OPEN: u8 = 0;
+const LIMIT_EXCEEDED: u8 = 1;
+const LIMIT_FAILED: u8 = 2;
+
+impl WriteLimit {
+    /// A budget of `cap` bytes, of which `written` are already in the file; `0` is unbounded.
+    pub fn new(cap: usize, written: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap,
+            written: std::sync::atomic::AtomicUsize::new(written),
+            state: std::sync::atomic::AtomicU8::new(LIMIT_OPEN),
+        })
+    }
+
+    /// Records that the backing store refused the bytes, so the next write reports it.
+    pub fn fail(&self) {
+        self.state
+            .store(LIMIT_FAILED, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The refusal a write over the budget reports.
+    pub fn exceeded(&self) -> io::Error {
+        io::Error::other(format!("file size limit exceeded ({} bytes)", self.cap))
+    }
+
+    /// How many of `len` bytes still fit, or the refusal when none do.
+    fn admit(&self, len: usize) -> io::Result<usize> {
+        match self.state.load(std::sync::atomic::Ordering::Relaxed) {
+            LIMIT_EXCEEDED => return Err(self.exceeded()),
+            LIMIT_FAILED => return Err(io::Error::other("write failed")),
+            _ => {}
+        }
+        if self.cap == 0 {
+            return Ok(len);
+        }
+        let room = self
+            .cap
+            .saturating_sub(self.written.load(std::sync::atomic::Ordering::Relaxed));
+        if len > 0 && room == 0 {
+            self.state
+                .store(LIMIT_EXCEEDED, std::sync::atomic::Ordering::Relaxed);
+            return Err(self.exceeded());
+        }
+        Ok(len.min(room))
+    }
+
+    fn record(&self, len: usize) {
+        self.written
+            .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl FdKind {
     async fn try_clone(&self) -> io::Result<FdKind> {
         match self {
-            FdKind::ChannelWriter { tx, error_flag } => Ok(FdKind::ChannelWriter {
+            FdKind::ChannelWriter { tx, limit } => Ok(FdKind::ChannelWriter {
                 tx: tx.clone(),
-                error_flag: error_flag.clone(),
+                limit: limit.clone(),
             }),
             #[cfg(not(target_arch = "wasm32"))]
             FdKind::File(f) => Ok(FdKind::File(f.try_clone().await?)),
@@ -418,13 +481,25 @@ impl Process {
     }
 
     pub fn set_channel_writer(&mut self, fd: Fd, tx: mpsc::Sender<Bytes>) {
-        self.fds.insert(
-            fd,
-            FdKind::ChannelWriter {
-                tx,
-                error_flag: None,
-            },
-        );
+        self.fds
+            .insert(fd, FdKind::ChannelWriter { tx, limit: None });
+    }
+
+    /// Give `target` a clone of the channel writer on `fd` with its budget, or `false` when there is none.
+    pub fn inherit_channel_writer(&self, fd: Fd, target: &mut Process) -> bool {
+        match self.fds.get(&fd) {
+            Some(FdKind::ChannelWriter { tx, limit }) => {
+                target.fds.insert(
+                    fd,
+                    FdKind::ChannelWriter {
+                        tx: tx.clone(),
+                        limit: limit.clone(),
+                    },
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Remove an fd from this process and install it in another.
@@ -520,31 +595,71 @@ impl Process {
         self.err_tx = None;
     }
 
+    /// Send `text` to the channel writer on `fd` within its budget, or `None` when `fd` has no channel writer.
+    fn send_to_channel(&mut self, fd: Fd, text: String) -> Option<io::Result<()>> {
+        let Some(FdKind::ChannelWriter { tx, limit }) = self.fds.get(&fd) else {
+            return None;
+        };
+        let bytes = Bytes::from(text);
+        let Some(limit) = limit else {
+            let _ = tx.try_send(bytes);
+            return Some(Ok(()));
+        };
+        let fit = match limit.admit(bytes.len()) {
+            Ok(fit) => fit,
+            Err(e) => return Some(Err(e)),
+        };
+        if tx.try_send(bytes.slice(..fit)).is_ok() {
+            limit.record(fit);
+        }
+        Some(match bytes.len() - fit {
+            0 => Ok(()),
+            rest => limit.admit(rest).map(|_| ()),
+        })
+    }
+
     /// Write an error message to the process stderr channel, or real stderr as fallback.
+    ///
+    /// Checks a `ChannelWriter` on fd 2 after `err_tx`, mirroring [`Self::out_msg`]'s check on
+    /// fd 1: without it an embedder's stderr sink never sees a message reported this way.
     pub fn err_msg(&mut self, msg: &str) {
         if let Some(tx) = &self.err_tx {
             let _ = tx.try_send(Bytes::from(format!("{msg}\n")));
+        } else if let Some(sent) = self.send_to_channel(STDERR, format!("{msg}\n")) {
+            if sent.is_err() {
+                self.last_exit = 1;
+            }
         } else if self.capture {
-            self.captured_stderr.push_str(msg);
-            self.captured_stderr.push('\n');
+            let complete = self.append_captured_stderr(msg) && self.append_captured_stderr("\n");
+            if !complete {
+                self.last_exit = 1;
+            }
         } else {
             eprintln!("{msg}");
         }
     }
 
+    pub(crate) fn append_captured_output(&mut self, output: &str) -> bool {
+        append_limited(&mut self.captured_output, output, self.max_output)
+    }
+
+    pub(crate) fn append_captured_stderr(&mut self, output: &str) -> bool {
+        append_limited(&mut self.captured_stderr, output, self.max_output)
+    }
+
     /// Write a message to stdout (fd 1 channel if available, else real stdout).
     pub fn out_msg(&mut self, msg: &str) {
-        if let Some(FdKind::ChannelWriter { tx, .. }) = self.fds.get(&STDOUT) {
-            let _ = tx.try_send(Bytes::from(format!("{msg}\n")));
-        } else if self.capture {
-            if self.max_output > 0 && self.captured_output.len() + msg.len() > self.max_output {
-                self.captured_stderr
-                    .push_str("strands-shell: output size limit exceeded\n");
+        if let Some(sent) = self.send_to_channel(STDOUT, format!("{msg}\n")) {
+            if let Err(e) = sent {
+                self.err_msg(&format!("strands-shell: {e}"));
                 self.last_exit = 1;
-                return;
             }
-            self.captured_output.push_str(msg);
-            self.captured_output.push('\n');
+        } else if self.capture {
+            let complete = self.append_captured_output(msg) && self.append_captured_output("\n");
+            if !complete {
+                self.append_captured_stderr("strands-shell: output size limit exceeded\n");
+                self.last_exit = 1;
+            }
         } else {
             println!("{msg}");
         }
@@ -655,6 +770,26 @@ impl Process {
     }
 }
 
+pub(crate) fn append_limited(target: &mut String, value: &str, limit: usize) -> bool {
+    if limit == 0 {
+        target.push_str(value);
+        return true;
+    }
+
+    let remaining = limit.saturating_sub(target.len());
+    if value.len() <= remaining {
+        target.push_str(value);
+        return true;
+    }
+
+    let mut end = remaining.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&value[..end]);
+    false
+}
+
 /// Read from an async reader into a String, enforcing an optional size limit.
 /// Returns Err if the limit is exceeded.
 pub async fn read_to_string_limited<R: tokio::io::AsyncRead + Unpin>(
@@ -714,6 +849,15 @@ pub fn base64_encode(input: &[u8]) -> String {
         }
     }
     result
+}
+
+/// One file write that did not reach its place after its descriptors closed.
+#[derive(Debug)]
+pub struct WriteFailure {
+    /// The path the descriptor was opened on.
+    pub path: String,
+    /// The error the write met.
+    pub error: io::Error,
 }
 
 /// Create a bounded channel pair for use as a pipe.
@@ -802,16 +946,22 @@ impl AsyncWrite for FdWriter {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         match &mut this.kind {
-            FdKind::ChannelWriter { tx, error_flag } => {
-                if let Some(flag) = error_flag
-                    && flag.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    return Poll::Ready(Err(io::Error::other("file size limit exceeded")));
-                }
-                let bytes = Bytes::copy_from_slice(buf);
-                let len = bytes.len();
+            FdKind::ChannelWriter { tx, limit } => {
+                let len = match limit {
+                    Some(limit) => match limit.admit(buf.len()) {
+                        Ok(len) => len,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    },
+                    None => buf.len(),
+                };
+                let bytes = Bytes::copy_from_slice(&buf[..len]);
                 match tx.try_send(bytes) {
-                    Ok(()) => Poll::Ready(Ok(len)),
+                    Ok(()) => {
+                        if let Some(limit) = limit {
+                            limit.record(len);
+                        }
+                        Poll::Ready(Ok(len))
+                    }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Channel full — we need to wait. Store bytes and poll again.
                         // For simplicity, use a waker-based approach via try_send retry.
@@ -873,50 +1023,229 @@ pub struct HttpResponse {
     pub reason: String,
 }
 
+// No `HttpTransport` seam. Routing the Shell's egress through a boundary is not a
+// mechanism the Shell should own: a trait every embedding must wire up correctly is
+// weaker than a proxy destination an operator can inspect, and it can route anywhere —
+// including around the boundary it exists to enforce.
+//
+// It would also not be a forcing control where it matters. The Shell shim runs
+// outside the Agent's containment domain, so a trusted process that can construct a
+// direct client is not confined by configuration. So the box sets its egress gateway as
+// the proxy destination, and calls `disable_network()` when it has no gateway.
+
+/// Whether an operation acts on a symlink's target or on the link itself.
+///
+/// This is a property of the *operation*, not of the path, and getting it wrong is
+/// exploitable in both directions: resolving a no-follow operation would authorize a
+/// file the caller never touches, and failing to resolve a following one lets a
+/// symlink launder a denied path.
+///
+/// | Disposition | Operations |
+/// |---|---|
+/// | [`Follow::Yes`] | `open`, `list_dir`, `change_dir`, `stat`, `access`, `canonicalize`, `is_executable`, `remove_dir`, `set_permissions` |
+/// | [`Follow::No`] | `lstat`, `read_link`, `remove_file`, `create_dir`, the `rename` source and destination, the link side of `symlink` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Follow {
+    /// Act on what the link points at.
+    Yes,
+    /// Act on the link itself.
+    No,
+}
+
+/// A filesystem identity produced by the kernel that owns it.
+///
+/// Constructible only by [`Kernel::resolve`], so a method accepting one has evidence
+/// that resolution happened. That is the point: a `&str` parameter carries no such
+/// evidence, which is why each method had to remember to resolve, and why one of them
+/// did not.
+///
+/// The contained path is absolute and normalized. Whether a final symlink was
+/// followed is recorded in [`Self::follow`], and must match the semantics of the
+/// operation the token is passed to.
+///
+/// This is **not** a capability in the object-capability sense: it proves resolution,
+/// not authorization. Admission is a separate step and the token records no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    path: String,
+    follow: Follow,
+    generation: u64,
+    host_identity: Option<HostIdentity>,
+}
+
+/// The host object identity recorded by an earlier Shell release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectIdentity {
+    /// The device number.
+    pub dev: u64,
+    /// The inode number.
+    pub ino: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostIdentity {
+    Present {
+        path: PathBuf,
+        parent: PathBuf,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(unix)]
+        parent_device: u64,
+        #[cfg(unix)]
+        parent_inode: u64,
+    },
+    Missing {
+        path: PathBuf,
+        parent: PathBuf,
+        #[cfg(unix)]
+        parent_device: u64,
+        #[cfg(unix)]
+        parent_inode: u64,
+    },
+    Unavailable {
+        path: PathBuf,
+    },
+}
+
+impl Resolved {
+    /// Mint a token. Callable only inside this crate, by a [`Kernel::resolve`] impl.
+    pub(crate) fn new(
+        path: String,
+        follow: Follow,
+        generation: u64,
+        host_identity: Option<HostIdentity>,
+    ) -> Self {
+        Self {
+            path,
+            follow,
+            generation,
+            host_identity,
+        }
+    }
+
+    /// The resolved absolute path, for admission and diagnostics.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The symlink disposition this token was minted with.
+    pub fn follow(&self) -> Follow {
+        self.follow
+    }
+
+    /// The earlier host identity view, when this token is host-backed.
+    pub fn binding(&self) -> Option<ObjectIdentity> {
+        #[cfg(unix)]
+        {
+            match &self.host_identity {
+                Some(HostIdentity::Present { device, inode, .. }) => Some(ObjectIdentity {
+                    dev: *device,
+                    ino: *inode,
+                }),
+                Some(HostIdentity::Missing {
+                    parent_device,
+                    parent_inode,
+                    ..
+                }) => Some(ObjectIdentity {
+                    dev: *parent_device,
+                    ino: *parent_inode,
+                }),
+                Some(HostIdentity::Unavailable { .. }) | None => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn host_identity(&self) -> Option<&HostIdentity> {
+        self.host_identity.as_ref()
+    }
+}
+
 /// The core kernel abstraction. All methods take &self — the kernel is shared.
 #[async_trait]
 pub trait Kernel: Send + Sync {
+    /// Resolve a caller-supplied path into the identity an operation will act on.
+    ///
+    /// The only constructor of [`Resolved`]. Applies the process working directory,
+    /// normalizes `.` and `..`, and resolves every intermediate symlink. The final component is
+    /// resolved only when `follow` is [`Follow::Yes`]. A dangling symlink that is resolved resolves to
+    /// the path it names, and a path with too many symlinks keeps its spelling.
+    ///
+    /// A path whose leaf does not exist yet still resolves: existing ancestors are
+    /// canonicalized and the missing remainder appended to that base. This is what
+    /// makes a create authorize under its real parent, so
+    /// `ln -s /secrets /alias; touch /alias/new` is judged as `/secrets/new`.
+    ///
+    /// Resolution answers *which object*, never *whether permitted* — admission is a
+    /// separate step above this trait.
+    async fn resolve(&self, proc: &Process, path: &str, follow: Follow) -> Resolved;
+
     fn new_process(&self) -> Process;
-    async fn open(&self, proc: &mut Process, path: &str, flags: OpenFlags) -> io::Result<Fd>;
-    async fn list_dir(&self, proc: &Process, path: &str) -> io::Result<Vec<DirEntry>>;
-    async fn change_dir(&self, proc: &mut Process, path: &str) -> io::Result<()>;
+    async fn open(&self, proc: &mut Process, path: Resolved, flags: OpenFlags) -> io::Result<Fd>;
+    async fn list_dir(&self, proc: &Process, path: Resolved) -> io::Result<Vec<DirEntry>>;
+    async fn change_dir(&self, proc: &mut Process, path: Resolved) -> io::Result<()>;
     /// Stat a file (follows symlinks). Returns default (exists=false) on error.
-    async fn stat(&self, proc: &Process, path: &str) -> FileStat;
+    async fn stat(&self, proc: &Process, path: Resolved) -> FileStat;
     /// Stat a file (does not follow symlinks).
-    async fn lstat(&self, proc: &Process, path: &str) -> FileStat;
+    async fn lstat(&self, proc: &Process, path: Resolved) -> FileStat;
     /// Check access permissions (ACCESS_R, ACCESS_W, ACCESS_X).
-    async fn access(&self, proc: &Process, path: &str, mode: i32) -> bool;
+    async fn access(&self, proc: &Process, path: Resolved, mode: i32) -> bool;
     /// Canonicalize a path (resolve symlinks).
-    async fn canonicalize(&self, proc: &Process, path: &str) -> io::Result<PathBuf>;
+    async fn canonicalize(&self, proc: &Process, path: Resolved) -> io::Result<PathBuf>;
     /// Check if a path is an executable file.
-    async fn is_executable(&self, proc: &Process, path: &str) -> bool;
+    async fn is_executable(&self, proc: &Process, path: Resolved) -> bool;
     /// Expand a glob pattern relative to the process cwd. Returns sorted matches.
     async fn glob(&self, proc: &Process, pattern: &str) -> Vec<String>;
     /// Check if a file descriptor refers to a terminal.
     fn isatty(&self, fd: i32) -> bool;
     /// Remove a file.
-    async fn remove_file(&self, proc: &Process, path: &str) -> io::Result<()>;
+    async fn remove_file(&self, proc: &Process, path: Resolved) -> io::Result<()>;
     /// Remove an empty directory.
-    async fn remove_dir(&self, proc: &Process, path: &str) -> io::Result<()>;
+    async fn remove_dir(&self, proc: &Process, path: Resolved) -> io::Result<()>;
     /// Create a directory.
-    async fn create_dir(&self, proc: &Process, path: &str) -> io::Result<()>;
+    async fn create_dir(&self, proc: &Process, path: Resolved) -> io::Result<()>;
     /// Rename (move) a file or directory.
-    async fn rename(&self, proc: &Process, from: &str, to: &str) -> io::Result<()>;
+    async fn rename(&self, proc: &Process, from: Resolved, to: Resolved) -> io::Result<()>;
     /// Create a symbolic link at `link` pointing to `target`.
-    async fn symlink(&self, proc: &Process, target: &str, link: &str) -> io::Result<()>;
+    /// Create the symlink `link` holding the literal text `target`.
+    ///
+    /// `target` is a `&str`, not a [`Resolved`]: it is *stored data*, not a path this
+    /// call acts on. A relative link (`ln -s d /tmp/link`) must keep the spelling `d`
+    /// so it resolves against the link's own directory later — absolutizing or
+    /// resolving it here would silently rewrite the user's link. What a later read
+    /// through the link authorizes is decided then, by `open`, on the resolved target.
+    async fn symlink(&self, proc: &Process, target: &str, link: Resolved) -> io::Result<()>;
     /// Read the target of a symbolic link.
-    async fn read_link(&self, proc: &Process, path: &str) -> io::Result<String>;
+    async fn read_link(&self, proc: &Process, path: Resolved) -> io::Result<String>;
     /// Set Unix permission mode bits on a path.
-    async fn set_permissions(&self, proc: &Process, path: &str, mode: u32) -> io::Result<()>;
+    async fn set_permissions(&self, proc: &Process, path: Resolved, mode: u32) -> io::Result<()>;
     /// Return the current wall-clock time.
     fn now(&self) -> std::time::SystemTime;
+    /// Wait until every write whose descriptors are all closed is visible, and report each that failed.
+    async fn settle_writes(&self) -> Vec<WriteFailure>;
     /// Check whether a URL is allowed for network access.
     /// Returns Ok(()) if allowed, Err with a message if blocked.
-    fn check_url(&self, _url: &str) -> io::Result<()> {
-        Ok(())
-    }
-    /// Send an HTTP request. The kernel handles SSRF protection and the
-    /// actual network transport.
+    /// The SSRF floor: refuse a destination no policy may open.
+    ///
+    /// Deny-only, and **required** — it has no default body on purpose. A default of
+    /// `Ok(())` would mean an implementer opts out of the floor by writing no code,
+    /// which is the wrong direction for the one control that must hold
+    /// unconditionally. Refuse link-local, loopback, RFC1918, and instance-metadata
+    /// destinations; return `Ok(())` for anything else.
+    ///
+    /// This is not authorization. Reachability is decided above this trait.
+    fn check_url(&self, url: &str) -> io::Result<()>;
+    /// Send an HTTP request. The kernel handles SSRF protection and the actual
+    /// network transport.
     async fn http_request(&self, _req: HttpRequest) -> io::Result<HttpResponse> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

@@ -14,12 +14,18 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
+use crate::effect::EffectInterceptor;
 use crate::exec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mcp_client::{McpConfigEntry, NamedMcpClient};
+use crate::mediate::Mediated;
 use crate::os::{Kernel, OpenFlags, Process};
 use crate::vfs_config::{BindEntry, BindMode, VfsConfig, build_vfs};
 use crate::vfs_kernel::VfsKernel;
+
+// The `shell:run` denial and interceptor-failure statuses moved to `exec.rs` with the
+// admission point. They are not duplicated here: two spellings of "denied"
+// would drift, and this module no longer produces either.
 
 /// Structured output from a shell command execution.
 ///
@@ -83,6 +89,8 @@ pub struct FileInfo {
 pub struct ShellConfig {
     /// Bind mounts mapping host paths into the VFS, in declaration order.
     pub binds: Vec<BindInfo>,
+    /// Whether the kernel may dispatch network requests.
+    pub network_enabled: bool,
     /// Environment variables seeded into the shell, in declaration order.
     pub env: Vec<(String, String)>,
     /// File-creation umask.
@@ -153,11 +161,10 @@ impl Default for LimitsInfo {
 
 impl Default for ShellConfig {
     /// An empty snapshot with default umask, no timeout, and default caps.
-    /// Used for shells created via [`Shell::with_kernel`], which bypass the
-    /// builder and therefore have no captured configuration.
     fn default() -> Self {
         Self {
             binds: Vec::new(),
+            network_enabled: true,
             env: Vec::new(),
             umask: 0o022,
             timeout_secs: None,
@@ -181,8 +188,8 @@ pub enum FileOpErrorKind {
     NotFound,
     /// Read-only mount or otherwise blocked — `io::ErrorKind::PermissionDenied`.
     PermissionDenied,
-    /// `max_file_size` / `max_inodes` cap (on write or read), or a stalled
-    /// drain consistent with the size cap.
+    /// `max_file_size` / `max_inodes` cap (on write or read), or a write that
+    /// did not commit its full length.
     TooLarge,
     /// Anything else (not-a-directory, parent-is-a-file, host I/O, …).
     Other,
@@ -260,7 +267,11 @@ impl FileOpErrorKind {
 /// # }
 /// ```
 pub struct Shell {
-    kernel: Arc<dyn Kernel>,
+    // The interceptor is NOT stored here. `Mediated` owns it — `build` hands
+    // it over — and `exec::execute` reaches it through `kernel`. A second copy on `Shell`
+    // was what let this type admit commands on a path four other routes did not take; one
+    // owner means one admission point.
+    kernel: Arc<Mediated>,
     /// The shell process state.
     ///
     /// Exposed for advanced use cases that need direct access to the
@@ -305,38 +316,6 @@ impl Shell {
         ShellBuilder::default()
     }
 
-    /// Create a shell from a custom [`Kernel`]
-    /// implementation.
-    ///
-    /// Use this when you need a backend other than the built-in VFS —
-    /// for example, one backed by S3, a database, or a remote API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use std::sync::Arc;
-    /// use strands_shell::Shell;
-    /// use strands_shell::os::Kernel;
-    ///
-    /// fn create_shell(kernel: Arc<dyn Kernel>) -> Shell {
-    ///     Shell::with_kernel(kernel)
-    /// }
-    /// ```
-    pub fn with_kernel(kernel: Arc<dyn Kernel>) -> Self {
-        let proc = kernel.new_process();
-        Self {
-            kernel,
-            proc,
-            timeout: None,
-            max_file_size: 0,
-            config: ShellConfig::default(),
-            #[cfg(not(target_arch = "wasm32"))]
-            mcp_clients: Rc::new(Vec::new()),
-            #[cfg(not(target_arch = "wasm32"))]
-            mcp_config: Vec::new(),
-        }
-    }
-
     /// Refresh `proc.deadline` to `now + timeout` so the per-command
     /// budget starts fresh on each `run()` / `execute()`.
     fn refresh_deadline(&mut self) {
@@ -351,6 +330,15 @@ impl Shell {
             }
         }
     }
+
+    // `intercept_shell_command` and `finish_shell_command` were deleted here, not moved.
+    // They admitted only the two entry points a caller reaches from outside
+    // the crate, which is why Lua's `io.popen`, `os.execute`, `find -exec`, and `xargs`
+    // — all of which re-enter `exec::execute` from *inside* — ran unjudged. The equivalents
+    // now live beside the funnel as `Mediated::admit_command` and `CommandPermit::record`.
+    //
+    // Do not reintroduce an admission call in this module. It would double-count every
+    // submission, and a policy counting `shell:run` would see two events for one command.
 
     /// Run a command and capture its output.
     ///
@@ -370,6 +358,12 @@ impl Shell {
     /// # }
     /// ```
     pub async fn run(&mut self, input: &str) -> Output {
+        // Admission is NOT here. `exec::execute` — which `execute_capture`
+        // delegates to — is the one function every command-text route reaches, so judging
+        // there covers Lua's `io.popen`/`os.execute`, `find -exec`, and `xargs`, which
+        // bypassed this method entirely. Re-adding a check here would emit two
+        // `shell:run` events for one submission, which is worse than none for a policy
+        // that counts them.
         self.refresh_deadline();
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -403,6 +397,7 @@ impl Shell {
     /// # }
     /// ```
     pub async fn execute(&mut self, input: &str) -> i32 {
+        // Admission is in `exec::execute` — see the note on `run`.
         self.refresh_deadline();
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -425,12 +420,13 @@ impl Shell {
         self.proc.get_env(key)
     }
 
-    /// Access the underlying [`Kernel`].
+    /// The mediating kernel handle.
     ///
-    /// Useful for advanced operations like passing the kernel to
-    /// [`mcp::serve()`](crate::mcp::serve) or sharing it across
-    /// multiple shells.
-    pub fn kernel(&self) -> &Arc<dyn Kernel> {
+    /// Yields [`Mediated`], never a bare `Arc<dyn Kernel>`: an accessor returning the
+    /// raw trait would be a route around admission, which is the hole this seam
+    /// closes. Consumers that need a kernel — the MCP server, the REPL — get the
+    /// mediated handle and are governed by the configured interceptor.
+    pub fn kernel(&self) -> &Arc<Mediated> {
         &self.kernel
     }
 
@@ -450,9 +446,6 @@ impl Shell {
     /// resource caps. It exists so an embedder (e.g. a sandbox adapter in
     /// another SDK) can introspect a constructed `Shell` without having held
     /// onto the builder — to build tool descriptions or report active limits.
-    ///
-    /// Shells created via [`with_kernel`](Shell::with_kernel) (which bypass the
-    /// builder) report a [`ShellConfig::default`] snapshot.
     pub fn config(&self) -> &ShellConfig {
         &self.config
     }
@@ -475,7 +468,7 @@ impl Shell {
     /// for its drain task and panics outside that context.
     pub async fn read_file(&mut self, path: &str) -> io::Result<Vec<u8>> {
         async fn inner(
-            kernel: &Arc<dyn Kernel>,
+            kernel: &Arc<Mediated>,
             proc: &mut Process,
             path: &str,
             limit: usize,
@@ -516,7 +509,7 @@ impl Shell {
     ///
     /// Returns `Err(io::Error)` if the parent path is a file, the mount
     /// is read-only, the write exceeds `max_file_size`, the VFS exceeds
-    /// `max_inodes`, or the drain task stalls. The error message is
+    /// `max_inodes`, or the write did not commit its full length. The error message is
     /// prefixed with the path: `"{path}: {kernel diagnostic}"`.
     ///
     /// # Panics
@@ -539,32 +532,16 @@ impl Shell {
                 writer.write_all(content).await?;
                 writer.shutdown().await?;
             }
-            // Bound by "no progress for STALL_LIMIT consecutive yields"
-            // rather than a fixed iteration count, so arbitrarily large
-            // writes converge as long as the drain task keeps making
-            // progress. If progress stalls before reaching `expected`,
-            // the kernel almost certainly hit `max_file_size`.
-            const STALL_LIMIT: u32 = 1024;
-            let mut last_len = u64::MAX;
-            let mut stalled = 0u32;
-            loop {
-                tokio::task::yield_now().await;
-                let s = kernel.stat(proc, path).await;
-                if s.exists && s.len == expected {
-                    return Ok(());
-                }
-                let cur = if s.exists { s.len } else { 0 };
-                if cur != last_len {
-                    last_len = cur;
-                    stalled = 0;
-                } else {
-                    stalled += 1;
-                    if stalled >= STALL_LIMIT {
-                        return Err(io::Error::other(
-                            "write did not commit (file size limit exceeded?)",
-                        ));
-                    }
-                }
+            if let Some(failure) = kernel.settle_writes().await.into_iter().next() {
+                return Err(failure.error);
+            }
+            let s = kernel.stat(proc, path).await;
+            if s.exists && s.len == expected {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "write did not commit (file size limit exceeded?)",
+                ))
             }
         }
         .await;
@@ -658,7 +635,8 @@ impl Shell {
 ///
 /// 1. **Filesystem** — bind mounts that expose host paths into the
 ///    virtual filesystem
-/// 2. **Network** — the SSRF floor on HTTP requests
+/// 2. **Network** — whether the kernel dispatches requests, and the transport
+///    that carries them
 /// 3. **Limits** — resource constraints to prevent runaway execution
 ///
 /// # Bind Mount Modes
@@ -712,6 +690,9 @@ pub struct ShellBuilder {
     max_file_size: usize,
     max_inodes: usize,
     timeout: Option<Duration>,
+    network_enabled: bool,
+    effect_interceptor: Option<Arc<dyn EffectInterceptor>>,
+    kernel: Option<Arc<dyn Kernel>>,
 }
 
 impl Default for ShellBuilder {
@@ -730,11 +711,80 @@ impl Default for ShellBuilder {
             max_file_size: 10 * 1024 * 1024,
             max_inodes: 10_000,
             timeout: Some(std::time::Duration::from_secs(30)),
+            network_enabled: true,
+            effect_interceptor: None,
+            kernel: None,
         }
     }
 }
 
 impl ShellBuilder {
+    /// Intercept **every** route that evaluates command text.
+    ///
+    /// The interceptor receives the exact command string and returns an opaque permit; the
+    /// Shell reports the invocation's status through that permit.
+    ///
+    /// Coverage is the whole point, so it is spelled out. Admission lives in
+    /// [`exec::execute_sourced`](crate::exec::execute_sourced) and
+    /// [`exec::execute_with_reader`](crate::exec::execute_with_reader) — the narrowest pair every
+    /// route reaches — so all of these are judged: [`Shell::run`], [`Shell::execute`], the
+    /// capturing and direct `exec::` entry points, Lua's `io.popen` and `os.execute`,
+    /// `find -exec`, `xargs`, `sh <file>` and `source`, an `EXIT` trap body, the MCP
+    /// `exec_shell` tool, and the REPL. A nested command is admitted in its own right rather
+    /// than folded into the command that spawned it.
+    ///
+    /// **This doc said the opposite until 2026-08-09** — "public direct executor and MCP entry
+    /// points do not use this builder seam" — which was true when admission sat in `Shell::run`,
+    /// and is the sentence an embedder would have read to conclude a route was unmediated.
+    ///
+    /// Not covered: [`crate::mcp_client`] spawns a host process outside this seam entirely.
+    pub fn effect_interceptor(mut self, interceptor: Arc<dyn EffectInterceptor>) -> Self {
+        self.effect_interceptor = Some(interceptor);
+        self
+    }
+
+    /// Use `kernel` as the backend instead of the built-in VFS kernel.
+    ///
+    /// Use this when you need a backend other than the built-in VFS — for
+    /// example, one backed by S3, a database, or a remote API. Going through the
+    /// builder is what makes the custom kernel inherit the process limits and
+    /// umask [`build`](Self::build) applies: `max_depth`, `max_output`,
+    /// `max_fds`, `max_bg_jobs`, `max_pipeline`, `max_input`, `umask`, and the
+    /// per-command [`timeout`](Self::timeout) all land on the shell process
+    /// either way.
+    ///
+    /// [`effect_interceptor`](Self::effect_interceptor) **does** apply: admission
+    /// sits above the `Kernel` trait, so a supplied kernel is mediated identically to
+    /// the bundled one and cannot opt out.
+    ///
+    /// **The remaining kernel-side settings do not transfer, and the supplied kernel
+    /// is responsible for the guarantees they would have provided.** These builder
+    /// calls configure the built-in VFS kernel's internals and cannot be injected into
+    /// an arbitrary implementation, so they are ignored here:
+    ///
+    /// - [`bind`](Self::bind) and the other bind modes — no VFS is built
+    /// - [`disable_network`](Self::disable_network) — the custom kernel's
+    ///   `http_request` decides whether it dispatches
+    /// - [`max_file_size`](Self::max_file_size) and
+    ///   [`max_inodes`](Self::max_inodes) — the custom kernel owns its storage.
+    ///   `max_file_size` still bounds [`Shell::read_file`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use strands_shell::Shell;
+    /// use strands_shell::os::Kernel;
+    ///
+    /// fn create_shell(kernel: Arc<dyn Kernel>) -> std::io::Result<Shell> {
+    ///     Shell::builder().kernel(kernel).build()
+    /// }
+    /// ```
+    pub fn kernel(mut self, kernel: Arc<dyn Kernel>) -> Self {
+        self.kernel = Some(kernel);
+        self
+    }
+
     /// Bind a host path into the virtual filesystem using copy mode.
     ///
     /// The contents of `source` are copied into the VFS at `destination`
@@ -892,6 +942,12 @@ impl ShellBuilder {
         self
     }
 
+    /// Disable all network requests dispatched by this Shell's kernel.
+    pub fn disable_network(mut self) -> Self {
+        self.network_enabled = false;
+        self
+    }
+
     /// Load additional configuration from a TOML file.
     ///
     /// Bind mounts from the file are appended to whatever is already
@@ -965,8 +1021,11 @@ impl ShellBuilder {
 
     /// Build the [`Shell`].
     ///
-    /// This constructs the virtual filesystem with bind mounts and creates
-    /// the initial shell process.
+    /// This constructs the virtual filesystem with bind mounts and creates the
+    /// initial shell process. When a custom [`kernel`](Self::kernel) was
+    /// supplied, no VFS is built and that kernel is used instead — the process
+    /// limits and umask still apply, but the kernel-side settings listed on
+    /// [`kernel`](Self::kernel) do not.
     ///
     /// # Errors
     ///
@@ -998,6 +1057,7 @@ impl ShellBuilder {
                     readonly: b.readonly,
                 })
                 .collect(),
+            network_enabled: self.network_enabled,
             env: self.env.clone(),
             umask: self.config.umask,
             timeout_secs: self.timeout.map(|d| d.as_secs_f64()),
@@ -1013,10 +1073,21 @@ impl ShellBuilder {
             },
         };
 
-        let mut vfs = build_vfs(&self.config)?;
-        vfs.max_file_size = self.max_file_size;
-        vfs.max_inodes = self.max_inodes;
-        let kernel: Arc<dyn Kernel> = Arc::new(VfsKernel::new(vfs));
+        let kernel: Arc<dyn Kernel> = match self.kernel {
+            Some(kernel) => kernel,
+            None => {
+                let mut vfs = build_vfs(&self.config)?;
+                vfs.max_file_size = self.max_file_size;
+                vfs.max_inodes = self.max_inodes;
+                let mut kernel = VfsKernel::new(vfs);
+                kernel.network_enabled = self.network_enabled;
+                Arc::new(kernel)
+            }
+        };
+        // Wrapped once, here. `Mediated` is the only route to the kernel, so a
+        // supplied kernel is admitted exactly as the bundled one is — mediation does
+        // not depend on which backend the embedder chose.
+        let kernel = Arc::new(Mediated::new(kernel, self.effect_interceptor.clone()));
         let mut proc = kernel.new_process();
 
         proc.max_depth = self.max_depth;
@@ -1043,6 +1114,7 @@ impl ShellBuilder {
 
         Ok(Shell {
             kernel,
+
             proc,
             timeout: self.timeout,
             max_file_size: self.max_file_size,
@@ -1054,6 +1126,12 @@ impl ShellBuilder {
         })
     }
 }
+
+// `EffectStartFailure` and `EffectPermitGuard` were deleted with the admission calls above.
+// `mediate::CommandPermit` is their replacement, and it keeps the property
+// that mattered: dropping without recording marks the effect **indeterminate**, never
+// successful, so a command killed by its deadline or abandoned on a client disconnect cannot
+// enter history as though it completed.
 
 /// Compute the parent directory of a path, or `None` if there is none
 /// (root, empty, or no `/`).
@@ -1068,7 +1146,7 @@ fn parent_dir(path: &str) -> Option<String> {
 }
 
 /// Create a directory and all missing ancestors via the Kernel trait.
-async fn create_dir_recursive(kernel: &dyn Kernel, proc: &Process, path: &str) -> io::Result<()> {
+async fn create_dir_recursive(kernel: &Mediated, proc: &Process, path: &str) -> io::Result<()> {
     let stat = kernel.stat(proc, path).await;
     if stat.exists && stat.is_dir {
         return Ok(());

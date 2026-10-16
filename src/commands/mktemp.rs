@@ -10,7 +10,7 @@ Options:
 TEMPLATE should contain 'XXXXXX' which is replaced with random chars.
 Default template: tmp.XXXXXX";
 
-async fn random_suffix(os: &dyn Kernel, len: usize) -> String {
+async fn random_suffix(os: &Mediated, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut buf = vec![0u8; len];
     let mut proc = io::with_process(|p| p.fork());
@@ -26,7 +26,7 @@ async fn random_suffix(os: &dyn Kernel, len: usize) -> String {
 }
 
 #[command("mktemp")]
-async fn cmd_mktemp(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_mktemp(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut dir_mode = false;
     let mut parent = None;

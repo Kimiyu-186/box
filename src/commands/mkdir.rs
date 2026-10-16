@@ -7,7 +7,7 @@ Options:
   -p  create parent directories as needed";
 
 #[command("mkdir")]
-async fn cmd_mkdir(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_mkdir(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut parents = false;
     let mut dirs = Vec::new();

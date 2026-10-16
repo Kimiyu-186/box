@@ -201,6 +201,7 @@ pub struct LimitsInfo {
 #[napi(object)]
 pub struct ShellConfig {
     pub binds: Vec<BindInfo>,
+    pub network_enabled: bool,
     /// Seeded environment variables as a plain object.
     pub env: std::collections::HashMap<String, String>,
     pub umask: f64,
@@ -269,6 +270,12 @@ impl ShellBuilder {
     #[napi]
     pub fn bind_direct_readonly(&self, source: String, destination: String) -> Result<&Self> {
         self.chain(|b| b.bind_direct_readonly(&source, &destination))
+    }
+
+    /// Disable all network requests dispatched by this Shell.
+    #[napi]
+    pub fn disable_network(&self) -> Result<&Self> {
+        self.chain(crate::shell::ShellBuilder::disable_network)
     }
 
     /// Set an environment variable.
@@ -444,6 +451,7 @@ impl Shell {
                             readonly: b.readonly,
                         })
                         .collect(),
+                    network_enabled: c.network_enabled,
                     env: c.env.iter().cloned().collect(),
                     umask: c.umask as f64,
                     timeout: c.timeout_secs,

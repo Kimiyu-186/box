@@ -32,7 +32,7 @@ fn in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
 }
 
 #[command("cut")]
-async fn cmd_cut(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_cut(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut delim = '\t';
     let mut field_spec = String::new();

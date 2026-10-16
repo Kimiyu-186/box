@@ -1,12 +1,15 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 
 use crate::builtins;
 use crate::commands;
 use crate::io::{CURRENT_KERNEL, CURRENT_PROCESS};
-use crate::os::{self, FdReader, Kernel, OpenFlags, Process, STDERR, STDIN, STDOUT};
+use crate::mediate::{CommandPermit, Mediated};
+use crate::os::{self, FdReader, OpenFlags, Process, STDERR, STDIN, STDOUT};
 use crate::parser::{self, Connector, Item, Redirect, Word, WordPart};
 
 /// Signals for break/continue/exit control flow.
@@ -38,19 +41,8 @@ fn is_special(name: &str) -> bool {
     )
 }
 
-async fn find_in_path(os: &dyn Kernel, proc: &Process, name: &str) -> Option<String> {
-    let path_var = proc.env.get("PATH")?;
-    for dir in path_var.split(':') {
-        let full = if dir.is_empty() {
-            format!("./{name}")
-        } else {
-            format!("{dir}/{name}")
-        };
-        if os.is_executable(proc, &full).await {
-            return Some(full);
-        }
-    }
-    None
+async fn find_in_path(os: &Mediated, proc: &Process, name: &str) -> Option<String> {
+    os.find_in_path(proc, name).await
 }
 
 /// Resolve an executable path to either a multicall command name or a shebang interpreter + script.
@@ -62,7 +54,7 @@ enum ExecTarget {
 }
 
 async fn resolve_executable(
-    os: &dyn Kernel,
+    os: &Mediated,
     proc: &Process,
     name: &str,
 ) -> Option<(String, ExecTarget)> {
@@ -110,7 +102,7 @@ async fn resolve_executable(
 
 /// Read a script file and execute it via execute_sourced in a child context.
 async fn run_script(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     script_path: &str,
     args: &[String],
@@ -146,15 +138,143 @@ async fn run_script(
     exit
 }
 
+/// Status for a command an interceptor refused. Matches `Shell`'s own denial status.
+const EFFECT_DENIED_STATUS: i32 = 126;
+
+/// Status for an interceptor that faulted, or whose outcome could not be recorded.
+const INTERCEPTOR_FAILURE_STATUS: i32 = 125;
+
+/// Present `input` for `shell:run` admission, reporting a refusal on `proc`'s stderr.
+///
+/// `Err(status)` means the command must not run, and **carries the status rather than letting
+/// the caller pick one**: a policy refusal is `126` and an interceptor fault is `125`, and
+/// collapsing them loses the difference between "the policy working" and "the box not working".
+/// An earlier version of this helper returned `Option` and every caller reported `126`, which
+/// silently reclassified faults as denials — caught by
+/// `tests/effect_interceptor.rs::interceptor_failure_is_distinct_from_denial`.
+async fn admit(
+    os: &Arc<Mediated>,
+    proc: &mut Process,
+    program: &str,
+    args: &[String],
+) -> Result<CommandPermit, i32> {
+    // The canonical command line, rebuilt from the expanded words. Deliberately not the
+    // submitted spelling: a decision is about what runs, and `X=rm; $X -rf x` runs
+    // `rm -rf x`. Joining with a single space is a faithful description of argv and is
+    // **not** a re-parseable encoding — a rule that needs one argument reads `arg1`, never
+    // a substring of this.
+    let command = canonical_command_line(program, args);
+    let cwd = proc.cwd.to_string_lossy().into_owned();
+    match os.admit_run(&command, program, args, &cwd).await {
+        Ok(permit) => Ok(permit),
+        Err(error) => Err(refuse(proc, &error)),
+    }
+}
+
+/// Turn an admission error into the status the caller reports.
+///
+/// `Err(status)` **carries** the status rather than letting the caller pick one: a policy
+/// refusal is `126` and an interceptor fault is `125`, and collapsing them loses the difference
+/// between "the policy working" and "the box not working".
+fn refuse(proc: &mut Process, error: &std::io::Error) -> i32 {
+    let (status, label) = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        (EFFECT_DENIED_STATUS, "effect denied")
+    } else {
+        (INTERCEPTOR_FAILURE_STATUS, "effect interception failed")
+    };
+    proc.err_msg(&format!("strands-shell: {label}: {error}"));
+    status
+}
+
+/// The program and its arguments as one line, for `context.input.command`.
+fn canonical_command_line(program: &str, args: &[String]) -> String {
+    let mut line = String::with_capacity(program.len() + args.len() * 8);
+    line.push_str(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    line
+}
+
+/// Admit every non-empty stage of a pipeline, **before any stage runs**.
+///
+/// Admitting all stages up front is the load-bearing part. A pipeline is one construct the
+/// workload submitted, and its stages run concurrently — so admitting lazily would let an
+/// earlier stage's effect land before a later stage was refused, and `cat secret | curl …`
+/// would have already read the file when the second stage was denied. First refusal wins
+/// and nothing runs.
+///
+/// Returns one permit per stage, aligned with `expanded_args` by index, so a caller records
+/// each stage's own status against its own permit. `None` marks a stage with no words (a
+/// bare assignment), which runs no program and so has nothing to authorize.
+async fn admit_pipeline(
+    os: &Arc<Mediated>,
+    proc: &mut Process,
+    expanded_args: &[Vec<String>],
+) -> Result<Vec<Option<CommandPermit>>, i32> {
+    let mut permits = Vec::with_capacity(expanded_args.len());
+    for words in expanded_args.iter() {
+        match words.split_first() {
+            Some((program, args)) => {
+                permits.push(Some(admit(os, proc, program, args).await?));
+            }
+            None => permits.push(None),
+        }
+    }
+    Ok(permits)
+}
+
+/// Report one stage's status against its permit.
+///
+/// A recording failure cannot un-run the command, so it surfaces as a distinguishable
+/// status rather than as a denial: history is now knowingly incomplete, and a caller must
+/// not read the result as clean success.
+async fn report_stage(permit: Option<CommandPermit>, proc: &mut Process, status: i32) -> i32 {
+    let Some(permit) = permit else {
+        return status;
+    };
+    if let Err(error) = permit.record(status).await {
+        proc.err_msg(&format!(
+            "strands-shell: command completed with status {status}, but effect outcome \
+             recording failed: {error}"
+        ));
+        return INTERCEPTOR_FAILURE_STATUS;
+    }
+    status
+}
+
 /// Execute a full input line. `proc` is the shell's process — cd modifies it.
 /// Returns (exit_code, should_exit).
-pub async fn execute(os: Arc<dyn Kernel>, proc: &mut Process, input: &str) -> (i32, bool) {
+///
+/// Admission happens in the two functions this delegates to — [`execute_sourced`] and
+/// [`execute_with_reader`] — **not here**.
+///
+/// That placement is load-bearing, and putting it here instead was measured wrong. `execute`
+/// is not the funnel: `run_script` (for `sh <file>` / `lash <file>`) and the `.`/`source`
+/// builtin call `execute_sourced` **directly**, and the EXIT trap calls
+/// `execute_with_reader` directly, so an admission gate on `execute` alone left all three
+/// unjudged. Measured 2026-08-09 in a real box, against a policy forbidding a marker the
+/// outer command never contained: `find -exec` was correctly denied while `sh script` and
+/// `. script` both ran the forbidden text.
+///
+/// The two callees are the narrowest pair that every command-text route reaches, so judging
+/// there covers `Shell::run`/`Shell::execute`, Lua's `io.popen` and `os.execute`,
+/// `find -exec`, `xargs`, the MCP `exec_shell` tool, the REPL, `sh <file>`, `source`, and a
+/// trap body.
+pub async fn execute(os: Arc<Mediated>, proc: &mut Process, input: &str) -> (i32, bool) {
     let result = if input.contains('\n') {
         execute_sourced(os.clone(), proc, input).await
     } else {
         execute_with_reader(os.clone(), proc, input, &mut |_| None).await
     };
-    // Run EXIT trap if one is set (only at top-level depth)
+    // Run EXIT trap if one is set (only at top-level depth).
+    //
+    // **Judged in its own right**, because `execute_with_reader` admits. An earlier version of
+    // this fix reasoned that a trap is "part of the submission that installed it" and left it
+    // unadmitted — false for the spelling that matters: `V=$(cat f); trap "$V" EXIT` installs
+    // text the submitted command never contained, so the trap body is workload-authored text
+    // that no rule had seen.
     if proc.depth == 0
         && let Some(cmd) = proc.traps.remove("EXIT")
     {
@@ -165,7 +285,7 @@ pub async fn execute(os: Arc<dyn Kernel>, proc: &mut Process, input: &str) -> (i
 
 /// Execute and capture all stdout/stderr output. Returns (exit_code, stdout, stderr).
 pub async fn execute_capture(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     input: &str,
 ) -> (i32, String, String) {
@@ -180,8 +300,25 @@ pub async fn execute_capture(
 }
 
 /// Execute with a line reader for here-documents.
+///
+/// **This is no longer an admission point.** Admission moved to the resolved command, in
+/// [`run_pipeline`], because the submitted text names no program and one effect has many
+/// spellings. Every command this reaches is judged there, one decision per pipeline stage.
 pub async fn execute_with_reader(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    input: &str,
+    read_line: &mut dyn FnMut(&str) -> Option<String>,
+) -> (i32, bool) {
+    execute_admitted_line(os, proc, input, read_line).await
+}
+
+/// [`execute_with_reader`]'s body, after admission.
+///
+/// Split out so no early return can land between admission and the outcome report — that is
+/// what keeps report-exactly-once true by construction rather than by inspection.
+async fn execute_admitted_line(
+    os: Arc<Mediated>,
     proc: &mut Process,
     input: &str,
     read_line: &mut dyn FnMut(&str) -> Option<String>,
@@ -217,7 +354,27 @@ pub async fn execute_with_reader(
 
 /// Execute sourced file content incrementally, so aliases defined by earlier
 /// commands are visible when parsing later commands.
-pub async fn execute_sourced(os: Arc<dyn Kernel>, proc: &mut Process, input: &str) -> (i32, bool) {
+///
+/// **This is no longer an admission point.** Reached directly by `run_script`
+/// (`sh <file>`, `lash <file>`) and by the `.`/`source` builtin, both of which bypass
+/// [`execute`] entirely — which is why a text gate had to live here at all.
+///
+/// Admission now happens per resolved command in [`run_pipeline`], which every line of a
+/// sourced file reaches. So a sourced file costs one decision **per command it runs** rather
+/// than one for the whole file. That is the finer accounting: a `source` of a hundred
+/// commands is a hundred things happening, and a budget that charged it once could not say
+/// which.
+pub async fn execute_sourced(os: Arc<Mediated>, proc: &mut Process, input: &str) -> (i32, bool) {
+    execute_admitted_source(os, proc, input).await
+}
+
+/// [`execute_sourced`]'s body, after admission. See [`execute_admitted_line`] for why it is
+/// split out.
+async fn execute_admitted_source(
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    input: &str,
+) -> (i32, bool) {
     let mut last_code = 0i32;
     let mut accum = String::new();
     let mut last_err = String::new();
@@ -286,7 +443,7 @@ pub async fn execute_sourced(os: Arc<dyn Kernel>, proc: &mut Process, input: &st
 }
 
 /// Expand a Word into a String using the current environment.
-async fn expand_word(os: Arc<dyn Kernel>, proc: &mut Process, word: &Word) -> String {
+async fn expand_word(os: Arc<Mediated>, proc: &mut Process, word: &Word) -> String {
     let mut result = String::new();
     for part in word {
         expand_part(os.clone(), proc, part, &mut result).await;
@@ -326,7 +483,7 @@ impl Segment {
 /// Expand a word and perform IFS field splitting on unquoted expansion results.
 /// Handles "$@" (separate fields per positional param) and "$*" (join with IFS[0]).
 /// After IFS splitting, applies pathname globbing on unquoted metacharacters.
-async fn expand_word_split(os: Arc<dyn Kernel>, proc: &mut Process, word: &Word) -> Vec<String> {
+async fn expand_word_split(os: Arc<Mediated>, proc: &mut Process, word: &Word) -> Vec<String> {
     let ifs = proc
         .env
         .get("IFS")
@@ -355,7 +512,7 @@ async fn expand_word_split(os: Arc<dyn Kernel>, proc: &mut Process, word: &Word)
 /// Expand a single WordPart into segments, handling "$@" splitting.
 /// `quoted` is true when inside a DoubleQuoted context.
 fn expand_part_split<'a>(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &'a mut Process,
     part: &'a WordPart,
     segments: &'a mut Vec<Segment>,
@@ -528,7 +685,7 @@ fn ifs_split(seg: Segment, ifs: &str) -> Vec<(String, bool)> {
 
 /// Expand glob metacharacters in a field using the Kernel abstraction.
 /// If matches are found, add them sorted; otherwise add the original field unchanged.
-async fn glob_expand(os: &dyn Kernel, proc: &Process, field: &str, result: &mut Vec<String>) {
+async fn glob_expand(os: &Mediated, proc: &Process, field: &str, result: &mut Vec<String>) {
     let matches = os.glob(proc, field).await;
     if matches.is_empty() {
         result.push(field.to_string());
@@ -540,7 +697,7 @@ async fn glob_expand(os: &dyn Kernel, proc: &Process, field: &str, result: &mut 
 /// Pre-expand $-prefixed references in an arithmetic expression.
 /// Bare variable names (without $) are left for ArithParser to resolve.
 fn expand_arith_expr<'a>(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &'a mut Process,
     expr: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
@@ -1207,7 +1364,7 @@ fn check_nounset(proc: &mut Process, name: &str) -> bool {
 }
 
 fn expand_part<'a>(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &'a mut Process,
     part: &'a WordPart,
     out: &'a mut String,
@@ -1376,7 +1533,7 @@ fn trim_pattern(s: &str, pat: &str, op: &str) -> String {
 }
 
 /// Expand a here-doc body (like double-quoted context: expand $VAR, $(cmd), `cmd`).
-async fn expand_heredoc_body(os: Arc<dyn Kernel>, proc: &mut Process, body: &str) -> String {
+async fn expand_heredoc_body(os: Arc<Mediated>, proc: &mut Process, body: &str) -> String {
     // Parse the body as if it were inside double quotes
     let mut parts: Vec<WordPart> = Vec::new();
     let mut lit = String::new();
@@ -1429,7 +1586,7 @@ async fn expand_heredoc_body(os: Arc<dyn Kernel>, proc: &mut Process, body: &str
 
 /// Apply expanded redirections to a process. Returns Ok(()) or an error message.
 async fn apply_redirects(
-    os: &Arc<dyn Kernel>,
+    os: &Arc<Mediated>,
     proc: &mut Process,
     redirects: &[(Redirect, String)],
 ) -> Result<(), String> {
@@ -1511,7 +1668,7 @@ async fn apply_redirects(
 }
 
 /// Expand a Vec<Word> (args) into Vec<String>, with IFS field splitting.
-async fn expand_words(os: Arc<dyn Kernel>, proc: &mut Process, words: &[Word]) -> Vec<String> {
+async fn expand_words(os: Arc<Mediated>, proc: &mut Process, words: &[Word]) -> Vec<String> {
     let mut result = Vec::with_capacity(words.len());
     for w in words {
         result.extend(expand_word_split(os.clone(), proc, w).await);
@@ -1520,40 +1677,78 @@ async fn expand_words(os: Arc<dyn Kernel>, proc: &mut Process, words: &[Word]) -
 }
 
 /// Run a command string in a subshell and capture its stdout.
-async fn capture_output(os: Arc<dyn Kernel>, proc: &mut Process, cmd: &str) -> String {
+///
+/// **This is no longer an admission point, and the event it existed to add is now
+/// automatic.** Command substitution — `$(…)` and backticks — evaluates command text
+/// without passing through [`execute_sourced`] or [`execute_with_reader`], so a text gate
+/// had to be repeated here.
+///
+/// The substituted text is parsed and run like any other, so each command inside it reaches
+/// [`run_pipeline`] and raises its own resolved decision. That fixes the accounting defect
+/// this gate was added for — N substitutions used to produce one decision while the same N
+/// through `eval`, `xargs`, or `source` produced N+1 — and it fixes it more completely,
+/// because the decision now names each resolved program rather than the substitution's
+/// source text.
+///
+/// It also retires a documented residual. The old gate judged the substitution's
+/// *unexpanded* text, so a policy saw `$(cat /etc/x)` rather than what it became. Admission
+/// now happens after expansion, so there is nothing left to launder.
+async fn capture_output(os: Arc<Mediated>, proc: &mut Process, cmd: &str) -> String {
     if proc.max_input > 0 && cmd.len() > proc.max_input {
-        proc.captured_stderr
-            .push_str("strands-shell: input too large\n");
         proc.err_msg("strands-shell: input too large");
         proc.last_exit = 1;
         return String::new();
     }
+    let (output, _status) = capture_admitted(os, proc, cmd).await;
+    output
+}
+
+/// [`capture_output`]'s body, after admission.
+///
+/// Split out for the same reason [`execute_admitted_line`] is: no early return may land
+/// between admission and the outcome report, so report-exactly-once holds by construction
+/// rather than by inspection. Returns the status the permit reports.
+async fn capture_admitted(os: Arc<Mediated>, proc: &mut Process, cmd: &str) -> (String, i32) {
     let command_line = match parser::parse(cmd) {
         Ok(cl) => cl,
-        Err(_) => return String::new(),
+        // A parse failure ran nothing, which is a completed effect with a failure status
+        // rather than an indeterminate one.
+        Err(_) => return (String::new(), 1),
     };
     let mut sub = proc.fork();
     sub.depth += 1;
     if sub.check_limits().is_some() {
-        proc.captured_stderr
-            .push_str("strands-shell: maximum recursion depth exceeded\n");
         proc.err_msg("strands-shell: maximum recursion depth exceeded");
         proc.last_exit = 1;
-        return String::new();
+        return (String::new(), 1);
     }
-    let result = run_capturing(os, &mut sub, &command_line).await;
-    if !sub.captured_stderr.is_empty() {
-        proc.captured_stderr.push_str(&sub.captured_stderr);
+    let (result, status) = run_capturing_status(os, &mut sub, &command_line).await;
+    if !sub.captured_stderr.is_empty() && !proc.append_captured_stderr(&sub.captured_stderr) {
+        proc.last_exit = 1;
     }
-    result
+    (result, status)
 }
 
 /// Execute a command line, capturing all stdout into a String instead of printing it.
 async fn run_capturing(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     command_line: &parser::CommandLine,
 ) -> String {
+    run_capturing_status(os, proc, command_line).await.0
+}
+
+/// [`run_capturing`], additionally yielding the status of the last item it ran.
+///
+/// The status is what [`capture_output`] reports against its permit. It is threaded out
+/// rather than read from `proc` afterwards because a capture runs in a fork, and reporting a
+/// status the effect did not have would put a wrong outcome into policy history — the one
+/// thing a mediation seam cannot be wrong about.
+async fn run_capturing_status(
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    command_line: &parser::CommandLine,
+) -> (String, i32) {
     let mut output = String::new();
     let mut last_exit = 0;
     let mut skip = false;
@@ -1741,16 +1936,17 @@ async fn run_capturing(
                 proc.err_msg("strands-shell: output size limit exceeded");
                 output.truncate(proc.max_output);
                 proc.last_exit = 1;
+                last_exit = 1;
                 break;
             }
         }
     }
-    output
+    (output, last_exit)
 }
 
 /// Public-facing execute_command_line that swallows break/continue.
 async fn execute_command_line(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     command_line: &parser::CommandLine,
 ) -> i32 {
@@ -1763,7 +1959,7 @@ async fn execute_command_line(
 
 /// Inner execute that propagates ControlFlow.
 async fn execute_command_line_inner(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     command_line: &parser::CommandLine,
 ) -> Result<i32, ControlFlow> {
@@ -1825,8 +2021,50 @@ async fn execute_command_line_inner(
     Ok(last_exit)
 }
 
+/// Run one item, and return its status only after every byte it wrote is visible.
 async fn execute_item(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    item: &parser::Item,
+) -> Result<i32, ControlFlow> {
+    let result = Box::pin(execute_item_unsettled(os.clone(), proc, item)).await;
+    let failures = os.settle_writes().await;
+    if failures.is_empty() {
+        return result;
+    }
+    let program = item_program(item);
+    for failure in &failures {
+        let message = match &program {
+            Some(program) => format!(
+                "strands-shell: {program}: {}: {}",
+                failure.path, failure.error
+            ),
+            None => format!("strands-shell: {}: {}", failure.path, failure.error),
+        };
+        proc.err_msg(&message);
+    }
+    proc.last_exit = 1;
+    result.map(|_| 1)
+}
+
+/// The literal program word of a pipeline item's last stage, if it has one.
+fn item_program(item: &parser::Item) -> Option<String> {
+    let Item::Pipeline(pipeline, _) = item else {
+        return None;
+    };
+    let word = pipeline.last()?.args.first()?;
+    let program: String = word
+        .iter()
+        .map(|part| match part {
+            WordPart::Literal(text) | WordPart::SingleQuoted(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    (!program.is_empty()).then_some(program)
+}
+
+async fn execute_item_unsettled(
+    os: Arc<Mediated>,
     proc: &mut Process,
     item: &parser::Item,
 ) -> Result<i32, ControlFlow> {
@@ -1852,8 +2090,11 @@ async fn execute_item(
             }
             let r = Box::pin(execute_command_line_inner(os, &mut sub, cl)).await;
             if proc.capture {
-                proc.captured_output.push_str(&sub.captured_output);
-                proc.captured_stderr.push_str(&sub.captured_stderr);
+                let complete = proc.append_captured_output(&sub.captured_output)
+                    && proc.append_captured_stderr(&sub.captured_stderr);
+                if !complete {
+                    proc.last_exit = 1;
+                }
             }
             match r {
                 Ok(n) => Ok(n),
@@ -1966,16 +2207,19 @@ async fn execute_item(
                             Redirect::Append(..) => OpenFlags::append(),
                             _ => OpenFlags::write(),
                         };
-                        if let Ok(fd) = os.open(proc, target, flags).await
-                            && let Ok(mut w) = proc.take_writer(fd)
-                        {
-                            use tokio::io::AsyncWriteExt;
-                            let _ = w.write_all(captured.as_bytes()).await;
+                        let written = match os.open(proc, target, flags).await {
+                            Ok(fd) => match proc.take_writer(fd) {
+                                Ok(mut w) => w.write_all(captured.as_bytes()).await,
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = written {
+                            proc.err_msg(&format!("strands-shell: {target}: {e}"));
+                            proc.last_exit = 1;
                         }
                     }
                 }
-                // Yield to let write-back tasks flush
-                tokio::task::yield_now().await;
                 Ok(proc.last_exit)
             } else {
                 let result = Box::pin(execute_item(os, proc, item)).await;
@@ -1990,7 +2234,7 @@ async fn execute_item(
 }
 
 async fn execute_if(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     branches: &[(parser::CommandLine, parser::CommandLine)],
     else_body: Option<&parser::CommandLine>,
@@ -2013,7 +2257,7 @@ async fn execute_if(
 }
 
 async fn execute_while(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     condition: &parser::CommandLine,
     body: &parser::CommandLine,
@@ -2056,7 +2300,7 @@ async fn execute_while(
 }
 
 async fn execute_for(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     var: &str,
     words: &[Word],
@@ -2087,7 +2331,7 @@ async fn execute_for(
 }
 
 async fn execute_case(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     word: &Word,
     arms: &[parser::CaseArm],
@@ -2216,7 +2460,7 @@ fn xtrace(proc: &mut Process, args: &[String]) {
 
 /// Execute a pipeline, checking for break/continue/exit builtins.
 async fn execute_pipeline_checked(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     pipeline: &[parser::Command],
 ) -> Result<i32, ControlFlow> {
@@ -2392,7 +2636,7 @@ async fn execute_pipeline_checked(
 
 /// Get the optional numeric argument for break/continue (default 1).
 async fn get_numeric_arg(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     proc: &mut Process,
     pipeline: &[parser::Command],
 ) -> i32 {
@@ -2409,30 +2653,21 @@ async fn get_numeric_arg(
 }
 
 async fn execute_pipeline(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     shell_proc: &mut Process,
     pipeline: &[parser::Command],
 ) -> i32 {
     let capture = shell_proc.capture;
     let (exit, output) = run_pipeline(os, shell_proc, pipeline, capture).await;
-    if capture {
-        if shell_proc.max_output > 0
-            && shell_proc.captured_output.len() + output.len() > shell_proc.max_output
-        {
-            let remaining = shell_proc
-                .max_output
-                .saturating_sub(shell_proc.captured_output.len());
-            shell_proc.captured_output.push_str(&output[..remaining]);
-            shell_proc.err_msg("strands-shell: output size limit exceeded");
-            return 1;
-        }
-        shell_proc.captured_output.push_str(&output);
+    if capture && !shell_proc.append_captured_output(&output) {
+        shell_proc.err_msg("strands-shell: output size limit exceeded");
+        return 1;
     }
     exit
 }
 
 async fn execute_pipeline_capture(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     shell_proc: &mut Process,
     pipeline: &[parser::Command],
 ) -> (i32, String) {
@@ -2440,7 +2675,7 @@ async fn execute_pipeline_capture(
 }
 
 async fn run_pipeline(
-    os: Arc<dyn Kernel>,
+    os: Arc<Mediated>,
     shell_proc: &mut Process,
     pipeline: &[parser::Command],
     capture: bool,
@@ -2551,6 +2786,25 @@ async fn run_pipeline(
             }
         }
     }
+
+    // **The single admission point for command execution**
+    // (docs/design/decisions.md#one-admission-point-after-resolution).
+    //
+    // Here, and not earlier, because only here is the program known: the loop above has
+    // applied every multicall and shebang rewrite, so `expanded_args[i][0]` is what will
+    // actually run rather than what was typed. Expansion is already done, so an alias, a
+    // variable, and a quoting trick have all collapsed into the same words.
+    //
+    // Here, and not at a dispatch site, because there are four of them — the single-builtin
+    // arm, the single-function arm, and the two halves of the pipeline arm — and a gate
+    // repeated four times is a gate that will be three times correct. `run_pipeline` is the
+    // one function every command reaches, whatever route submitted it: the REPL, `sh <file>`,
+    // `.`/`source`, an EXIT trap, `eval`, `find -exec`, `xargs`, `$(…)`, and Lua's
+    // `io.popen` and `os.execute` all arrive here.
+    let mut permits = match admit_pipeline(&os, shell_proc, &expanded_args).await {
+        Ok(permits) => permits,
+        Err(status) => return (status, String::new()),
+    };
 
     // Single command: check for builtins
     if len == 1 {
@@ -2672,17 +2926,23 @@ async fn run_pipeline(
                     String::new()
                 }
             };
-            if capture && !stderr_str.is_empty() {
-                shell_proc.captured_stderr.push_str(&stderr_str);
+            if capture && !stderr_str.is_empty() && !shell_proc.append_captured_stderr(&stderr_str)
+            {
+                shell_proc.last_exit = 1;
             }
 
-            return match result {
-                Ok(code) => (code, stdout_str),
+            let status = match result {
+                Ok(code) => code,
                 Err(e) => {
                     shell_proc.err_msg(&format!("strands-shell: {name}: {e}"));
-                    (1, stdout_str)
+                    1
                 }
             };
+            // Report against this stage's own permit. Dropping it instead would submit
+            // `Indeterminate` from its `Drop` — fail-safe, but it would tell a counting rule
+            // "something ended, unknown how" for a command whose status is known.
+            let status = report_stage(permits.remove(0), shell_proc, status).await;
+            return (status, stdout_str);
         }
 
         // Single command: check for functions
@@ -2704,6 +2964,10 @@ async fn run_pipeline(
                     shell_proc.depth -= 1;
                     shell_proc.pop_local_scope();
                     shell_proc.args = saved_args;
+                    // `exit` inside a function body still ended this command, so it is
+                    // reported like any other status. An early return that skipped the
+                    // report would leave the permit to submit `Indeterminate` from `Drop`.
+                    let code = report_stage(permits.remove(0), shell_proc, code).await;
                     return (code, String::new());
                 }
                 Err(_) => shell_proc.last_exit,
@@ -2716,6 +2980,7 @@ async fn run_pipeline(
             } else {
                 String::new()
             };
+            let exit = report_stage(permits.remove(0), shell_proc, exit).await;
             return (exit, func_output);
         }
     }
@@ -2781,104 +3046,110 @@ async fn run_pipeline(
             // Builtins/functions: child has pipe fds (for I/O via CURRENT_PROCESS),
             // state_proc is a fork with env/functions but no fds (for builtin &mut Process)
             let mut state_proc = child.fork();
-            handles.push(tokio::task::spawn_local(CURRENT_KERNEL.scope(
-                os.clone(),
-                CURRENT_PROCESS.scope(RefCell::new(child), async move {
-                    if is_script {
-                        if args.is_empty() {
-                            return 0;
-                        }
-                        let exit = run_script(os, &mut state_proc, &args[0], &args[1..]).await;
-                        let output = std::mem::take(&mut state_proc.captured_output);
-                        if !output.is_empty()
-                            && let Ok(mut w) = crate::io::stdout()
-                        {
-                            let _ = w.write_all(output.as_bytes()).await;
-                        }
-                        return exit;
-                    }
-                    if let Some(f) = builtin {
-                        return match f(os.as_ref(), &mut state_proc, &args).await {
-                            Ok(code) => code,
-                            Err(e) => {
-                                if let Ok(mut w) = crate::io::stderr() {
-                                    let _ = w
-                                        .write_all(
-                                            format!("strands-shell: {name}: {e}\n").as_bytes(),
-                                        )
-                                        .await;
-                                }
-                                1
+            handles.push((
+                i,
+                tokio::task::spawn_local(CURRENT_KERNEL.scope(
+                    os.clone(),
+                    CURRENT_PROCESS.scope(RefCell::new(child), async move {
+                        if is_script {
+                            if args.is_empty() {
+                                return 0;
                             }
-                        };
-                    }
-                    if let Some(body) = func_body {
-                        state_proc.args = args;
-                        state_proc.push_local_scope();
-                        state_proc.capture = true;
-                        // Transfer stdin from child (CURRENT_PROCESS) so the
-                        // function body's commands can read pipeline input.
-                        CURRENT_PROCESS.with(|p| {
-                            p.borrow_mut().transfer_fd(STDIN, &mut state_proc);
-                        });
-                        let exit = match Box::pin(execute_command_line_inner(
-                            os.clone(),
-                            &mut state_proc,
-                            &body,
-                        ))
-                        .await
-                        {
-                            Ok(code) => code,
-                            Err(ControlFlow::Return(code)) => code,
-                            Err(ControlFlow::Exit(code)) => code,
-                            Err(_) => state_proc.last_exit,
-                        };
-                        state_proc.pop_local_scope();
-                        // Write captured output to the pipeline's stdout
-                        let output = std::mem::take(&mut state_proc.captured_output);
-                        if !output.is_empty()
-                            && let Ok(mut w) = crate::io::stdout()
-                        {
-                            let _ = w.write_all(output.as_bytes()).await;
+                            let exit = run_script(os, &mut state_proc, &args[0], &args[1..]).await;
+                            let output = std::mem::take(&mut state_proc.captured_output);
+                            if !output.is_empty()
+                                && let Ok(mut w) = crate::io::stdout()
+                            {
+                                let _ = w.write_all(output.as_bytes()).await;
+                            }
+                            return exit;
                         }
-                        return exit;
-                    }
-                    unreachable!()
-                }),
-            )));
+                        if let Some(f) = builtin {
+                            return match f(os.as_ref(), &mut state_proc, &args).await {
+                                Ok(code) => code,
+                                Err(e) => {
+                                    if let Ok(mut w) = crate::io::stderr() {
+                                        let _ = w
+                                            .write_all(
+                                                format!("strands-shell: {name}: {e}\n").as_bytes(),
+                                            )
+                                            .await;
+                                    }
+                                    1
+                                }
+                            };
+                        }
+                        if let Some(body) = func_body {
+                            state_proc.args = args;
+                            state_proc.push_local_scope();
+                            state_proc.capture = true;
+                            // Transfer stdin from child (CURRENT_PROCESS) so the
+                            // function body's commands can read pipeline input.
+                            CURRENT_PROCESS.with(|p| {
+                                p.borrow_mut().transfer_fd(STDIN, &mut state_proc);
+                            });
+                            let exit = match Box::pin(execute_command_line_inner(
+                                os.clone(),
+                                &mut state_proc,
+                                &body,
+                            ))
+                            .await
+                            {
+                                Ok(code) => code,
+                                Err(ControlFlow::Return(code)) => code,
+                                Err(ControlFlow::Exit(code)) => code,
+                                Err(_) => state_proc.last_exit,
+                            };
+                            state_proc.pop_local_scope();
+                            // Write captured output to the pipeline's stdout
+                            let output = std::mem::take(&mut state_proc.captured_output);
+                            if !output.is_empty()
+                                && let Ok(mut w) = crate::io::stdout()
+                            {
+                                let _ = w.write_all(output.as_bytes()).await;
+                            }
+                            return exit;
+                        }
+                        unreachable!()
+                    }),
+                )),
+            ));
         } else {
             // External commands
-            handles.push(tokio::task::spawn_local(CURRENT_KERNEL.scope(
-                os.clone(),
-                CURRENT_PROCESS.scope(RefCell::new(child), async move {
-                    match commands::lookup(&name) {
-                        Some(f) => match f(os.as_ref(), &args).await {
-                            Ok(code) => code,
-                            Err(e) => {
+            handles.push((
+                i,
+                tokio::task::spawn_local(CURRENT_KERNEL.scope(
+                    os.clone(),
+                    CURRENT_PROCESS.scope(RefCell::new(child), async move {
+                        match commands::lookup(&name) {
+                            Some(f) => match f(os.as_ref(), &args).await {
+                                Ok(code) => code,
+                                Err(e) => {
+                                    if let Ok(mut w) = crate::io::stderr() {
+                                        let _ = w
+                                            .write_all(
+                                                format!("strands-shell: {name}: {e}\n").as_bytes(),
+                                            )
+                                            .await;
+                                    }
+                                    1
+                                }
+                            },
+                            None => {
                                 if let Ok(mut w) = crate::io::stderr() {
                                     let _ = w
                                         .write_all(
-                                            format!("strands-shell: {name}: {e}\n").as_bytes(),
+                                            format!("strands-shell: {name}: command not found\n")
+                                                .as_bytes(),
                                         )
                                         .await;
                                 }
-                                1
+                                127
                             }
-                        },
-                        None => {
-                            if let Ok(mut w) = crate::io::stderr() {
-                                let _ = w
-                                    .write_all(
-                                        format!("strands-shell: {name}: command not found\n")
-                                            .as_bytes(),
-                                    )
-                                    .await;
-                            }
-                            127
                         }
-                    }
-                }),
-            )));
+                    }),
+                )),
+            ));
         }
     }
 
@@ -2914,18 +3185,8 @@ async fn run_pipeline(
 
     // Drain all stderr
     let stderr_drain = if capture {
-        let handle = tokio::spawn(async move {
-            let mut all = String::new();
-            for rx in stderr_rxs {
-                let mut reader = FdReader::from_receiver(rx);
-                all.push_str(
-                    &os::read_to_string_limited(&mut reader, max_output)
-                        .await
-                        .unwrap_or_default(),
-                );
-            }
-            all
-        });
+        let handle =
+            tokio::spawn(async move { read_receivers_limited(stderr_rxs, max_output).await });
         Some(handle)
     } else {
         let handle = tokio::spawn(async move {
@@ -2949,12 +3210,22 @@ async fn run_pipeline(
         Some(handle)
     };
 
-    // Wait for all command tasks
+    // Wait for all command tasks, reporting each stage against its own permit.
+    //
+    // `handles` carries its stage index because it skips word-less stages, so a positional
+    // zip against `permits` would misalign every later stage — reporting one command's
+    // status against another command's permit.
     let mut last_exit = 0;
-    for handle in handles {
-        if let Ok(exit) = handle.await {
-            last_exit = exit;
-        }
+    for (index, handle) in handles {
+        let exit = match handle.await {
+            Ok(exit) => exit,
+            // A task that did not join has ended with no status. Leave the permit to
+            // submit `Indeterminate` from its `Drop`: a rule counting attempts must still
+            // see one happened, and must not be told it succeeded.
+            Err(_) => continue,
+        };
+        let permit = permits.get_mut(index).and_then(Option::take);
+        last_exit = report_stage(permit, shell_proc, exit).await;
     }
 
     let stdout_str = if let Some(h) = stdout_drain {
@@ -2967,9 +3238,30 @@ async fn run_pipeline(
     } else {
         String::new()
     };
-    if capture && !stderr_str.is_empty() {
-        shell_proc.captured_stderr.push_str(&stderr_str);
+    if capture && !stderr_str.is_empty() && !shell_proc.append_captured_stderr(&stderr_str) {
+        last_exit = 1;
     }
 
     (last_exit, stdout_str)
+}
+
+async fn read_receivers_limited(receivers: Vec<mpsc::Receiver<Bytes>>, limit: usize) -> String {
+    let mut output = String::new();
+    for receiver in receivers {
+        let remaining = if limit == 0 {
+            0
+        } else {
+            limit.saturating_sub(output.len())
+        };
+        if limit > 0 && remaining == 0 {
+            break;
+        }
+
+        let mut reader = FdReader::from_receiver(receiver);
+        match os::read_to_string_limited(&mut reader, remaining).await {
+            Ok(value) => output.push_str(&value),
+            Err(_) => break,
+        }
+    }
+    output
 }

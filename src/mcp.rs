@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::exec;
-use crate::os::{self, Kernel, Process, ProcessLimits};
+use crate::mediate::Mediated;
+use crate::os::{self, Process, ProcessLimits};
 
 // ── JSON-RPC types ──────────────────────────────────────────────────
 
@@ -207,7 +208,7 @@ fn tool_list() -> Value {
 
 // ── Tool execution ──────────────────────────────────────────────────
 
-async fn exec_shell(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Value) -> Value {
+async fn exec_shell(kernel: &Arc<Mediated>, proc: &mut Process, args: &Value) -> Value {
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return err_result("missing required parameter: command"),
@@ -245,7 +246,7 @@ async fn exec_shell(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Value) 
     })
 }
 
-async fn exec_read_file(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Value) -> Value {
+async fn exec_read_file(kernel: &Arc<Mediated>, proc: &mut Process, args: &Value) -> Value {
     let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return err_result("missing required parameter: file_path"),
@@ -317,7 +318,7 @@ async fn exec_read_file(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Val
     text_result(&result)
 }
 
-async fn exec_write_file(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Value) -> Value {
+async fn exec_write_file(kernel: &Arc<Mediated>, proc: &mut Process, args: &Value) -> Value {
     let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return err_result("missing required parameter: file_path"),
@@ -350,7 +351,7 @@ async fn exec_write_file(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Va
     text_result(&format!("Wrote {} bytes to {file_path}", content.len()))
 }
 
-async fn exec_list_dir(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Value) -> Value {
+async fn exec_list_dir(kernel: &Arc<Mediated>, proc: &mut Process, args: &Value) -> Value {
     let dir_path = match args.get("dir_path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return err_result("missing required parameter: dir_path"),
@@ -375,7 +376,7 @@ async fn exec_list_dir(kernel: &Arc<dyn Kernel>, proc: &mut Process, args: &Valu
 /// Process MCP JSON-RPC messages from a reader, writing responses to a writer.
 /// This is the core server loop, factored out for testability.
 pub async fn serve_io(
-    kernel: Arc<dyn Kernel>,
+    kernel: Arc<Mediated>,
     limits: &ProcessLimits,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
@@ -448,7 +449,7 @@ pub async fn serve_io(
     }
 }
 
-pub async fn serve(kernel: Arc<dyn Kernel>, limits: ProcessLimits) {
+pub async fn serve(kernel: Arc<Mediated>, limits: ProcessLimits) {
     let stdin = io::stdin();
     let mut locked = stdin.lock();
     let mut stdout = io::stdout();

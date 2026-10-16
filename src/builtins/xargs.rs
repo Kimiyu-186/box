@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::os::Process;
 use crate::prelude::*;
 
 fn exec_fork(proc: &mut Process) -> Process {
@@ -25,7 +25,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 pub fn builtin_xargs<'a>(
-    _os: &'a dyn Kernel,
+    _os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {

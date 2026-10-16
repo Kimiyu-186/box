@@ -34,7 +34,7 @@ async fn flush_line(
 }
 
 #[command("uniq")]
-async fn cmd_uniq(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_uniq(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut count = false;
     let mut only_dup = false;

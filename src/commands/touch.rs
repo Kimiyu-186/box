@@ -4,7 +4,7 @@ const HELP: &str = "Usage: touch FILE...
 Create files or update modification times.";
 
 #[command("touch")]
-async fn cmd_touch(os: &dyn Kernel, args: &[String]) -> CommandResult {
+async fn cmd_touch(os: &Mediated, args: &[String]) -> CommandResult {
     let mut parser = lexopt::Parser::from_args(args);
     let mut files = Vec::new();
     while let Some(arg) = parser.next()? {

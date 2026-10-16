@@ -4,7 +4,7 @@ use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
 
 use crate::commands::CommandResult;
-use crate::os::{Kernel, Process};
+use crate::os::Process;
 use crate::prelude::*;
 
 fn exec_fork(proc: &mut Process) -> Process {
@@ -290,7 +290,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 pub fn builtin_find<'a>(
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a mut Process,
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
@@ -416,7 +416,7 @@ pub fn builtin_find<'a>(
 }
 
 fn walk<'a>(
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a mut Process,
     w: &'a mut crate::os::FdWriter,
     path: &'a str,
@@ -493,7 +493,7 @@ fn walk<'a>(
 }
 
 fn do_actions<'a>(
-    os: &'a dyn Kernel,
+    os: &'a Mediated,
     proc: &'a mut Process,
     w: &'a mut crate::os::FdWriter,
     expr: &'a Expr,
