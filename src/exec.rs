@@ -2567,8 +2567,24 @@ async fn run_pipeline(
             io_proc.set_channel_writer(STDERR, err_tx.clone());
             shell_proc.set_err_tx(err_tx);
 
-            // Apply redirects to the io_proc so builtins see them
+            // Apply redirects to the io_proc so builtins see them.
+            //
+            // `clear_err_tx` first, and it is load-bearing. `set_err_tx` above points
+            // `err_msg` at `err_rx`, but this arm returns *before* the drain tasks below are
+            // spawned — so reporting through the channel writes into a receiver nobody will
+            // ever read, and the failure surfaces as a bare exit status with no reason.
+            // Clearing it sends the message to the shell's own captured stderr instead.
+            //
+            // Measured against a read-only bind: `printf x > <ro-path>` exited 1 silently,
+            // while the same denial through a builtin (`tee`, `mkdir`) printed "read-only
+            // bind mount" correctly — those report through a process whose stderr *is*
+            // drained, which is why the bug looked like it was in the bind rather than here.
+            //
+            // Do not "fix" this by cloning `err_tx` into `set_err_tx`: that leaves a sender
+            // alive on the success path, `err_rx` never reaches end-of-stream, and the drain
+            // below hangs until the command deadline. Measured — every redirect took 30s.
             if let Err(e) = apply_redirects(&os, &mut io_proc, &expanded_redirects[0]).await {
+                shell_proc.clear_err_tx();
                 shell_proc.err_msg(&format!("strands-shell: {e}"));
                 return (1, String::new());
             }
