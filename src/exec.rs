@@ -157,6 +157,7 @@ async fn admit(
     proc: &mut Process,
     program: &str,
     args: &[String],
+    literal: &[bool],
 ) -> Result<CommandPermit, i32> {
     // The canonical command line, rebuilt from the expanded words. Deliberately not the
     // submitted spelling: a decision is about what runs, and `X=rm; $X -rf x` runs
@@ -165,7 +166,7 @@ async fn admit(
     // a substring of this.
     let command = canonical_command_line(program, args);
     let cwd = proc.cwd.to_string_lossy().into_owned();
-    match os.admit_run(&command, program, args, &cwd).await {
+    match os.admit_run(&command, program, args, literal, &cwd).await {
         Ok(permit) => Ok(permit),
         Err(error) => Err(refuse(proc, &error)),
     }
@@ -212,12 +213,20 @@ async fn admit_pipeline(
     os: &Arc<Mediated>,
     proc: &mut Process,
     expanded_args: &[Vec<String>],
+    literal_args: &[Vec<bool>],
 ) -> Result<Vec<Option<CommandPermit>>, i32> {
     let mut permits = Vec::with_capacity(expanded_args.len());
-    for words in expanded_args.iter() {
+    for (stage, words) in expanded_args.iter().enumerate() {
         match words.split_first() {
             Some((program, args)) => {
-                permits.push(Some(admit(os, proc, program, args).await?));
+                // The mask covers the program too, so the arguments start one in. A mask of another
+                // length is a rewrite that moved the words without moving the mask, so it is
+                // dropped: an absent entry counts as expanded, and an expanded value is redacted.
+                let literal = literal_args
+                    .get(stage)
+                    .filter(|mask| mask.len() == words.len())
+                    .map_or(&[][..], |mask| mask.get(1..).unwrap_or(&[]));
+                permits.push(Some(admit(os, proc, program, args, literal).await?));
             }
             None => permits.push(None),
         }
@@ -1669,11 +1678,30 @@ async fn apply_redirects(
 
 /// Expand a Vec<Word> (args) into Vec<String>, with IFS field splitting.
 async fn expand_words(os: Arc<Mediated>, proc: &mut Process, words: &[Word]) -> Vec<String> {
+    expand_words_tracked(os, proc, words).await.0
+}
+
+/// Expand `words`, and say for each produced string whether its word was literal in the script.
+///
+/// One word may produce several strings — field splitting and globbing both do that — and every
+/// string a literal word produces is itself literal: a glob result is a filename the filesystem
+/// supplied, which an interceptor already judges as a path.
+async fn expand_words_tracked(
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    words: &[Word],
+) -> (Vec<String>, Vec<bool>) {
     let mut result = Vec::with_capacity(words.len());
+    let mut literal = Vec::with_capacity(words.len());
     for w in words {
-        result.extend(expand_word_split(os.clone(), proc, w).await);
+        let produced = expand_word_split(os.clone(), proc, w).await;
+        literal.resize(
+            literal.len() + produced.len(),
+            crate::parser::word_is_literal(w),
+        );
+        result.extend(produced);
     }
-    result
+    (result, literal)
 }
 
 /// Run a command string in a subshell and capture its stdout.
@@ -2704,11 +2732,17 @@ async fn run_pipeline(
 
     // Expand all args/env/redirects up front
     let mut expanded_args: Vec<Vec<String>> = Vec::with_capacity(len);
+    // Which of those words the script stated itself, aligned with `expanded_args` by index. Only
+    // admission reads it: an interceptor must tell a literal word from a value that arrived at
+    // runtime, and every expansion has already happened by the time it sees the strings.
+    let mut literal_args: Vec<Vec<bool>> = Vec::with_capacity(len);
     let mut expanded_env: Vec<Vec<(String, String)>> = Vec::with_capacity(len);
     let mut expanded_redirects: Vec<Vec<(Redirect, String)>> = Vec::with_capacity(len);
 
     for cmd in pipeline {
-        expanded_args.push(expand_words(os.clone(), shell_proc, &cmd.args).await);
+        let (args, literal) = expand_words_tracked(os.clone(), shell_proc, &cmd.args).await;
+        expanded_args.push(args);
+        literal_args.push(literal);
         let mut env = Vec::new();
         for (k, v) in &cmd.env {
             env.push((
@@ -2781,22 +2815,33 @@ async fn run_pipeline(
                     expanded_args[i][0] = name;
                 }
                 ExecTarget::Shebang(interp) => {
+                    // A rewrite that prepends words must move the provenance mask with them, or
+                    // admission reads a literal bit against an argument that arrived at runtime.
+                    // Every word prepended here comes from the operator's own `#!` line.
+                    let orig_args = expanded_args[i][1..].to_vec();
+                    let orig_literal = literal_args[i].get(1..).unwrap_or(&[]).to_vec();
                     // Check if the interpreter resolves to a multicall binary
                     if let Some((_, ExecTarget::Multicall(mcname))) =
                         resolve_executable(os.as_ref(), shell_proc, &interp[0]).await
                     {
                         // Multicall: rewrite to <command> <script_path> [orig_args...]
                         let script_path = interp.last().unwrap().clone();
-                        let orig_args = expanded_args[i][1..].to_vec();
                         let mut new_args = vec![mcname, script_path];
                         new_args.extend(orig_args);
                         expanded_args[i] = new_args;
+                        let mut new_literal = vec![true, true];
+                        new_literal.extend(orig_literal);
+                        literal_args[i] = new_literal;
                     } else {
-                        let orig_args = expanded_args[i][1..].to_vec();
+                        let prepended = interp.len();
                         let mut new_args = interp;
                         new_args.extend(orig_args);
                         expanded_args[i] = new_args;
+                        let mut new_literal = vec![true; prepended];
+                        new_literal.extend(orig_literal);
+                        literal_args[i] = new_literal;
                     }
+                    debug_assert_eq!(literal_args[i].len(), expanded_args[i].len());
                 }
             }
         }
@@ -2816,7 +2861,7 @@ async fn run_pipeline(
     // one function every command reaches, whatever route submitted it: the REPL, `sh <file>`,
     // `.`/`source`, an EXIT trap, `eval`, `find -exec`, `xargs`, `$(…)`, and Lua's
     // `io.popen` and `os.execute` all arrive here.
-    let mut permits = match admit_pipeline(&os, shell_proc, &expanded_args).await {
+    let mut permits = match admit_pipeline(&os, shell_proc, &expanded_args, &literal_args).await {
         Ok(permits) => permits,
         Err(status) => return (status, String::new()),
     };

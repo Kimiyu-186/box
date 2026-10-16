@@ -114,12 +114,14 @@ impl Mediated {
         command: &str,
         program: &str,
         args: &[String],
+        literal: &[bool],
         cwd: &str,
     ) -> io::Result<CommandPermit> {
         self.admit_resolved(&EffectAttempt::ShellRun {
             command,
             program,
             args,
+            literal,
             cwd,
         })
         .await
@@ -137,6 +139,7 @@ impl Mediated {
         program: &str,
         program_path: &str,
         args: &[String],
+        literal: &[bool],
         cwd: &str,
     ) -> io::Result<CommandPermit> {
         self.admit_resolved(&EffectAttempt::ShellSpawn {
@@ -144,6 +147,7 @@ impl Mediated {
             program,
             program_path,
             args,
+            literal,
             cwd,
         })
         .await

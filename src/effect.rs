@@ -102,6 +102,11 @@ pub enum EffectAttempt<'a> {
         program: &'a str,
         /// The expanded arguments, without the program.
         args: &'a [String],
+        /// Whether each argument's word was literal in the script, aligned with `args` by index.
+        ///
+        /// An interceptor that reports a command needs this: a literal word is already in a file the
+        /// operator can read, and an expanded one carries a value that arrived at runtime.
+        literal: &'a [bool],
         /// The working directory the command will run in.
         cwd: &'a str,
     },
@@ -124,6 +129,8 @@ pub enum EffectAttempt<'a> {
         program_path: &'a str,
         /// The expanded arguments, without the program.
         args: &'a [String],
+        /// Whether each argument's word was literal in the script, aligned with `args` by index.
+        literal: &'a [bool],
         /// The working directory the command will run in.
         cwd: &'a str,
     },

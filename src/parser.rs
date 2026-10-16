@@ -33,6 +33,25 @@ pub enum WordPart {
 /// A word is a sequence of parts that get concatenated after expansion.
 pub type Word = Vec<WordPart>;
 
+/// Whether every part of `word` is text the submitted script already carried.
+///
+/// An interceptor needs this to tell a word the operator can read in their own file from one whose
+/// value arrived at runtime. `Tilde` and `Arith` are **not** literal: each resolves to something the
+/// script does not state, so an interceptor decides about the result rather than about the spelling.
+#[must_use]
+pub fn word_is_literal(word: &[WordPart]) -> bool {
+    word.iter().all(|part| match part {
+        WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
+        WordPart::DoubleQuoted(parts) => word_is_literal(parts),
+        WordPart::Var(_)
+        | WordPart::VarOp(..)
+        | WordPart::Backtick(_)
+        | WordPart::DollarParen(_)
+        | WordPart::Arith(_)
+        | WordPart::Tilde(_) => false,
+    })
+}
+
 /// A single command with its arguments and optional I/O redirections.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Command {
@@ -1620,6 +1639,43 @@ mod tests {
         parse(input)
     }
 
+    /// `word_is_literal` separates a word the script stated from one whose value arrives at runtime.
+    ///
+    /// An interceptor that reports a command line reads this to decide what the record may carry.
+    #[test]
+    fn a_word_is_literal_only_when_no_part_expands() {
+        let last_arg = |input: &str| {
+            let parsed = p(input).expect("the line parses");
+            match &parsed[0].0 {
+                Item::Pipeline(pipeline, _) => {
+                    pipeline[0].args.last().expect("one argument").clone()
+                }
+                other => panic!("expected a pipeline, got {other:?}"),
+            }
+        };
+        for line in [
+            "setopt pipefail",
+            "cat allowed.txt",
+            "echo 'single quoted'",
+            r#"echo "double quoted""#,
+        ] {
+            let word = last_arg(line);
+            assert!(word_is_literal(&word), "{line}: {word:?} is literal");
+        }
+        for line in [
+            "echo $SECRET",
+            "echo ${SECRET}",
+            "echo ${SECRET:-fallback}",
+            "echo $(cat secret.txt)",
+            "echo `cat secret.txt`",
+            "echo $((1 + 1))",
+            "cat ~/notes.txt",
+            r#"echo "value is $SECRET""#,
+        ] {
+            let word = last_arg(line);
+            assert!(!word_is_literal(&word), "{line}: {word:?} expands");
+        }
+    }
     /// Helper: extract the literal string from a Word (panics if not all literal/single-quoted).
     fn word_str(w: &Word) -> String {
         word_to_str(w).expect("expected literal word")
