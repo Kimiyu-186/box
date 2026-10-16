@@ -68,41 +68,53 @@ impl VfsKernel {
                 _ => {}
             }
         }
-        // Walk components looking for a HostDir ancestor
-        let components: Vec<&str> = abs_path.split('/').filter(|c| !c.is_empty()).collect();
-        for i in (0..components.len()).rev() {
-            let prefix = format!("/{}", components[..=i].join("/"));
-            if let Ok(ino) = vfs.resolve(&prefix, true)
-                && let Ok(inode) = vfs.get(ino)
-                && let InodeData::HostDir(host_base, ro) = &inode.data
-            {
-                let rest = &components[i + 1..];
-                let mut host = PathBuf::from(host_base);
-                for c in rest {
-                    host.push(c);
-                }
-                // Canonicalize and verify the path stays within the bind mount
-                let canon_base =
-                    std::fs::canonicalize(host_base).unwrap_or_else(|_| PathBuf::from(host_base));
-                if let Ok(canon_host) = std::fs::canonicalize(&host) {
-                    if !canon_host.starts_with(&canon_base) {
-                        return None; // symlink escape — block access
-                    }
-                    return Some((canon_host, *ro, canon_base));
-                }
-                // canonicalize failed — check if path is a dangling symlink
-                if host.symlink_metadata().is_ok() {
-                    return None; // dangling symlink pointing outside mount
-                }
-                // Path truly doesn't exist — verify parent is safe
-                if let Some(parent) = host.parent()
-                    && let Ok(canon_parent) = std::fs::canonicalize(parent)
-                    && !canon_parent.starts_with(&canon_base)
-                {
-                    return None;
-                }
-                return Some((host, *ro, canon_base));
+        // The HostDir ancestor, when there is one, is the longest prefix that resolves.
+        let normalized = vfs::normalize(abs_path);
+        let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
+        let resolves = |length: usize| {
+            vfs.resolve(&format!("/{}", components[..length].join("/")), true)
+                .ok()
+        };
+        let (mut low, mut high) = (0, components.len());
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if resolves(middle).is_some() {
+                low = middle;
+            } else {
+                high = middle - 1;
             }
+        }
+        if low > 0
+            && let Some(ino) = resolves(low)
+            && let Ok(inode) = vfs.get(ino)
+            && let InodeData::HostDir(host_base, ro) = &inode.data
+        {
+            let rest = &components[low..];
+            let mut host = PathBuf::from(host_base);
+            for c in rest {
+                host.push(c);
+            }
+            // Canonicalize and verify the path stays within the bind mount
+            let canon_base =
+                std::fs::canonicalize(host_base).unwrap_or_else(|_| PathBuf::from(host_base));
+            if let Ok(canon_host) = std::fs::canonicalize(&host) {
+                if !canon_host.starts_with(&canon_base) {
+                    return None; // symlink escape — block access
+                }
+                return Some((canon_host, *ro, canon_base));
+            }
+            // canonicalize failed — check if path is a dangling symlink
+            if host.symlink_metadata().is_ok() {
+                return None; // dangling symlink pointing outside mount
+            }
+            // Path truly doesn't exist — verify parent is safe
+            if let Some(parent) = host.parent()
+                && let Ok(canon_parent) = std::fs::canonicalize(parent)
+                && !canon_parent.starts_with(&canon_base)
+            {
+                return None;
+            }
+            return Some((host, *ro, canon_base));
         }
         None
     }
@@ -1409,5 +1421,114 @@ mod url_safety_tests {
         ] {
             assert!(check_url_safe(u).is_ok(), "{u} should be allowed");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod resolve_host_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::VfsKernel;
+    use crate::vfs::{InodeData, LASH_GID, LASH_UID, Vfs};
+
+    struct Fixture {
+        vfs: Vfs,
+        workspace: PathBuf,
+        canonical: PathBuf,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let base = std::env::temp_dir().join(format!("resolve-host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(workspace.join("sub")).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(workspace.join("real.txt"), "IN_MOUNT").expect("file");
+        std::os::unix::fs::symlink(base.join("absent"), workspace.join("dangle")).expect("dangle");
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).expect("escape");
+
+        let mut vfs = Vfs::new();
+        vfs.mkdir_p("/mnt/deep", 0o755, LASH_UID, LASH_GID)
+            .expect("parent");
+        let source = workspace.to_str().expect("UTF-8 workspace").to_string();
+        vfs.mknod(
+            "/mnt/deep/ws",
+            InodeData::HostDir(source, false),
+            0o100644,
+            LASH_UID,
+            LASH_GID,
+        )
+        .expect("bind");
+        vfs.symlink("/alias", "/mnt/deep/ws", LASH_UID, LASH_GID)
+            .expect("alias");
+        vfs.symlink("/chain", "alias", LASH_UID, LASH_GID)
+            .expect("chain");
+        let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+        Fixture {
+            vfs,
+            workspace,
+            canonical,
+        }
+    }
+
+    fn host(fixture: &Fixture, path: &str) -> Option<PathBuf> {
+        VfsKernel::resolve_host(&fixture.vfs, path).map(|(host, _, _)| host)
+    }
+
+    fn under(root: &Path, tail: &str) -> Option<PathBuf> {
+        Some(root.join(tail))
+    }
+
+    #[test]
+    fn a_path_under_a_bind_maps_to_the_host_path_below_it() {
+        let fixture = fixture("under");
+        let (workspace, canonical) = (&fixture.workspace, &fixture.canonical);
+        assert_eq!(host(&fixture, "/mnt/deep/ws"), Some(workspace.clone()));
+        assert_eq!(
+            host(&fixture, "/mnt/deep/ws/real.txt"),
+            under(canonical, "real.txt")
+        );
+        assert_eq!(
+            host(&fixture, "/mnt/deep/ws/a/b/c"),
+            under(workspace, "a/b/c")
+        );
+        assert_eq!(
+            host(&fixture, "/mnt/deep/ws/sub/../real.txt"),
+            under(canonical, "real.txt")
+        );
+        assert_eq!(
+            host(&fixture, "/mnt/deep/absent/../ws/real.txt"),
+            under(canonical, "real.txt")
+        );
+    }
+
+    #[test]
+    fn a_bind_reached_through_a_symlink_is_the_ancestor() {
+        let fixture = fixture("symlinked");
+        let (workspace, canonical) = (&fixture.workspace, &fixture.canonical);
+        assert_eq!(
+            host(&fixture, "/alias/real.txt"),
+            under(canonical, "real.txt")
+        );
+        assert_eq!(host(&fixture, "/alias/sub/x"), under(workspace, "sub/x"));
+        assert_eq!(host(&fixture, "/chain/a/b"), under(workspace, "a/b"));
+    }
+
+    #[test]
+    fn a_host_symlink_that_leaves_or_dangles_is_refused() {
+        let fixture = fixture("refused");
+        assert_eq!(host(&fixture, "/mnt/deep/ws/dangle"), None);
+        assert_eq!(host(&fixture, "/mnt/deep/ws/escape"), None);
+        assert_eq!(host(&fixture, "/mnt/deep/ws/escape/f"), None);
+    }
+
+    #[test]
+    fn a_path_with_no_bind_ancestor_has_no_host_path() {
+        let fixture = fixture("virtual");
+        assert_eq!(host(&fixture, "/"), None);
+        assert_eq!(host(&fixture, "/mnt/deep"), None);
+        assert_eq!(host(&fixture, "/mnt/deep/x/y"), None);
+        assert_eq!(host(&fixture, "/absent/ws/real.txt"), None);
     }
 }
