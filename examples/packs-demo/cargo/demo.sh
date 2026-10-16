@@ -33,6 +33,8 @@ name = "hello"
 version = "0.1.0"
 edition = "2021"
 TOML
+# rustc reports the TOOL_TABLE of the [tool] table it runs under, and compiles nothing.
+echo 'compile_error!(concat!("TOOL_TABLE=", env!("TOOL_TABLE")));' > "$DEMO/work/hello/table.rs"
 echo 'pub fn hello() -> &'"'"'static str { "hello" }' > "$DEMO/work/hello/src/lib.rs"
 (cd "$DEMO/work/hello" && CARGO_HOME="$DEMO/cargo-home" "$TOOLCHAIN/bin/cargo" generate-lockfile --offline -q)
 
@@ -42,7 +44,8 @@ run "cargo t"
 run "cargo update"
 run "cargo build --locked"
 run "ls target/debug"
-run "rustc --version"'
+run "rustc --version"
+run "rustc --crate-type lib table.rs"'
 python3 - "$HERE" "$DEMO" "$CARGO_BIN" "$RUSTUP_HOME" "$SCRIPT" <<'PY'
 import sys
 here, demo, cargo_bin, rustup_home, script = sys.argv[1:]

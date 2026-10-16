@@ -18,10 +18,10 @@ env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
 # The rustup proxy: `cargo` and `rustc` are both symlinks to one `rustup` file. The cargo pack binds
 # that file only when it is called as `cargo`, so `rustc` is not parsed as cargo. `run` starts with
 # <CARGO_BIN> first on PATH, so the box's shell resolves both names there. CARGO_HOME is a scratch
-# directory, so the tool never writes the operator's ~/.cargo.
+# directory, so the tool never writes the operator's ~/.cargo. TOOL_TABLE shows which table a run got.
 [tool.cargo]
 command = ["<CARGO_BIN>/cargo"]
-env = { HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", CARGO_HOME = "<DEMO>/cargo-home", TMPDIR = "<DEMO>/tmp" }
+env = { TOOL_TABLE = "cargo", HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", CARGO_HOME = "<DEMO>/cargo-home", TMPDIR = "<DEMO>/tmp" }
 
 [tool.cargo.filesystem]
 read = ["<DEMO>/work", "<DEMO>/cargo-home", "<DEMO>/tmp", "<CARGO_BIN>", "<RUSTUP_HOME>"]
@@ -29,7 +29,7 @@ write = ["<DEMO>/work", "<DEMO>/cargo-home", "<DEMO>/tmp"]
 
 [tool.rustc]
 command = ["<CARGO_BIN>/rustc"]
-env = { HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", TMPDIR = "<DEMO>/tmp" }
+env = { TOOL_TABLE = "rustc", HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", TMPDIR = "<DEMO>/tmp" }
 
 [tool.rustc.filesystem]
 read = ["<DEMO>/work", "<DEMO>/tmp", "<CARGO_BIN>", "<RUSTUP_HOME>"]
