@@ -5,7 +5,7 @@
 name = "packs-demo-temporal"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
-packs = ["git.pack.toml", "cargo.pack.toml"]
+tool_packs = ["git.pack.toml", "cargo.pack.toml"]
 
 [agent]
 command = ["/bin/bash", "<AGENT_SCRIPT>"]

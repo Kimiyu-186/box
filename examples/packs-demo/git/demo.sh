@@ -3,10 +3,10 @@
 #
 #   demo.sh force      # no_force_push: every force spelling is refused; -n -f and a plain push run
 #   demo.sh upstream   # a forbid on remote == "upstream": pushes to upstream are refused
-#   demo.sh forbid     # forbid Pack::git::Action::"push": status runs, push is refused
+#   demo.sh forbid     # forbid Tool::git::Action::"push": status runs, push is refused
 #   demo.sh allow      # no pack rule: the push reaches the bare remote
 #   demo.sh nopack     # the push forbid stays but box.toml installs no pack: the box refuses to start
-#   demo.sh unmodeled  # forbid Pack::git::Action::"unmodeled": `git log -1` (the -<n> form) is refused
+#   demo.sh unmodeled  # forbid Tool::git::Action::"unmodeled": `git log -1` (the -<n> form) is refused
 #   demo.sh baseline   # no pack and no pack rule: every command decides as it does without packs
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
@@ -44,8 +44,8 @@ case "$MODE" in
   force)
     RULES='@id("no_force_push")
 @description("Force pushes are not allowed.")
-forbid (principal, action == Pack::git::Action::"push", resource)
-when { context.input.effects.contains(Pack::git::Effect::"force_push") };'
+forbid (principal, action == Tool::git::Action::"push", resource)
+when { context.input.effects.contains(Tool::git::Effect::"force_push") };'
     SCRIPT='run "git push -f origin main"
 run "git push --force origin main"
 run "git push --force-with-lease origin main"
@@ -57,7 +57,7 @@ run "git push"' ;;
   upstream)
     RULES='@id("no_upstream")
 @description("Nothing is pushed to upstream.")
-forbid (principal, action == Pack::git::Action::"push", resource)
+forbid (principal, action == Tool::git::Action::"push", resource)
 when { context.input has remote && context.input.remote == "upstream" };'
     SCRIPT='run "git push upstream main"
 run "cd .. && git -C repo push upstream"
@@ -65,12 +65,12 @@ run "git push origin main"' ;;
   forbid|nopack)
     RULES='@id("no_push")
 @description("Pushes are not allowed in this box.")
-forbid (principal, action == Pack::git::Action::"push", resource);'
+forbid (principal, action == Tool::git::Action::"push", resource);'
     SCRIPT='run "git status --short --branch"
 run "git push origin main"' ;;
   unmodeled)
     RULES='@id("no_unmodeled_git")
-forbid (principal, action == Pack::git::Action::"unmodeled", resource);'
+forbid (principal, action == Tool::git::Action::"unmodeled", resource);'
     SCRIPT='run "git status --short --branch"
 run "git log -1 --oneline"
 run "git log -n 1 --oneline"' ;;
@@ -94,12 +94,12 @@ open(f"{demo}/config/policy.dw", "w").write(render("policy.dw") + rules + "\n")
 PY
 cp "$REPO_ROOT/examples/packs/git.pack.toml" "$DEMO/config/git.pack.toml"
 case "$MODE" in
-  nopack|baseline) sed -i.bak '/^packs = /d' "$DEMO/config/box.toml"; rm -f "$DEMO/config/"*.bak ;;
+  nopack|baseline) sed -i.bak '/^tool_packs = /d' "$DEMO/config/box.toml"; rm -f "$DEMO/config/"*.bak ;;
 esac
 
 echo "=== mode: $MODE"
 echo "--- policy.dw mode rules:"; sed -n '/MODE RULES/,$p' "$DEMO/config/policy.dw" | tail -n +2 | sed 's/^/    /'
-echo "--- box.toml packs:"; grep -n "^packs" "$DEMO/config/box.toml" || echo "(no packs key)"
+echo "--- box.toml tool_packs:"; grep -n "^tool_packs" "$DEMO/config/box.toml" || echo "(no tool_packs key)"
 echo "--- strands-box run"
 set +e
 # The startup disclosure of filesystem grants is long; FULL=1 shows it.

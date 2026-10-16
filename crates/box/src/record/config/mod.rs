@@ -389,7 +389,7 @@ impl RunContract {
             if source.path().starts_with(root.root()) {
                 return Err(ConfigError::Contract {
                     reason: format!(
-                        "pack source {} is inside `box_dir` {}",
+                        "tool pack source {} is inside `box_dir` {}",
                         source.path().display(),
                         root.root().display()
                     ),
@@ -527,8 +527,8 @@ pub(crate) struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) policy: Option<PathBuf>,
 
-    /// Where each installed policy pack came from, canonical.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Where each installed tool pack came from, canonical.
+    #[serde(default, rename = "tool_packs", skip_serializing_if = "Vec::is_empty")]
     pub(crate) packs: Vec<PathBuf>,
 
     /// The agent this box runs, as `[agent]` declared it.
@@ -970,7 +970,7 @@ fn load_packs(
     let mut packs: Vec<policy::Pack> = Vec::new();
     let mut sources = Vec::new();
     for path in paths {
-        let (source, text) = AuthoritySource::read(path, "pack")?;
+        let (source, text) = AuthoritySource::read(path, "tool pack")?;
         let pack =
             policy::Pack::parse(&text, source.path()).map_err(|error| ConfigError::Contract {
                 reason: error.to_string(),
@@ -978,7 +978,7 @@ fn load_packs(
         if let Some(other) = packs.iter().find(|other| other.name() == pack.name()) {
             return Err(ConfigError::Contract {
                 reason: format!(
-                    "packs {} and {} are both named {:?}",
+                    "tool packs {} and {} are both named {:?}",
                     other.origin().display(),
                     pack.origin().display(),
                     pack.name()
@@ -989,7 +989,7 @@ fn load_packs(
         if let Some(other) = packs.iter().find(|other| other.program() == pack.program()) {
             return Err(ConfigError::Contract {
                 reason: format!(
-                    "packs {:?} and {:?} both cover the program {:?}",
+                    "tool packs {:?} and {:?} both cover the program {:?}",
                     other.name(),
                     pack.name(),
                     pack.program()
@@ -1003,7 +1003,7 @@ fn load_packs(
         {
             return Err(ConfigError::Contract {
                 reason: format!(
-                    "pack {:?} binds to no [tool]; declare a [tool] that runs {}",
+                    "tool pack {:?} binds to no [tool]; declare a [tool] that runs {}",
                     pack.name(),
                     pack.program()
                 ),
@@ -1098,8 +1098,8 @@ struct ConfigFile {
     #[serde(default)]
     policy: Option<PathBuf>,
 
-    /// Policy pack files, each relative to the config file's directory unless absolute.
-    #[serde(default)]
+    /// Tool pack files, each relative to the config file's directory unless absolute.
+    #[serde(default, rename = "tool_packs")]
     packs: Vec<PathBuf>,
 
     /// The agent this box runs.

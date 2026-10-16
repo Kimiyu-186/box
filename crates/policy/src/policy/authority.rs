@@ -628,7 +628,7 @@ fn collect_typed_actions(source: &str, out: &mut BTreeSet<(String, String)>) {
         let after = &rest[pos + MARKER.len()..];
         match after.find('"') {
             Some(end) => {
-                // A nested namespace (`Pack::<name>::Action`) is never an MCP server's.
+                // A nested namespace (`Tool::<name>::Action`) is never an MCP server's.
                 let nested = rest[..pos - namespace.len()].ends_with("::");
                 if !namespace.is_empty() && namespace != "Box" && !nested {
                     out.insert((namespace, after[..end].to_string()));

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run the cargo pack demo in a real box, with the full pack in examples/packs/cargo.pack.toml.
-# One forbid on Pack::cargo::Effect::"update_lockfile" refuses `cargo build`, `cargo test`,
+# One forbid on Tool::cargo::Effect::"update_lockfile" refuses `cargo build`, `cargo test`,
 # `cargo t`, and `cargo update`, and lets `cargo build --locked` run.
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).

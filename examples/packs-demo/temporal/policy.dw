@@ -22,12 +22,12 @@ when { context.input.path == "/dev/null" };
 // A push needs a passing `cargo test` (or `cargo t`) in the last hour.
 @id("push_after_tests")
 @description("Run the tests first: git push needs a passing cargo test in the last hour.")
-forbid (principal, action == Pack::git::Action::"push", resource)
-unless temporal { formerly within 1h (Pack::cargo::Action::"test"::response{ output.status: 0 }) };
+forbid (principal, action == Tool::git::Action::"push", resource)
+unless temporal { formerly within 1h (Tool::cargo::Action::"test"::response{ output.status: 0 }) };
 
-// One rule over every cargo action that raises an effect. Pack::cargo::Action::"*" is the group
-// of all cargo actions, so the git actions, whose effects are Pack::git::Effect, stay out of it.
+// One rule over every cargo action that raises an effect. Tool::cargo::Action::"*" is the group
+// of all cargo actions, so the git actions, whose effects are Tool::git::Effect, stay out of it.
 @id("lockfile_is_frozen")
 @description("Cargo.lock may not change: pass --locked or --frozen.")
-forbid (principal, action in Pack::cargo::Action::"*", resource)
-when { context.input.effects.contains(Pack::cargo::Effect::"update_lockfile") };
+forbid (principal, action in Tool::cargo::Action::"*", resource)
+when { context.input.effects.contains(Tool::cargo::Effect::"update_lockfile") };

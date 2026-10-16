@@ -301,7 +301,7 @@ impl ObservationCapture {
     pub(crate) fn deciding(self) -> Option<ObservedDecision> {
         let mut observed = self.finish();
         let last = observed.pop()?;
-        if last.action.starts_with("Pack::") && last.decision.is_allow() {
+        if last.action.starts_with("Tool::") && last.decision.is_allow() {
             return observed.pop().or(Some(last));
         }
         Some(last)

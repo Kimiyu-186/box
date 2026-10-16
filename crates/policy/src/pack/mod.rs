@@ -18,16 +18,16 @@ pub(crate) use grammar::{FieldKind, FieldValue, Parsed, ShellGrammar};
 use crate::schema::cedar_identifier;
 
 /// The namespace every pack's vocabulary lives under.
-pub(crate) const PACK_NAMESPACE: &str = "Pack";
+pub(crate) const PACK_NAMESPACE: &str = "Tool";
 
 /// The action a command for a pack's program raises when no shell action matches it.
 pub(crate) const UNMODELED_ACTION: &str = "unmodeled";
-/// The pure action group every action of a pack belongs to: `Pack::<name>::Action::"*"`.
+/// The pure action group every action of a pack belongs to: `Tool::<name>::Action::"*"`.
 pub(crate) const ALL_ACTIONS: &str = "*";
 
 /// A pack file could not be loaded.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("pack {origin}: {reason}")]
+#[error("tool pack {origin}: {reason}")]
 pub struct PackError {
     origin: String,
     reason: String,
@@ -113,7 +113,7 @@ impl Pack {
         &self.origin
     }
 
-    /// The pack's name, which is its `Pack::<name>` namespace.
+    /// The pack's name, which is its `Tool::<name>` namespace.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

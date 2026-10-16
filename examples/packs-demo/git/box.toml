@@ -4,7 +4,7 @@
 name = "packs-demo-git"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
-packs = ["git.pack.toml"]
+tool_packs = ["git.pack.toml"]
 
 [agent]
 command = ["/bin/bash", "-c", '''

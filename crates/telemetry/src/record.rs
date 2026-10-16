@@ -582,10 +582,10 @@ fn action_category(action: &str) -> &str {
     }
     match action.split_once("::") {
         Some((BOX_NAMESPACE, _)) => group(term),
-        // A pack action's category is its pack: `Pack::git::Action::"push"` gives `Pack::git`.
-        Some(("Pack", rest)) => rest
+        // A pack action's category is its pack: `Tool::git::Action::"push"` gives `Tool::git`.
+        Some(("Tool", rest)) => rest
             .split_once("::")
-            .map_or(action, |(pack, _)| &action[..("Pack::".len() + pack.len())]),
+            .map_or(action, |(pack, _)| &action[..("Tool::".len() + pack.len())]),
         Some((namespace, _)) if !namespace.is_empty() => namespace,
         _ => group(term),
     }

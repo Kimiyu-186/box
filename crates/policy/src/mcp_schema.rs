@@ -420,7 +420,7 @@ fn validate_mcp_schema_namespaces(
     }
     if namespace == crate::pack::PACK_NAMESPACE {
         return Err(McpSchemaError::Composition {
-            reason: "the Pack namespace is reserved for policy packs".to_string(),
+            reason: "the Tool namespace is reserved for tool packs".to_string(),
         });
     }
     if let Some(server) = server {
@@ -458,7 +458,7 @@ fn validate_mcp_schema_namespaces(
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flat_map(serde_json::Map::values)
-        .filter(|action| !(namespace.starts_with("Pack::") && action_is_pure_group(action)))
+        .filter(|action| !(namespace.starts_with("Tool::") && action_is_pure_group(action)))
         .any(|action| {
             !action_applies_to(action, "principalTypes", "Box::Agent")
                 || !action_applies_to(action, "resourceTypes", "Box::Resource")
@@ -493,7 +493,7 @@ fn validate_mcp_schema_namespaces(
     }
     if schema.action_groups().any(|action| {
         action.type_name().to_string() != "Box::Action"
-            && !(namespace.starts_with("Pack::") && action.id().escaped() == "*")
+            && !(namespace.starts_with("Tool::") && action.id().escaped() == "*")
     }) {
         return Err(McpSchemaError::Composition {
             reason: "an MCP schema fragment declares an action group".to_string(),
@@ -713,7 +713,7 @@ fn refuse_reserved_namespace(server: &str) -> Result<(), McpSchemaError> {
     if mcp_action_namespace(server) == crate::pack::PACK_NAMESPACE {
         return Err(McpSchemaError::GeneratedShape {
             server: server.to_string(),
-            reason: "the normalized server namespace is reserved for policy packs",
+            reason: "the normalized server namespace is reserved for tool packs",
         });
     }
     Ok(())

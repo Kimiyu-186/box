@@ -536,7 +536,7 @@ impl ShellGrammar {
             };
             if *first != file.program {
                 return Err(fail(format!(
-                    "usage starts with {first:?}, but the pack's program is {:?}",
+                    "usage starts with {first:?}, but the tool pack's program is {:?}",
                     file.program
                 )));
             }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run the aws pack demo in a real box, with the full pack in examples/packs/aws.pack.toml.
-# One forbid on Pack::aws::Effect::"delete_data" refuses `aws s3 rm`, `aws s3 sync --delete`, and
+# One forbid on Tool::aws::Effect::"delete_data" refuses `aws s3 rm`, `aws s3 sync --delete`, and
 # `aws s3api delete-bucket` (exit 126), and lets `aws sts get-caller-identity` and
 # `aws s3 rm --dryrun` start. Credentials are dummies and the endpoint is http://127.0.0.1:9, so
 # an allowed command fails at the network: that is expected, and no command reaches AWS.

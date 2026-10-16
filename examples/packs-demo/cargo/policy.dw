@@ -20,5 +20,5 @@ when { context.input.path == "/dev/null" };
 forbid (principal, action, resource)
 when {
   context.input has effects &&
-  context.input.effects.contains(Pack::cargo::Effect::"update_lockfile")
+  context.input.effects.contains(Tool::cargo::Effect::"update_lockfile")
 };

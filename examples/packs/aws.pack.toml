@@ -4,7 +4,7 @@
 # Shape: `aws [global options] <service> <operation> [parameters]`. An action is one
 # service/operation pair. Its usage line names both words as literals (EXT-3 lets literals be
 # more than one word), and the action key joins them with `_`: `aws s3 rm` is
-# `Pack::aws::Action::"s3_rm"`. The key is only a name. The parser matches the literal words
+# `Tool::aws::Action::"s3_rm"`. The key is only a name. The parser matches the literal words
 # in `usage`.
 #
 # Every aws parameter is a long option. aws accepts `--opt value` and `--opt=value`, and

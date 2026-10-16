@@ -50,15 +50,15 @@ bash examples/packs-demo/temporal/demo.sh unscoped   # the effect rule over ever
 ```
 
 `git push` is allowed only after a passing `cargo test` in the last hour, and a rule over
-`Pack::cargo::Action::"*"` (every cargo action) refuses any cargo command that can rewrite
+`Tool::cargo::Action::"*"` (every cargo action) refuses any cargo command that can rewrite
 `Cargo.lock`. A push before a test, after a failing test, and after `cargo +stable test` (which
 the toolchain cargo cannot run, so it exits non-zero) is refused. A push after a passing
 `cargo t --locked` lands. A second `strands-box run` pushes again with no test, because history is
 durable across runs.
 
 `unscoped` writes the same effect rule over `action`, with no scope. The box refuses to start,
-because a git action's effects are `Pack::git::Effect`, a different type from
-`Pack::cargo::Effect`, so the rule does not type-check against both packs.
+because a git action's effects are `Tool::git::Effect`, a different type from
+`Tool::cargo::Effect`, so the rule does not type-check against both packs.
 
 ## Parse corpus
 

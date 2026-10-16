@@ -4,7 +4,7 @@
 name = "packs-demo-cargo"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
-packs = ["cargo.pack.toml"]
+tool_packs = ["cargo.pack.toml"]
 
 [agent]
 command = ["/bin/bash", "-c", '''

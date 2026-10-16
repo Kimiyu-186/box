@@ -458,7 +458,7 @@ impl EffectInterceptor for ReachFloor {
             // A pack refinement names its own action, not `shell:spawn`.
             let subject = subject.map(|mut subject| {
                 if let Some(observed) = &determined
-                    && observed.action.starts_with("Pack::")
+                    && observed.action.starts_with("Tool::")
                 {
                     subject.action = observed.action.clone().into();
                     subject.resource = observed.resource.clone();

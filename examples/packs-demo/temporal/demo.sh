@@ -14,7 +14,7 @@
 #   this run -> allowed, because the passing test from run 1 is in the durable history.
 #
 #   demo.sh unscoped  # the lockfile rule over `action` (every action): the box refuses to start,
-#                     # because Pack::git::Effect and Pack::cargo::Effect are not compatible types
+#                     # because Tool::git::Effect and Tool::cargo::Effect are not compatible types
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
 # DEMO names the scratch directory (default: /tmp/packs-demo-temporal). It is recreated.
@@ -71,7 +71,7 @@ render() {
 cp "$HERE/policy.dw" "$DEMO/config/"
 cp "$REPO_ROOT/examples/packs/git.pack.toml" "$REPO_ROOT/examples/packs/cargo.pack.toml" "$DEMO/config/"
 if [ "$MODE" = unscoped ]; then
-  sed -i.bak 's#^forbid (principal, action in Pack::cargo::Action::"\*", resource)#forbid (principal, action, resource)#; s#^when { context.input.effects#when { context.input has effects \&\& context.input.effects#' "$DEMO/config/policy.dw"
+  sed -i.bak 's#^forbid (principal, action in Tool::cargo::Action::"\*", resource)#forbid (principal, action, resource)#; s#^when { context.input.effects#when { context.input has effects \&\& context.input.effects#' "$DEMO/config/policy.dw"
   grep -A1 'action, resource)' "$DEMO/config/policy.dw"
 fi
 
@@ -131,7 +131,7 @@ for line in open(sys.argv[1]):
                 args = [v.get("stringValue") for v in a.get("process.command_args", {}).get("arrayValue", {}).get("values", [])]
                 action = get("strands.box.policy.action")
                 category = get("strands.box.policy.category")
-                if not (category.startswith("Pack::") or "spawn" in action):
+                if not (category.startswith("Tool::") or "spawn" in action):
                     continue
                 print(" ", category, action, "|", get("strands.box.policy.verdict"), "|",
                       get("strands.box.policy.rule"), "|", " ".join(args))

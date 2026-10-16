@@ -5,7 +5,7 @@
 name = "packs-demo-aws"
 box_dir = "<DEMO>/state"
 policy = "policy.dw"
-packs = ["aws.pack.toml"]
+tool_packs = ["aws.pack.toml"]
 
 [agent]
 command = ["/bin/bash", "-c", '''
