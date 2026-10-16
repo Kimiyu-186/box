@@ -7,16 +7,31 @@ Options:
   -f  ignore nonexistent files
   -r  remove directories and their contents recursively";
 
-async fn remove_recursive(os: &Mediated, path: &str) -> std::io::Result<()> {
+async fn report(path: &str, e: &std::io::Error) -> std::io::Result<()> {
+    let mut ew = io::stderr()?;
+    wprintln!(ew, "rm: {}: {}", path, e)
+}
+
+async fn remove_recursive(os: &Mediated, path: &str) -> std::io::Result<bool> {
     let st = io::lstat(os, path).await;
     if st.is_dir && !st.is_symlink {
+        let mut ok = true;
         for entry in io::list_dir(os, path).await? {
             let child = format!("{}/{}", path, entry.name);
-            Box::pin(remove_recursive(os, &child)).await?;
+            if !Box::pin(remove_recursive(os, &child)).await? {
+                ok = false;
+            }
         }
-        io::remove_dir(os, path).await
+        if let Err(e) = io::remove_dir(os, path).await {
+            report(path, &e).await?;
+            ok = false;
+        }
+        Ok(ok)
+    } else if let Err(e) = io::remove_file(os, path).await {
+        report(path, &e).await?;
+        Ok(false)
     } else {
-        io::remove_file(os, path).await
+        Ok(true)
     }
 }
 
@@ -60,18 +75,16 @@ async fn cmd_rm(os: &Mediated, args: &[String]) -> CommandResult {
                 code = 1;
                 continue;
             }
-            if let Err(e) = remove_recursive(os, path).await
-                && !force
-            {
-                let mut ew = io::stderr()?;
-                wprintln!(ew, "rm: {}: {}", path, e)?;
-                code = 1;
+            match remove_recursive(os, path).await {
+                Ok(true) => {}
+                Ok(false) => code = 1,
+                Err(e) => {
+                    report(path, &e).await?;
+                    code = 1;
+                }
             }
-        } else if let Err(e) = io::remove_file(os, path).await
-            && !force
-        {
-            let mut ew = io::stderr()?;
-            wprintln!(ew, "rm: {}: {}", path, e)?;
+        } else if let Err(e) = io::remove_file(os, path).await {
+            report(path, &e).await?;
             code = 1;
         }
     }

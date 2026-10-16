@@ -338,6 +338,106 @@ fn lua_os_remove_denied_file_survives() {
     );
 }
 
+/// `rm -f` on a policy-refused path fails and names the refusal. `-f` suppresses only a
+/// nonexistent operand, never a denial, so the forced delete must not swallow it.
+#[test]
+fn rm_force_on_denied_path_reports_and_fails() {
+    let (interceptor, _, armed) =
+        Recorder::armable(|e| e.starts_with("remove_file") && e.contains("keep.txt"));
+    let mut shell = shell_with(interceptor);
+
+    let (out, content) = run(async {
+        let setup = shell.run("printf KEEP > /home/lash/keep.txt").await;
+        assert_eq!(setup.status, 0, "setup: {}", setup.stderr);
+        armed.store(true, Ordering::SeqCst);
+        let out = shell.run("rm -f /home/lash/keep.txt").await;
+        let content = shell.read_file("/home/lash/keep.txt").await;
+        (out, content)
+    });
+
+    assert_ne!(out.status, 0, "rm -f on a denied path must exit non-zero");
+    assert!(
+        out.stderr.contains("keep.txt"),
+        "rm -f must name the refused path: stderr={:?}",
+        out.stderr
+    );
+    assert_eq!(
+        content.unwrap(),
+        b"KEEP",
+        "the file must survive a denied rm -f"
+    );
+}
+
+/// `rm -f` on a genuinely absent path still exits 0. That is the POSIX behaviour `-f` exists
+/// for, and it stays intact beside the denial case above.
+#[test]
+fn rm_force_on_absent_path_succeeds() {
+    let (interceptor, _) = Recorder::allowing_everything();
+    let mut shell = shell_with(interceptor);
+
+    let out = run(async { shell.run("rm -f /home/lash/never-existed.txt").await });
+
+    assert_eq!(
+        out.status, 0,
+        "rm -f on an absent path must exit 0: {}",
+        out.stderr
+    );
+}
+
+/// `rm -r` names the refused child by its own path, not its parent's. Recursion reports the
+/// entry the denial fell on, so an operator reading stderr sees which path survived.
+#[test]
+fn rm_recursive_denied_child_is_named_by_its_own_path() {
+    let (interceptor, _, armed) =
+        Recorder::armable(|e| e.starts_with("remove_file") && e.contains("inner.txt"));
+    let mut shell = shell_with(interceptor);
+
+    let (out, inner) = run(async {
+        let setup = shell
+            .run("mkdir -p /home/lash/tree && printf X > /home/lash/tree/inner.txt")
+            .await;
+        assert_eq!(setup.status, 0, "setup: {}", setup.stderr);
+        armed.store(true, Ordering::SeqCst);
+        let out = shell.run("rm -r /home/lash/tree").await;
+        let inner = shell.read_file("/home/lash/tree/inner.txt").await;
+        (out, inner)
+    });
+
+    assert_ne!(out.status, 0, "a denied child must fail rm -r");
+    assert!(
+        out.stderr.contains("rm: /home/lash/tree/inner.txt:"),
+        "rm -r must name the refused child, not its parent: stderr={:?}",
+        out.stderr
+    );
+    assert_eq!(inner.unwrap(), b"X", "the refused child must survive");
+}
+
+/// The directory itself reaches a delete decision even when a child is refused. Recursion no
+/// longer aborts on the first denied entry, so auditing "was deleting this directory refused?"
+/// finds a `remove_dir` record for the directory rather than nothing.
+#[test]
+fn rm_recursive_directory_itself_reaches_a_decision() {
+    let (interceptor, admitted, armed) =
+        Recorder::armable(|e| e.starts_with("remove_file") && e.contains("inner.txt"));
+    let mut shell = shell_with(interceptor);
+
+    let seen = run(async {
+        let setup = shell
+            .run("mkdir -p /home/lash/tree && printf X > /home/lash/tree/inner.txt")
+            .await;
+        assert_eq!(setup.status, 0, "setup: {}", setup.stderr);
+        admitted.lock().unwrap().clear();
+        armed.store(true, Ordering::SeqCst);
+        shell.run("rm -r /home/lash/tree").await;
+        admitted.lock().unwrap().clone()
+    });
+
+    assert!(
+        seen.iter().any(|e| e == "remove_dir /home/lash/tree"),
+        "the directory itself must reach a delete decision even when a child is refused: {seen:?}"
+    );
+}
+
 /// A denied `os.rename` fails; the source survives and the target is never created.
 #[test]
 fn lua_os_rename_denied_source_survives() {
