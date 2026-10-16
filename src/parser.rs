@@ -105,6 +105,12 @@ pub enum Item {
         tail: Pipeline,
         negated: bool,
     },
+    /// A pipeline feeding a compound command: `cmd | while read x; do ...; done`
+    PipelineIntoCompound {
+        head: Pipeline,
+        compound: Box<Item>,
+        negated: bool,
+    },
     /// A compound command with redirections: `while read LINE; do ...; done < file`
     CompoundRedirect {
         item: Box<Item>,
@@ -349,6 +355,18 @@ fn resolve_heredocs(
                 }
             }
             Item::Function { body, .. } => resolve_heredocs(body, read_line)?,
+            Item::PipelineIntoCompound { head, compound, .. } => {
+                for cmd in head.iter_mut() {
+                    for redir in &mut cmd.redirects {
+                        if let Redirect::HereDoc(_, delim, body, strip, _) = redir {
+                            *body = read_heredoc_body(delim, *strip, read_line)?;
+                        }
+                    }
+                }
+                let mut inner_cl = vec![(*compound.clone(), None)];
+                resolve_heredocs(&mut inner_cl, read_line)?;
+                **compound = inner_cl.into_iter().next().unwrap().0;
+            }
             Item::CompoundPipeline { compound, tail, .. } => {
                 let mut inner_cl = vec![(*compound.clone(), None)];
                 resolve_heredocs(&mut inner_cl, read_line)?;
@@ -1315,6 +1333,27 @@ fn parse_command_line<'a>(
             continue;
         }
 
+        // A pipeline feeding a compound command: `cmd | while read x; do ...; done`
+        if !at_start
+            && pipeline_tokens.last() == Some(&&Token::Pipe)
+            && opens_a_compound(&tokens[i])
+        {
+            pipeline_tokens.pop();
+            let head = build_pipeline(&pipeline_tokens)?;
+            pipeline_tokens.clear();
+            let (compound, rest) = parse_compound(&tokens[i..])?;
+            i = tokens.len() - rest.len();
+            let item = Item::PipelineIntoCompound {
+                head,
+                compound: Box::new(compound),
+                negated,
+            };
+            let item = collect_compound_pipe(tokens, &mut i, &mut pipeline_tokens, item, false)?;
+            negated = false;
+            result.push((item, None));
+            continue;
+        }
+
         // Check for unexpected reserved words at command position
         if at_start && is_reserved(&tokens[i]) {
             // Handle { ... } group
@@ -1483,6 +1522,43 @@ fn expect_rparen(tokens: &[Token]) -> Result<&[Token], ParseError> {
             tok_name(t)
         ))),
         None => Err(ParseError::incomplete("expected ')'")),
+    }
+}
+
+/// Whether `tok` begins a compound command.
+fn opens_a_compound(tok: &Token) -> bool {
+    match tok {
+        Token::LParen => true,
+        Token::Word(w) => matches!(w.as_str(), "{" | "if" | "while" | "until" | "for" | "case"),
+        _ => false,
+    }
+}
+
+/// Parse one compound command starting at `tokens[0]`.
+fn parse_compound(tokens: &[Token]) -> Result<(Item, &[Token]), ParseError> {
+    match &tokens[0] {
+        Token::LParen => {
+            let (group, rest) = parse_command_line(&tokens[1..], &[")"])?;
+            let rest = expect_rparen(rest)?;
+            if group.is_empty() {
+                return Err(ParseError::invalid("empty group"));
+            }
+            Ok((Item::Subshell(group), rest))
+        }
+        Token::Word(w) if w == "{" => {
+            let (group, rest) = parse_command_line(&tokens[1..], &["}"])?;
+            let rest = expect_word(rest, "}")?;
+            Ok((Item::Group(group), rest))
+        }
+        Token::Word(w) if w == "if" => parse_if(&tokens[1..]),
+        Token::Word(w) if w == "while" => parse_while_until(&tokens[1..], false),
+        Token::Word(w) if w == "until" => parse_while_until(&tokens[1..], true),
+        Token::Word(w) if w == "for" => parse_for(&tokens[1..]),
+        Token::Word(w) if w == "case" => parse_case(&tokens[1..]),
+        other => Err(ParseError::invalid(format!(
+            "unexpected '{}'",
+            tok_name(other)
+        ))),
     }
 }
 

@@ -2001,6 +2001,26 @@ async fn run_capturing_status(
                     proc.set_function(name, body.clone());
                     (0, String::new())
                 }
+                Item::PipelineIntoCompound {
+                    head,
+                    compound,
+                    negated,
+                } => {
+                    let (_, captured) = execute_pipeline_capture(os.clone(), proc, head).await;
+                    let mut sub = proc.fork();
+                    sub.depth += 1;
+                    sub.set_channel_reader(STDIN, string_reader(captured));
+                    let compound_cl = vec![(*compound.clone(), None)];
+                    let (s, mut exit) =
+                        Box::pin(run_capturing_status(os.clone(), &mut sub, &compound_cl)).await;
+                    if !proc.append_captured_stderr(&sub.captured_stderr) {
+                        proc.last_exit = 1;
+                    }
+                    if *negated {
+                        exit = if exit == 0 { 1 } else { 0 };
+                    }
+                    (exit, s)
+                }
                 Item::CompoundRedirect { item, redirects } => {
                     let mut expanded = Vec::new();
                     for redir in redirects {
@@ -2097,6 +2117,17 @@ async fn capture_pipeline_checked(
         Err(_) => proc.last_exit,
     };
     (exit, output)
+}
+
+/// A stdin channel that yields `text` and then end-of-file.
+fn string_reader(text: String) -> mpsc::Receiver<Bytes> {
+    let (tx, rx) = os::pipe(1);
+    tokio::task::spawn_local(async move {
+        if !text.is_empty() {
+            let _ = tx.send(Bytes::from(text.into_bytes())).await;
+        }
+    });
+    rx
 }
 
 /// Public-facing execute_command_line that swallows break/continue.
@@ -2272,6 +2303,36 @@ async fn execute_item_unsettled(
         Item::Function { name, body } => {
             proc.set_function(name, body.clone());
             Ok(0)
+        }
+        Item::PipelineIntoCompound {
+            head,
+            compound,
+            negated,
+        } => {
+            let (_, captured) = execute_pipeline_capture(os.clone(), proc, head).await;
+            let mut sub = proc.fork();
+            sub.depth += 1;
+            if let Some(msg) = sub.check_limits() {
+                sub.err_msg(msg);
+                return Ok(1);
+            }
+            sub.set_channel_reader(STDIN, string_reader(captured));
+            let r = Box::pin(execute_item(os, &mut sub, compound)).await;
+            if proc.capture {
+                let complete = proc.append_captured_output(&sub.captured_output)
+                    && proc.append_captured_stderr(&sub.captured_stderr);
+                if !complete {
+                    proc.last_exit = 1;
+                }
+            }
+            let mut exit = match r {
+                Ok(n) | Err(ControlFlow::Exit(n)) => n,
+                Err(e) => return Err(e),
+            };
+            if *negated {
+                exit = if exit == 0 { 1 } else { 0 };
+            }
+            Ok(exit)
         }
         Item::CompoundPipeline {
             compound,
