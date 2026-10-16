@@ -53,6 +53,10 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
+# Regenerate crates/shell from one commit of the shell/patches branch.
+sync-shell commit:
+    ./scripts/sync-shell.sh {{commit}}
+
 # ── Test-harness crates (excluded from the workspace) ──────────────────────────
 
 # The verdict layer's gate, mirroring .github/workflows/verdict-hermetic.yml.

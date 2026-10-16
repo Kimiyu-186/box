@@ -1,19 +1,33 @@
 # Upstream provenance
 
-This directory vendors the Rust implementation of Strands Shell from:
+This directory vendors the Rust implementation of Strands Shell. It is generated
+from one commit of the `shell/patches` branch of this repository:
 
 - repository: `https://github.com/strands-agents/shell`
-- revision: `06169c666260c15422e464a64ad5115ec6e9ac5f`
+- branch: `shell/patches`
+- revision: `b75e3f029b10420779ffb553602c07f207f6e254`
+
+`shell/patches` is upstream `main` plus one commit for each local change, so its
+commit list is the exact set of local changes. Do not edit this directory by
+hand. Change the branch, then run `scripts/sync-shell.sh <commit>`, which copies
+the commit, removes the excluded paths and the nested `[workspace]` table, and
+writes the commit to the `revision` line above.
 
 The nested Git repository, lockfile, build outputs, generated graph, language
 packaging, and release tooling are intentionally excluded. `LICENSE` and
 `NOTICE` are preserved from upstream.
-Each file that differs from the pinned revision starts with a modification notice.
+Each file that differs from upstream `main` starts with a modification notice.
 A file that is new in this copy has no notice.
 
 The upstream interactive CLI is feature-gated locally so the embedded library
 does not pull its terminal editor into the product. Its optional `rustyline`
 constraint is held at 15, which shares the workspace's `unicode-width` version.
+
+Five entries below describe no change that `shell/patches` carries, because
+upstream `main` has the same behaviour: "`curl -w` was dropped whenever `-o` was
+given", "`pyo3` moves from 0.28 to 0.29 with Monty 1.0.0", "`curl` refused the
+options the Strands harness `web_fetch` sends", "`mv` accepts `-f` and
+`--force`", and "`head` accepts the byte limit used by `web_fetch`".
 
 ## Local divergence from the pinned revision
 
