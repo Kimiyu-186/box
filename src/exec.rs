@@ -2511,6 +2511,21 @@ async fn execute_pipeline_checked(
     if pipeline.len() == 1 && !pipeline[0].args.is_empty() {
         let name_word = &pipeline[0].args[0];
         if let Some(name) = parser::word_to_str(name_word) {
+            // `builtin X` names the builtin `X`, so the prefix is dropped and `X` is the program.
+            if name == "builtin"
+                && pipeline[0]
+                    .args
+                    .get(1)
+                    .and_then(parser::word_to_str)
+                    .is_some_and(|inner| is_special(&inner) || builtins::lookup(&inner).is_some())
+            {
+                let unprefixed = parser::Command {
+                    env: pipeline[0].env.clone(),
+                    args: pipeline[0].args[1..].to_vec(),
+                    redirects: pipeline[0].redirects.clone(),
+                };
+                return Box::pin(execute_pipeline_checked(os, proc, &[unprefixed])).await;
+            }
             match name.as_str() {
                 "break" => {
                     let n = get_numeric_arg(os.clone(), proc, pipeline).await;
