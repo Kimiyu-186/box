@@ -1,13 +1,13 @@
 # Upstream provenance
 
 This directory vendors the Rust implementation of Strands Shell. It is generated
-from one commit of the `shell/patches` branch of this repository:
+from one commit of the `feature/shell-patches` branch of this repository:
 
 - repository: `https://github.com/strands-agents/shell`
-- branch: `shell/patches`
+- branch: `feature/shell-patches`
 - revision: `b75e3f029b10420779ffb553602c07f207f6e254`
 
-`shell/patches` is upstream `main` plus one commit for each local change, so its
+`feature/shell-patches` is upstream `main` plus one commit for each local change, so its
 commit list is the exact set of local changes. Do not edit this directory by
 hand. Change the branch, then run `scripts/sync-shell.sh <commit>`, which copies
 the commit, removes the excluded paths and the nested `[workspace]` table, and
@@ -23,7 +23,7 @@ The upstream interactive CLI is feature-gated locally so the embedded library
 does not pull its terminal editor into the product. Its optional `rustyline`
 constraint is held at 15, which shares the workspace's `unicode-width` version.
 
-Five entries below describe no change that `shell/patches` carries, because
+Five entries below describe no change that `feature/shell-patches` carries, because
 upstream `main` has the same behaviour: "`curl -w` was dropped whenever `-o` was
 given", "`pyo3` moves from 0.28 to 0.29 with Monty 1.0.0", "`curl` refused the
 options the Strands harness `web_fetch` sends", "`mv` accepts `-f` and

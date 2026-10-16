@@ -53,7 +53,7 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Regenerate crates/shell from one commit of the shell/patches branch.
+# Regenerate crates/shell from one commit of the feature/shell-patches branch.
 sync-shell commit:
     ./scripts/sync-shell.sh {{commit}}
 
