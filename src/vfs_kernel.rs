@@ -1387,7 +1387,8 @@ pub fn check_url_safe(url: &str) -> io::Result<()> {
             }
         }
         Some(url::Host::Domain(d)) => {
-            if d == "localhost" || d.ends_with(".localhost") {
+            let normalized = d.trim_end_matches('.').to_ascii_lowercase();
+            if normalized == "localhost" || normalized.ends_with(".localhost") {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!("access denied: {d}"),
@@ -1461,6 +1462,10 @@ mod url_safety_tests {
             "http://10.0.0.1/",        // private
             "http://localhost/",       // localhost domain
             "http://x.localhost/",     // .localhost subdomain
+            "http://localhost./",      // trailing root dot (FQDN form)
+            "http://x.localhost./",    // .localhost subdomain, trailing root dot
+            "http://LOCALHOST/",       // uppercase
+            "http://LocalHost./",      // mixed case, trailing root dot
             "ftp://example.com/",      // non-http scheme
         ] {
             assert!(check_url_safe(u).is_err(), "{u} should be blocked");
