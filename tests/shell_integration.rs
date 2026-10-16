@@ -4637,7 +4637,7 @@ expect!(
 
 expect_status!(command_v_notfound_exit, "command -v nonexistent_cmd_xyz", 1);
 
-// ── Shell builder coverage: bind_direct, credential, config_file ────
+// ── Shell builder coverage: bind_direct, config_file ────────────────
 
 #[test]
 fn builder_bind_direct_host() {
@@ -4698,54 +4698,6 @@ fn bind_direct_symlink_escape_blocked() {
             "symlink escape should be blocked; stdout: {}",
             out.stdout
         );
-    }));
-}
-
-#[test]
-fn builder_credential_bearer() {
-    let (rt, local) = rt();
-    rt.block_on(local.run_until(async {
-        let shell = Shell::builder()
-            .credential(
-                "https://api.example.com/",
-                strands_shell::CredKind::Bearer,
-                "test-token",
-            )
-            .build();
-        assert!(shell.is_ok());
-    }));
-}
-
-#[test]
-fn builder_credential_from_env_ok() {
-    // Note: env var manipulation is unsafe in Rust 2024 edition but
-    // we only need to verify the builder path works.
-    let (rt, local) = rt();
-    rt.block_on(local.run_until(async {
-        // Use a var that's very likely set
-        let shell = Shell::builder()
-            .credential_from_env(
-                "https://api.example.com/",
-                strands_shell::CredKind::Bearer,
-                "PATH",
-            )
-            .build();
-        assert!(shell.is_ok());
-    }));
-}
-
-#[test]
-fn builder_credential_from_env_missing_var() {
-    let (rt, local) = rt();
-    rt.block_on(local.run_until(async {
-        let shell = Shell::builder()
-            .credential_from_env(
-                "https://api.example.com/",
-                strands_shell::CredKind::Bearer,
-                "LSH_NONEXISTENT_KEY_ZZZZZ_12345",
-            )
-            .build();
-        assert!(shell.is_err());
     }));
 }
 
@@ -4856,40 +4808,6 @@ max_file_size = 16
 }
 
 #[test]
-fn config_file_allowed_urls_applied() {
-    // The SSRF allowlist is settable from TOML (top-level allowed_urls). The
-    // allowlist is *additive* — it relaxes SSRF for matching prefixes — so this
-    // test confirms the negative side: a private/loopback address NOT in the
-    // list stays blocked, proving the TOML entry didn't blanket-open the guard.
-    // The positive side (an in-list loopback URL is permitted) is proven with a
-    // live server in tests/curl_integration.rs::curl_allowed_url_via_toml_config.
-    let (rt, local) = rt();
-    rt.block_on(local.run_until(async {
-        let dir = TestDir::new("lsh_allowed_urls_config_test");
-        let config_path = dir.join("urls.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-allowed_urls = ["https://example.com/"]
-"#,
-        )
-        .unwrap();
-        let mut shell = Shell::builder()
-            .config_file(&config_path)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        // A loopback address outside the allowlist is still refused by SSRF.
-        let out = shell.run("curl http://127.0.0.1:9/").await;
-        assert_ne!(
-            out.status, 0,
-            "address outside TOML allowed_urls should stay blocked"
-        );
-    }));
-}
-
-#[test]
 fn config_file_env_applied() {
     // A [env] table seeds environment variables into the shell.
     let (rt, local) = rt();
@@ -4922,11 +4840,11 @@ DEPLOY_TARGET = "staging"
 
 #[test]
 fn config_file_combined_all_sections() {
-    // A realistic config exercising top-level keys (umask, allowed_urls)
-    // alongside [env], [[bind]]-free creds, and [limits] with both
-    // process- and VFS-level caps — in one file, in TOML-legal order
-    // (top-level keys before any table). Guards the ordering trap where a
-    // top-level array placed after a [table] is silently absorbed into it.
+    // A realistic config exercising a top-level key (umask) alongside [env]
+    // and [limits] with both process- and VFS-level caps — in one file, in
+    // TOML-legal order (top-level keys before any table). Guards the ordering
+    // trap where a top-level value placed after a [table] is silently absorbed
+    // into it.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let dir = TestDir::new("lsh_combined_config_test");
@@ -4935,7 +4853,6 @@ fn config_file_combined_all_sections() {
             &config_path,
             r#"
 umask = "022"
-allowed_urls = ["https://example.com/"]
 
 [env]
 PROJECT = "demo"
@@ -4956,11 +4873,6 @@ max_inodes = 10000
 
         // env applied
         assert_eq!(shell.run("echo $PROJECT").await.stdout.trim(), "demo");
-        // allowed_urls applied (out-of-list URL refused)
-        assert_ne!(
-            shell.run("curl https://blocked.example.org/").await.status,
-            0
-        );
         // VFS cap applied (write bounded to 32 bytes)
         shell
             .run("printf '%s' 0123456789012345678901234567890123456789 > /tmp/c.txt")
@@ -5002,15 +4914,15 @@ timeout_seconds = 30
 
 #[test]
 fn config_file_unknown_top_level_key_errors() {
-    // A typo'd top-level key (e.g. `allowed_url` singular instead of
-    // `allowed_urls`) must also be rejected — deny_unknown_fields on VfsConfig.
-    // For an SSRF allowlist, silently dropping a misspelled key would fail open.
+    // A typo'd top-level key (e.g. `umsak` for `umask`) must also be rejected —
+    // deny_unknown_fields on VfsConfig. Silently dropping a misspelled key would
+    // leave the builder default in place while the author believes otherwise.
     let dir = TestDir::new("lsh_bad_toplevel_key_test");
     let config_path = dir.join("bad.toml");
     std::fs::write(
         &config_path,
         r#"
-allowed_url = ["https://example.com/"]
+umsak = "077"
 "#,
     )
     .unwrap();
@@ -5023,26 +4935,9 @@ allowed_url = ["https://example.com/"]
 
 #[test]
 fn config_file_unknown_table_key_errors() {
-    // Unknown keys inside [[bind]], [[cred]], and [[mcp]] tables are also
-    // rejected, so the "typos fail the parse" guarantee holds at every level.
+    // Unknown keys inside [[bind]] and [[mcp]] tables are also rejected, so the
+    // "typos fail the parse" guarantee holds at every level.
     let dir = TestDir::new("lsh_bad_table_key_test");
-
-    // [[cred]] with a misspelled key.
-    let cred_path = dir.join("bad_cred.toml");
-    std::fs::write(
-        &cred_path,
-        r#"
-[[cred]]
-url = "https://api.example.com/"
-kind = "bearer"
-api_key_envv = "TOKEN"
-"#,
-    )
-    .unwrap();
-    assert!(
-        Shell::builder().config_file(&cred_path).is_err(),
-        "unknown [[cred]] key should be rejected"
-    );
 
     // [[bind]] with a misspelled key.
     let bind_path = dir.join("bad_bind.toml");
@@ -5554,22 +5449,6 @@ fn url_check_blocked_ipv4_mapped_ipv6() {
     }));
 }
 
-#[test]
-fn url_check_allowed_prefix_no_confusion() {
-    let (rt, local) = rt();
-    rt.block_on(local.run_until(async {
-        // allow_url("http://127.0.0.1:1234") must NOT match
-        // "http://127.0.0.1:12345" (different port sharing a prefix)
-        let mut shell = Shell::builder()
-            .allow_url("http://127.0.0.1:1234")
-            .build()
-            .unwrap();
-        let out = shell.run("curl http://127.0.0.1:12345/").await;
-        assert_ne!(out.status, 0);
-        assert!(out.stderr.contains("denied"));
-    }));
-}
-
 // ── Bind direct write-back ──────────────────────────────────────────
 
 #[test]
@@ -5698,7 +5577,7 @@ fn parser_error_unexpected_rparen() {
 // ── vfs_config.rs: parse_config coverage ────────────────────────────
 
 #[test]
-fn config_file_with_binds_and_creds() {
+fn config_file_with_binds() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let dir = TestDir::new("lsh_config_full_test");
@@ -5717,11 +5596,6 @@ mode = "copy"
 source = '{}'
 destination = "/workspace"
 readonly = true
-
-[[cred]]
-url = "https://api.example.com/"
-kind = "bearer"
-api_key = "test-key-123"
 "#,
                 src_dir.to_str().unwrap()
             ),
@@ -6786,16 +6660,6 @@ shell_test!(
     "for i in 1 2 3 4 5; do echo line$i; done",
     |_shell: &mut Shell, out: strands_shell::Output| {
         assert_eq!(out.stdout.lines().count(), 5);
-    }
-);
-
-// ── credential resolution (vfs_kernel.rs resolve_credential) ────────
-
-shell_test!(
-    cred_no_match,
-    "true",
-    |_shell: &mut Shell, out: strands_shell::Output| {
-        assert_eq!(out.status, 0);
     }
 );
 

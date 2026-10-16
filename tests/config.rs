@@ -1,23 +1,18 @@
 //! Integration tests for the read-only config snapshot returned by
 //! [`Shell::config`].
 //!
-//! The snapshot lets an embedder introspect a constructed shell — binds, the
-//! network allowlist, credential rules, env, umask, timeout, limits — without
-//! having held onto the builder. Its most important guarantee is that it never
-//! exposes resolved secret values: a credential reports only its source (a
-//! literal was supplied, or the name of the env var it reads from).
+//! The snapshot lets an embedder introspect a constructed shell — binds, env,
+//! umask, timeout, limits — without having held onto the builder.
 
 use std::time::Duration;
 
-use strands_shell::{CredKind, Shell};
+use strands_shell::Shell;
 
 #[test]
 fn default_shell_reports_default_config() {
     let shell = Shell::builder().build().unwrap();
     let cfg = shell.config();
     assert!(cfg.binds.is_empty());
-    assert!(cfg.credentials.is_empty());
-    assert!(cfg.allowed_urls.is_empty());
     assert!(cfg.env.is_empty());
     assert_eq!(cfg.umask, 0o022);
     // Builder default is a 30s per-command timeout; the snapshot reports the
@@ -52,23 +47,14 @@ fn config_reports_binds() {
 }
 
 #[test]
-fn config_reports_allowed_urls_env_umask_timeout() {
+fn config_reports_env_umask_timeout() {
     let shell = Shell::builder()
-        .allow_url("https://api.example.com/")
-        .allow_url("https://api.openai.com/")
         .env("PROJECT", "demo")
         .umask(0o027)
         .timeout(Duration::from_secs_f64(12.5))
         .build()
         .unwrap();
     let cfg = shell.config();
-    assert_eq!(
-        cfg.allowed_urls,
-        vec![
-            "https://api.example.com/".to_string(),
-            "https://api.openai.com/".to_string()
-        ]
-    );
     assert_eq!(cfg.env, vec![("PROJECT".to_string(), "demo".to_string())]);
     assert_eq!(cfg.umask, 0o027);
     assert_eq!(cfg.timeout_secs, Some(12.5));
@@ -84,58 +70,6 @@ fn config_reports_overridden_limits() {
     let cfg = shell.config();
     assert_eq!(cfg.limits.max_output, 2048);
     assert_eq!(cfg.limits.max_inodes, 500);
-}
-
-#[test]
-fn config_credentials_never_leak_literal_token() {
-    let shell = Shell::builder()
-        .credential(
-            "https://api.example.com/*",
-            CredKind::Bearer,
-            "sk-super-secret",
-        )
-        .build()
-        .unwrap();
-    let cfg = shell.config();
-    let cred = &cfg.credentials[0];
-    assert_eq!(cred.url, "https://api.example.com/*");
-    assert_eq!(cred.kind, "bearer");
-    assert!(cred.from_literal);
-    assert_eq!(cred.env_var, None);
-    // The secret itself must never appear in the snapshot's debug form.
-    let dump = format!("{cfg:?}");
-    assert!(
-        !dump.contains("sk-super-secret"),
-        "literal token leaked into config snapshot: {dump}"
-    );
-}
-
-#[test]
-fn config_credentials_report_env_var_name_not_value() {
-    // SAFETY: single-threaded test; we set and read back our own scoped var.
-    unsafe {
-        std::env::set_var("STRANDS_SHELL_RS_TEST_TOKEN", "value-must-not-leak");
-    }
-    let shell = Shell::builder()
-        .credential_from_env(
-            "https://api.openai.com/*",
-            CredKind::Bearer,
-            "STRANDS_SHELL_RS_TEST_TOKEN",
-        )
-        .build()
-        .unwrap();
-    let cfg = shell.config();
-    let cred = &cfg.credentials[0];
-    assert_eq!(cred.env_var.as_deref(), Some("STRANDS_SHELL_RS_TEST_TOKEN"));
-    assert!(!cred.from_literal);
-    let dump = format!("{cfg:?}");
-    assert!(
-        !dump.contains("value-must-not-leak"),
-        "env-var secret leaked into config snapshot: {dump}"
-    );
-    unsafe {
-        std::env::remove_var("STRANDS_SHELL_RS_TEST_TOKEN");
-    }
 }
 
 #[test]

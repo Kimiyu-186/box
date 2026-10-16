@@ -351,19 +351,9 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
             return Ok(1);
         }
 
-        // Inject credentials (only for original URL, not redirects)
+        // The original request carries the caller's body, cookies, and auth; a
+        // redirect hop carries none of them.
         if current_url == url {
-            // Query param credentials — modify URL
-            let mut request_url = current_url.clone();
-            for (name, value) in os.resolve_credential(&current_url, &method) {
-                if name == "__query_param__" {
-                    let sep = if request_url.contains('?') { "&" } else { "?" };
-                    request_url = format!("{}{}{}", request_url, sep, value);
-                } else {
-                    req_headers.push((name, value));
-                }
-            }
-
             // Default content-type for POST data
             if data.is_some() {
                 let has_ct = req_headers
@@ -395,7 +385,7 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
 
             let http_req = crate::os::HttpRequest {
                 method: method.clone(),
-                url: request_url,
+                url: current_url.clone(),
                 headers: req_headers,
                 body: data.as_ref().map(|d| d.as_bytes().to_vec()),
                 insecure,

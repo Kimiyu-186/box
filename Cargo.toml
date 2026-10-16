@@ -70,7 +70,6 @@ features = ["lua54", "async", "vendored"]
 members = [".", "strands-shell-macros", "xtask"]
 
 [dev-dependencies]
-axum = "0.8"
 
 # napi-build stays on 2.x — the build-script helper is versioned
 # independently of the napi/napi-derive runtime crates and has no 3.x release

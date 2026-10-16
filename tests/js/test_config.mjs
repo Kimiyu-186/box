@@ -3,8 +3,7 @@
 // Mirrors tests/python/test_config.py. Run with `npm test`.
 //
 // The snapshot lets an embedder introspect a constructed shell without having
-// held onto the config object. Its key guarantee: it never leaks secret
-// values — only the source of a credential (literal vs env-var name).
+// held onto the config object.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -21,8 +20,6 @@ async function makeHostDir() {
 test('default shell reports default config', async () => {
   const cfg = await (await Shell.create()).config()
   assert.deepEqual(cfg.binds, [])
-  assert.deepEqual(cfg.credentials, [])
-  assert.deepEqual(cfg.allowedUrls, [])
   assert.deepEqual(cfg.env, {})
   assert.equal(cfg.umask, 0o022)
   // The builder defaults to a 30s per-command timeout; the snapshot reports
@@ -60,15 +57,13 @@ test('config reports binds', async () => {
   }
 })
 
-test('config reports allowedUrls, env, umask, timeout', async () => {
+test('config reports env, umask, timeout', async () => {
   const shell = await Shell.create({
-    allowedUrls: ['https://api.example.com/', 'https://api.openai.com/'],
     env: { PROJECT: 'demo', STAGE: 'prod' },
     umask: 0o027,
     timeout: 12.5,
   })
   const cfg = await shell.config()
-  assert.deepEqual(cfg.allowedUrls, ['https://api.example.com/', 'https://api.openai.com/'])
   assert.deepEqual(cfg.env, { PROJECT: 'demo', STAGE: 'prod' })
   assert.equal(cfg.umask, 0o027)
   assert.equal(cfg.timeout, 12.5)
@@ -79,35 +74,6 @@ test('config reports overridden limits', async () => {
   const cfg = await shell.config()
   assert.equal(cfg.limits.maxOutput, 2048)
   assert.equal(cfg.limits.maxInodes, 500)
-})
-
-test('config credentials never leak literal token', async () => {
-  const shell = await Shell.create({
-    credentials: [{ url: 'https://api.example.com/*', token: 'sk-super-secret' }],
-  })
-  const cfg = await shell.config()
-  const cred = cfg.credentials[0]
-  assert.equal(cred.url, 'https://api.example.com/*')
-  assert.equal(cred.kind, 'bearer')
-  assert.equal(cred.fromLiteral, true)
-  assert.equal(cred.envVar, null)
-  assert.ok(!JSON.stringify(cfg).includes('sk-super-secret'))
-})
-
-test('config credentials report env var name not value', async () => {
-  process.env.STRANDS_SHELL_TEST_TOKEN = 'value-must-not-leak'
-  try {
-    const shell = await Shell.create({
-      credentials: [{ url: 'https://api.openai.com/*', envVar: 'STRANDS_SHELL_TEST_TOKEN' }],
-    })
-    const cfg = await shell.config()
-    const cred = cfg.credentials[0]
-    assert.equal(cred.envVar, 'STRANDS_SHELL_TEST_TOKEN')
-    assert.equal(cred.fromLiteral, false)
-    assert.ok(!JSON.stringify(cfg).includes('value-must-not-leak'))
-  } finally {
-    delete process.env.STRANDS_SHELL_TEST_TOKEN
-  }
 })
 
 test('config snapshot is deep-frozen', async () => {

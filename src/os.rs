@@ -915,13 +915,8 @@ pub trait Kernel: Send + Sync {
     fn check_url(&self, _url: &str) -> io::Result<()> {
         Ok(())
     }
-    /// Look up credentials for a URL and HTTP method.
-    /// Returns a list of HTTP headers to inject.
-    fn resolve_credential(&self, _url: &str, _method: &str) -> Vec<(String, String)> {
-        Vec::new()
-    }
-    /// Send an HTTP request. The kernel handles SSRF protection,
-    /// credential injection, and the actual network transport.
+    /// Send an HTTP request. The kernel handles SSRF protection and the
+    /// actual network transport.
     async fn http_request(&self, _req: HttpRequest) -> io::Result<HttpResponse> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

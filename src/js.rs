@@ -168,9 +168,8 @@ pub struct FileInfo {
 
 // ---------------------------------------------------------------------------
 // Read-only config snapshot — plain object shapes mirrored from the core
-// `crate::shell::{ShellConfig, BindInfo, CredInfo, LimitsInfo}` view types.
-// Returned by `Shell.config()`. Secret values are never carried — see
-// `CredInfo`.
+// `crate::shell::{ShellConfig, BindInfo, LimitsInfo}` view types.
+// Returned by `Shell.config()`.
 // ---------------------------------------------------------------------------
 
 /// A single bind mount in a config snapshot.
@@ -181,20 +180,6 @@ pub struct BindInfo {
     /// `"copy"` or `"direct"`.
     pub mode: String,
     pub readonly: bool,
-}
-
-/// A single credential rule in a config snapshot. Never carries the secret.
-#[napi(object)]
-pub struct CredInfo {
-    pub url: String,
-    /// `"bearer"` or `"query"`.
-    pub kind: String,
-    pub methods: Vec<String>,
-    pub param: Option<String>,
-    /// Name of the env var the secret is read from, or `null` for a literal.
-    pub env_var: Option<String>,
-    /// True when a literal token was supplied (value itself never exposed).
-    pub from_literal: bool,
 }
 
 /// Resource caps in a config snapshot.
@@ -216,8 +201,6 @@ pub struct LimitsInfo {
 #[napi(object)]
 pub struct ShellConfig {
     pub binds: Vec<BindInfo>,
-    pub credentials: Vec<CredInfo>,
-    pub allowed_urls: Vec<String>,
     /// Seeded environment variables as a plain object.
     pub env: std::collections::HashMap<String, String>,
     pub umask: f64,
@@ -286,24 +269,6 @@ impl ShellBuilder {
     #[napi]
     pub fn bind_direct_readonly(&self, source: String, destination: String) -> Result<&Self> {
         self.chain(|b| b.bind_direct_readonly(&source, &destination))
-    }
-
-    /// Add a bearer token credential for URLs matching a pattern.
-    #[napi]
-    pub fn credential(&self, url_pattern: String, token: String) -> Result<&Self> {
-        self.chain(|b| b.credential(&url_pattern, crate::CredKind::Bearer, &token))
-    }
-
-    /// Add a bearer token credential from an environment variable.
-    #[napi]
-    pub fn credential_from_env(&self, url_pattern: String, env_var: String) -> Result<&Self> {
-        self.chain(|b| b.credential_from_env(&url_pattern, crate::CredKind::Bearer, &env_var))
-    }
-
-    /// Allow curl requests to URLs matching prefix (bypasses SSRF protection).
-    #[napi]
-    pub fn allow_url(&self, prefix: String) -> Result<&Self> {
-        self.chain(|b| b.allow_url(&prefix))
     }
 
     /// Set an environment variable.
@@ -462,8 +427,7 @@ impl Shell {
 
     /// Read-only snapshot of the configuration this shell was built with.
     ///
-    /// Mirrors `Shell::config()` in the core. Never carries secret values —
-    /// each credential reports its source (literal vs env-var name) only.
+    /// Mirrors `Shell::config()` in the core.
     #[napi]
     pub async fn config(&self) -> Result<ShellConfig> {
         self.worker
@@ -480,19 +444,6 @@ impl Shell {
                             readonly: b.readonly,
                         })
                         .collect(),
-                    credentials: c
-                        .credentials
-                        .iter()
-                        .map(|cr| CredInfo {
-                            url: cr.url.clone(),
-                            kind: cr.kind.to_string(),
-                            methods: cr.methods.clone(),
-                            param: cr.param.clone(),
-                            env_var: cr.env_var.clone(),
-                            from_literal: cr.from_literal,
-                        })
-                        .collect(),
-                    allowed_urls: c.allowed_urls.clone(),
                     env: c.env.iter().cloned().collect(),
                     umask: c.umask as f64,
                     timeout: c.timeout_secs,

@@ -69,28 +69,6 @@
 //! # }
 //! ```
 //!
-//! ## Network Credentials
-//!
-//! Inject credentials for HTTP requests made via `curl` inside the shell:
-//!
-//! ```rust,no_run
-//! # async fn example() -> std::io::Result<()> {
-//! use strands_shell::{CredKind, Shell};
-//!
-//! let mut shell = Shell::builder()
-//!     .credential_from_env(
-//!         "https://api.example.com/*",
-//!         CredKind::Bearer,
-//!         "API_TOKEN",
-//!     )
-//!     .build()?;
-//!
-//! let output = shell.run("curl https://api.example.com/data").await;
-//! // The bearer token from $API_TOKEN is injected automatically
-//! # Ok(())
-//! # }
-//! ```
-//!
 //! ## Resource Limits
 //!
 //! Constrain what the shell can do to prevent runaway agents:
@@ -165,7 +143,5 @@ pub mod js;
 
 // Primary public API
 pub use shell::{
-    BindInfo, CredInfo, FileInfo, FileOpErrorKind, LimitsInfo, Output, Shell, ShellBuilder,
-    ShellConfig,
+    BindInfo, FileInfo, FileOpErrorKind, LimitsInfo, Output, Shell, ShellBuilder, ShellConfig,
 };
-pub use vfs_config::CredKind;

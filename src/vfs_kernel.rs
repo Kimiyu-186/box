@@ -8,21 +8,16 @@ use tokio::sync::Mutex;
 
 use crate::os::*;
 use crate::vfs::{self, InodeData, LASH_GID, LASH_UID, Vfs};
-use crate::vfs_config::{CredKind, ResolvedCred};
 
 /// A Kernel backed entirely by the in-memory VFS.
 pub struct VfsKernel {
     pub vfs: Arc<Mutex<Vfs>>,
-    pub creds: Vec<ResolvedCred>,
-    pub allowed_url_prefixes: Vec<String>,
 }
 
 impl VfsKernel {
-    pub fn new(vfs: Vfs, creds: Vec<ResolvedCred>) -> Self {
+    pub fn new(vfs: Vfs) -> Self {
         Self {
             vfs: Arc::new(Mutex::new(vfs)),
-            creds,
-            allowed_url_prefixes: Vec::new(),
         }
     }
 
@@ -722,56 +717,7 @@ impl Kernel for VfsKernel {
     }
 
     fn check_url(&self, url: &str) -> io::Result<()> {
-        // Match the allowlist on the *parsed* URL, not a raw string prefix.
-        // String-prefix matching is fooled by userinfo injection: against an
-        // allowlist of `http://127.0.0.1:1234`, the URL
-        // `http://127.0.0.1:1234@169.254.169.254/` prefix-matches (the `:` is a
-        // boundary char) yet its real host is 169.254.169.254 — a clean IMDS
-        // escape. Comparing the parsed scheme/host/port closes that class.
-        if let Ok(parsed) = url::Url::parse(url) {
-            for prefix in &self.allowed_url_prefixes {
-                if url_matches_prefix(&parsed, prefix) {
-                    return Ok(());
-                }
-            }
-        }
         check_url_safe(url)
-    }
-
-    fn resolve_credential(&self, url: &str, method: &str) -> Vec<(String, String)> {
-        let method_upper = method.to_uppercase();
-        for cred in &self.creds {
-            if !url.starts_with(&cred.url) {
-                continue;
-            }
-            // Prevent prefix confusion: cred for https://api.example.com/
-            // must not match https://api.example.com.evil.com/
-            if url.len() > cred.url.len() && !cred.url.ends_with('/') {
-                let next = url.as_bytes()[cred.url.len()];
-                if next != b'/' && next != b'?' && next != b'#' {
-                    continue;
-                }
-            }
-            if !cred.methods.is_empty() && !cred.methods.contains(&method_upper) {
-                continue;
-            }
-            match &cred.kind {
-                CredKind::Bearer => {
-                    return vec![("Authorization".into(), format!("Bearer {}", cred.api_key))];
-                }
-                CredKind::Query => {
-                    // Query params are handled by modifying the URL, not headers
-                    // Return a special marker that curl command will interpret
-                    if let Some(ref param) = cred.param {
-                        return vec![(
-                            "__query_param__".into(),
-                            format!("{}={}", param, cred.api_key),
-                        )];
-                    }
-                }
-            }
-        }
-        Vec::new()
     }
 
     async fn http_request(&self, req: HttpRequest) -> io::Result<HttpResponse> {
@@ -780,17 +726,11 @@ impl Kernel for VfsKernel {
             // 1. Check URL via self.check_url
             self.check_url(&req.url)?;
 
-            // 2. Determine if URL is explicitly allowed (for SafeResolver decision)
-            let url_explicitly_allowed = check_url_safe(&req.url).is_err();
-
-            // 3. Build reqwest client
-            let mut builder = reqwest::Client::builder()
+            // 2. Build reqwest client
+            let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(req.insecure);
-            if !url_explicitly_allowed {
-                builder = builder.dns_resolver(std::sync::Arc::new(SafeResolver));
-            }
-            let client = builder
+                .danger_accept_invalid_certs(req.insecure)
+                .dns_resolver(std::sync::Arc::new(SafeResolver))
                 .build()
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -1258,36 +1198,6 @@ fn glob_match_chars(p: &[char], t: &[char]) -> bool {
     }
 }
 
-/// Whether a parsed request URL is covered by an allowlist `prefix` entry.
-///
-/// Matches on parsed components (scheme + host + port + a path-segment prefix),
-/// never raw string prefixes — string matching is defeated by userinfo
-/// injection (`http://allowed:port@attacker/`). A prefix that fails to parse
-/// never matches.
-fn url_matches_prefix(url: &url::Url, prefix: &str) -> bool {
-    let Ok(p) = url::Url::parse(prefix) else {
-        return false;
-    };
-    if url.scheme() != p.scheme() || url.host() != p.host() {
-        return false;
-    }
-    if url.port_or_known_default() != p.port_or_known_default() {
-        return false;
-    }
-    // Path: the prefix path must cover the request path on a segment boundary,
-    // so `/v1` matches `/v1/x` but not `/v10`. An empty/`"/"` prefix path (the
-    // common host-only allowlist entry) covers every path.
-    let (req, pre) = (url.path(), p.path());
-    if pre == "/" || pre.is_empty() {
-        return true;
-    }
-    if req == pre {
-        return true;
-    }
-    let boundary = pre.strip_suffix('/').unwrap_or(pre);
-    req.starts_with(boundary) && req.as_bytes().get(boundary.len()) == Some(&b'/')
-}
-
 /// Check if an IP address is private/loopback/link-local/IMDS.
 fn is_ip_blocked(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -1434,7 +1344,7 @@ impl reqwest::dns::Resolve for SafeResolver {
 
 #[cfg(test)]
 mod url_safety_tests {
-    use super::{check_url_safe, url_matches_prefix};
+    use super::check_url_safe;
 
     // A1: IPv6 literals (incl. IPv4-mapped IMDS) must be blocked by
     // `check_url_safe` ITSELF — not merely by the SafeResolver/connection
@@ -1472,6 +1382,24 @@ mod url_safety_tests {
         }
     }
 
+    // Userinfo must not disguise the real host. `http://public.example@IMDS/` is a
+    // URL whose *apparent* host reads as public while its real host is the metadata
+    // service; matching on `url::Host` rather than on the raw string is what makes
+    // the floor see the real one.
+    #[test]
+    fn check_url_safe_blocks_a_host_disguised_by_userinfo() {
+        for u in [
+            "http://good.example.com@169.254.169.254/",
+            "http://good.example.com:8080@169.254.169.254/",
+            "http://user:pass@127.0.0.1/",
+        ] {
+            assert!(
+                check_url_safe(u).is_err(),
+                "{u} names a blocked real host and must be refused"
+            );
+        }
+    }
+
     #[test]
     fn check_url_safe_allows_public_hosts() {
         for u in [
@@ -1481,64 +1409,5 @@ mod url_safety_tests {
         ] {
             assert!(check_url_safe(u).is_ok(), "{u} should be allowed");
         }
-    }
-
-    fn matches(url: &str, prefix: &str) -> bool {
-        url_matches_prefix(&url::Url::parse(url).unwrap(), prefix)
-    }
-
-    // A2: userinfo injection must not let an allowlist entry cover a different
-    // real host. The `:port@` form is the one the old string-prefix code missed
-    // (`:` was a boundary char), reaching IMDS.
-    #[test]
-    fn allowlist_rejects_userinfo_injection() {
-        assert!(!matches(
-            "http://127.0.0.1:1234@169.254.169.254/",
-            "http://127.0.0.1:1234"
-        ));
-        assert!(!matches(
-            "http://good.example.com@169.254.169.254/",
-            "http://good.example.com"
-        ));
-    }
-
-    #[test]
-    fn allowlist_matches_legitimate_urls() {
-        // Host-only prefix covers any path.
-        assert!(matches("http://h.example.com/a/b", "http://h.example.com"));
-        assert!(matches("http://h.example.com/a/b", "http://h.example.com/"));
-        // Default-port equivalence (http=80, https=443).
-        assert!(matches("http://h.example.com:80/x", "http://h.example.com"));
-        assert!(matches(
-            "https://h.example.com/x",
-            "https://h.example.com:443"
-        ));
-        // Path-prefix on a segment boundary.
-        assert!(matches(
-            "http://h.example.com/v1/x",
-            "http://h.example.com/v1"
-        ));
-        assert!(matches(
-            "http://h.example.com/v1",
-            "http://h.example.com/v1"
-        ));
-    }
-
-    #[test]
-    fn allowlist_rejects_near_misses() {
-        // Path prefix must not match across a non-boundary (`/v1` vs `/v10`).
-        assert!(!matches(
-            "http://h.example.com/v10",
-            "http://h.example.com/v1"
-        ));
-        // Different port.
-        assert!(!matches(
-            "http://h.example.com:8080/",
-            "http://h.example.com:9090"
-        ));
-        // Different scheme.
-        assert!(!matches("http://h.example.com/", "https://h.example.com"));
-        // Different host.
-        assert!(!matches("http://evil.example.com/", "http://h.example.com"));
     }
 }

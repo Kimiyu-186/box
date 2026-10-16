@@ -18,9 +18,7 @@ use crate::exec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mcp_client::{McpConfigEntry, NamedMcpClient};
 use crate::os::{Kernel, OpenFlags, Process};
-use crate::vfs_config::{
-    BindEntry, BindMode, CredEntry, CredKind, VfsConfig, build_vfs, resolve_creds,
-};
+use crate::vfs_config::{BindEntry, BindMode, VfsConfig, build_vfs};
 use crate::vfs_kernel::VfsKernel;
 
 /// Structured output from a shell command execution.
@@ -75,14 +73,8 @@ pub struct FileInfo {
 /// Captured at [`build()`](ShellBuilder::build) time and returned by
 /// [`Shell::config()`]. This exists so an embedder (for example a sandbox
 /// adapter in another SDK) can introspect a constructed `Shell` after the
-/// fact — to build tool descriptions, surface the network allowlist, or
-/// report the active resource caps — without having held onto the builder.
-///
-/// The snapshot intentionally **never carries resolved secret values**.
-/// strands-shell's security model is that the agent never sees credentials,
-/// so [`CredInfo`] reports only the URL pattern, the credential *kind*, and
-/// the *source* of the secret (a literal was provided, or the name of the
-/// environment variable it is read from) — never the token itself.
+/// fact — to build tool descriptions or report the active resource caps —
+/// without having held onto the builder.
 ///
 /// `#[non_exhaustive]` so future fields can be added without breaking callers
 /// who construct or pattern-match exhaustively.
@@ -91,11 +83,6 @@ pub struct FileInfo {
 pub struct ShellConfig {
     /// Bind mounts mapping host paths into the VFS, in declaration order.
     pub binds: Vec<BindInfo>,
-    /// Credential injection rules, in declaration order. Secret values are
-    /// never included — see [`CredInfo`].
-    pub credentials: Vec<CredInfo>,
-    /// SSRF allowlist: URL prefixes `curl` may reach, in declaration order.
-    pub allowed_urls: Vec<String>,
     /// Environment variables seeded into the shell, in declaration order.
     pub env: Vec<(String, String)>,
     /// File-creation umask.
@@ -118,33 +105,6 @@ pub struct BindInfo {
     pub mode: &'static str,
     /// Whether writes through this mount are rejected.
     pub readonly: bool,
-}
-
-/// A single credential rule in a [`ShellConfig`] snapshot.
-///
-/// Carries everything an embedder needs to reason about a credential —
-/// *except the secret itself*. When the credential was configured from an
-/// environment variable, [`env_var`](Self::env_var) holds that variable's
-/// name; the value is never read into the snapshot. When a literal token was
-/// supplied, [`from_literal`](Self::from_literal) is `true` and `env_var` is
-/// `None`.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct CredInfo {
-    /// URL pattern the credential applies to (supports glob patterns).
-    pub url: String,
-    /// `"bearer"` or `"query"`.
-    pub kind: &'static str,
-    /// HTTP methods this credential is scoped to (empty means all methods).
-    pub methods: Vec<String>,
-    /// Query-parameter name, set only for `kind == "query"` credentials.
-    pub param: Option<String>,
-    /// Name of the environment variable the secret is read from, or `None`
-    /// when a literal token was supplied.
-    pub env_var: Option<String>,
-    /// `true` when a literal token value was supplied directly (rather than
-    /// via an environment variable). The token value itself is never exposed.
-    pub from_literal: bool,
 }
 
 /// The resource caps active on a [`Shell`], as reported in a
@@ -198,8 +158,6 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             binds: Vec::new(),
-            credentials: Vec::new(),
-            allowed_urls: Vec::new(),
             env: Vec::new(),
             umask: 0o022,
             timeout_secs: None,
@@ -488,15 +446,10 @@ impl Shell {
     /// with.
     ///
     /// The snapshot is captured at [`build()`](ShellBuilder::build) time and
-    /// reports bind mounts, credential rules, the network allowlist, seeded
-    /// environment variables, umask, timeout, and resource caps. It exists so
-    /// an embedder (e.g. a sandbox adapter in another SDK) can introspect a
-    /// constructed `Shell` without having held onto the builder — to build
-    /// tool descriptions, surface the allowlist, or report active limits.
-    ///
-    /// Secret values are never included: [`CredInfo`] reports the credential's
-    /// URL pattern, kind, and source (literal vs environment variable name),
-    /// but never the token itself.
+    /// reports bind mounts, seeded environment variables, umask, timeout, and
+    /// resource caps. It exists so an embedder (e.g. a sandbox adapter in
+    /// another SDK) can introspect a constructed `Shell` without having held
+    /// onto the builder — to build tool descriptions or report active limits.
     ///
     /// Shells created via [`with_kernel`](Shell::with_kernel) (which bypass the
     /// builder) report a [`ShellConfig::default`] snapshot.
@@ -705,7 +658,7 @@ impl Shell {
 ///
 /// 1. **Filesystem** — bind mounts that expose host paths into the
 ///    virtual filesystem
-/// 2. **Network** — credentials injected into HTTP requests
+/// 2. **Network** — the SSRF floor on HTTP requests
 /// 3. **Limits** — resource constraints to prevent runaway execution
 ///
 /// # Bind Mount Modes
@@ -726,18 +679,12 @@ impl Shell {
 /// ```rust,no_run
 /// # async fn example() -> std::io::Result<()> {
 /// use std::time::Duration;
-/// use strands_shell::{CredKind, Shell};
+/// use strands_shell::Shell;
 ///
 /// let mut shell = Shell::builder()
 ///     // Filesystem
 ///     .bind("/home/user/project/src", "/workspace/src")
 ///     .bind_direct("/tmp/output", "/output")
-///     // Network
-///     .credential_from_env(
-///         "https://api.example.com/*",
-///         CredKind::Bearer,
-///         "API_TOKEN",
-///     )
 ///     // Limits
 ///     .timeout(Duration::from_secs(30))
 ///     .max_depth(64)
@@ -753,7 +700,6 @@ impl Shell {
 /// ```
 pub struct ShellBuilder {
     config: VfsConfig,
-    creds: Vec<CredEntry>,
     env: Vec<(String, String)>,
     #[cfg(not(target_arch = "wasm32"))]
     mcp: Vec<McpConfigEntry>,
@@ -766,14 +712,12 @@ pub struct ShellBuilder {
     max_file_size: usize,
     max_inodes: usize,
     timeout: Option<Duration>,
-    allowed_url_prefixes: Vec<String>,
 }
 
 impl Default for ShellBuilder {
     fn default() -> Self {
         Self {
             config: VfsConfig::default(),
-            creds: Vec::new(),
             env: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             mcp: Vec::new(),
@@ -786,7 +730,6 @@ impl Default for ShellBuilder {
             max_file_size: 10 * 1024 * 1024,
             max_inodes: 10_000,
             timeout: Some(std::time::Duration::from_secs(30)),
-            allowed_url_prefixes: Vec::new(),
         }
     }
 }
@@ -862,80 +805,6 @@ impl ShellBuilder {
             source: source.into(),
             destination: destination.into(),
             readonly: true,
-        });
-        self
-    }
-
-    /// Add a credential for HTTP requests matching a URL pattern.
-    ///
-    /// When the shell executes `curl` against a URL matching `url`,
-    /// the credential is injected as an HTTP header automatically.
-    /// The `url` parameter supports glob patterns (e.g.
-    /// `https://api.example.com/*`).
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # fn example() {
-    /// # let builder = strands_shell::Shell::builder();
-    /// use strands_shell::CredKind;
-    /// builder.credential(
-    ///     "https://api.example.com/*",
-    ///     CredKind::Bearer,
-    ///     "sk-my-token",
-    /// );
-    /// # }
-    /// ```
-    pub fn credential(
-        mut self,
-        url: impl Into<String>,
-        kind: CredKind,
-        api_key: impl Into<String>,
-    ) -> Self {
-        self.creds.push(CredEntry {
-            url: url.into(),
-            methods: Vec::new(),
-            kind,
-            api_key: Some(api_key.into()),
-            api_key_env: None,
-            param: None,
-        });
-        self
-    }
-
-    /// Add a credential that reads the API key from an environment
-    /// variable at build time.
-    ///
-    /// This avoids hardcoding secrets. The environment variable is
-    /// read when [`build()`](Self::build) is called — if it is not
-    /// set, `build()` returns an error.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # fn example() {
-    /// # let builder = strands_shell::Shell::builder();
-    /// use strands_shell::CredKind;
-    /// builder.credential_from_env(
-    ///     "https://api.openai.com/*",
-    ///     CredKind::Bearer,
-    ///     "OPENAI_API_KEY",
-    /// );
-    /// # }
-    /// ```
-    pub fn credential_from_env(
-        mut self,
-        url: impl Into<String>,
-        kind: CredKind,
-        env_var: impl Into<String>,
-    ) -> Self {
-        self.creds.push(CredEntry {
-            url: url.into(),
-            methods: Vec::new(),
-            kind,
-            api_key: None,
-            api_key_env: Some(env_var.into()),
-            param: None,
         });
         self
     }
@@ -1023,17 +892,10 @@ impl ShellBuilder {
         self
     }
 
-    /// Allow curl requests to URLs matching the given prefix, bypassing
-    /// the default SSRF protections. Useful for testing with local servers.
-    pub fn allow_url(mut self, prefix: impl Into<String>) -> Self {
-        self.allowed_url_prefixes.push(prefix.into());
-        self
-    }
-
     /// Load additional configuration from a TOML file.
     ///
-    /// Bind mounts, credentials, and `allowed_urls` from the file are
-    /// appended to whatever is already configured on the builder. The umask
+    /// Bind mounts from the file are appended to whatever is already
+    /// configured on the builder. The umask
     /// is overwritten. Resource caps under `[limits]` overwrite the
     /// corresponding builder values (an omitted key keeps the builder
     /// default). Environment variables follow a "code wins" rule: a key set
@@ -1052,11 +914,9 @@ impl ShellBuilder {
         let content = std::fs::read_to_string(path)?;
         let config: VfsConfig = crate::vfs_config::parse_config(&content)?;
         self.config.bind.extend(config.bind);
-        self.creds.extend(config.cred);
         #[cfg(not(target_arch = "wasm32"))]
         self.mcp.extend(config.mcp);
         self.config.umask = config.umask;
-        self.allowed_url_prefixes.extend(config.allowed_urls);
         // Env: an explicitly-passed `.env()` value always wins over the file,
         // regardless of whether `.env()` or `.config_file()` was called first
         // (matches the "code wins" rule for umask/timeout). Only take a TOML
@@ -1105,15 +965,13 @@ impl ShellBuilder {
 
     /// Build the [`Shell`].
     ///
-    /// This resolves all credentials (reading environment variables as
-    /// needed), constructs the virtual filesystem with bind mounts,
-    /// and creates the initial shell process.
+    /// This constructs the virtual filesystem with bind mounts and creates
+    /// the initial shell process.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - A bind mount source path does not exist
-    /// - A credential references an environment variable that is not set
     /// - The configured timeout is zero (a zero timeout would expire every
     ///   command immediately; there is no "unlimited" sentinel — simply omit
     ///   the timeout for no limit)
@@ -1127,8 +985,7 @@ impl ShellBuilder {
 
         // Capture a read-only config snapshot before the builder's fields are
         // moved into the kernel/process below. This is what `Shell::config()`
-        // returns. Secret values are deliberately omitted: a credential
-        // reports its source (literal vs env-var name) but never the token.
+        // returns.
         let config_snapshot = ShellConfig {
             binds: self
                 .config
@@ -1141,19 +998,6 @@ impl ShellBuilder {
                     readonly: b.readonly,
                 })
                 .collect(),
-            credentials: self
-                .creds
-                .iter()
-                .map(|c| CredInfo {
-                    url: c.url.clone(),
-                    kind: c.kind.as_str(),
-                    methods: c.methods.clone(),
-                    param: c.param.clone(),
-                    env_var: c.api_key_env.clone(),
-                    from_literal: c.api_key.is_some(),
-                })
-                .collect(),
-            allowed_urls: self.allowed_url_prefixes.clone(),
             env: self.env.clone(),
             umask: self.config.umask,
             timeout_secs: self.timeout.map(|d| d.as_secs_f64()),
@@ -1169,15 +1013,10 @@ impl ShellBuilder {
             },
         };
 
-        let resolved_creds = resolve_creds(&self.creds)?;
         let mut vfs = build_vfs(&self.config)?;
         vfs.max_file_size = self.max_file_size;
         vfs.max_inodes = self.max_inodes;
-        let kernel: Arc<dyn Kernel> = Arc::new(VfsKernel {
-            vfs: std::sync::Arc::new(tokio::sync::Mutex::new(vfs)),
-            creds: resolved_creds,
-            allowed_url_prefixes: self.allowed_url_prefixes,
-        });
+        let kernel: Arc<dyn Kernel> = Arc::new(VfsKernel::new(vfs));
         let mut proc = kernel.new_process();
 
         proc.max_depth = self.max_depth;

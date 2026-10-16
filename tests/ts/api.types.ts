@@ -15,24 +15,19 @@ import {
   type FileInfo,
   type ShellConfig,
   type BindConfig,
-  type CredConfig,
   type ShellLimits,
   type ShellErrorCode,
   type ShellConfigSnapshot,
   type BindInfo,
-  type CredInfo,
   type LimitsInfo,
 } from '../../index.js'
 
 async function usage(): Promise<void> {
   // Config object exercises every field and the literal-typed `mode`.
   const bind: BindConfig = { source: '/host', destination: '/work', mode: 'copy', readonly: true }
-  const cred: CredConfig = { url: 'https://api.example.com/', envVar: 'API_TOKEN' }
   const limits: ShellLimits = { maxOutput: 1 << 20, maxFileSize: 10 << 20 }
   const config: ShellConfig = {
     binds: [bind],
-    credentials: [cred],
-    allowedUrls: ['https://api.example.com/'],
     env: { PROJECT: 'demo' },
     umask: 0o022,
     timeout: 30,
@@ -61,11 +56,6 @@ async function usage(): Promise<void> {
   const snapshot: ShellConfigSnapshot = await shell.config()
   const _binds: readonly BindInfo[] = snapshot.binds
   const _mode: 'copy' | 'direct' = snapshot.binds[0].mode
-  const _creds: readonly CredInfo[] = snapshot.credentials
-  const _credKind: 'bearer' | 'query' = snapshot.credentials[0].kind
-  const _envVar: string | null = snapshot.credentials[0].envVar
-  const _fromLiteral: boolean = snapshot.credentials[0].fromLiteral
-  const _allowed: readonly string[] = snapshot.allowedUrls
   const _umask: number = snapshot.umask
   const _timeout: number | null = snapshot.timeout
   const _limits: LimitsInfo = snapshot.limits

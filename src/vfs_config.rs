@@ -72,17 +72,11 @@ pub struct VfsConfig {
     pub umask: u32,
     #[serde(default)]
     pub bind: Vec<BindEntry>,
-    #[serde(default)]
-    pub cred: Vec<CredEntry>,
     #[cfg(not(target_arch = "wasm32"))]
     #[serde(default)]
     pub mcp: Vec<McpConfigEntry>,
     #[serde(default)]
     pub limits: Option<LimitsConfig>,
-    /// SSRF allowlist — URL prefixes `curl` may reach. Mirrors the builder's
-    /// `allow_url` / the bindings' `allowed_urls`.
-    #[serde(default)]
-    pub allowed_urls: Vec<String>,
     /// Environment variables seeded into the shell. A TOML `[env]` table.
     /// Ordered (BTreeMap) so config application is deterministic.
     #[serde(default)]
@@ -98,11 +92,9 @@ impl Default for VfsConfig {
         Self {
             umask: default_umask(),
             bind: Vec::new(),
-            cred: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             mcp: Vec::new(),
             limits: None,
-            allowed_urls: Vec::new(),
             env: std::collections::BTreeMap::new(),
         }
     }
@@ -146,89 +138,9 @@ impl BindMode {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredEntry {
-    pub url: String,
-    #[serde(default)]
-    pub methods: Vec<String>,
-    pub kind: CredKind,
-    pub api_key: Option<String>,
-    pub api_key_env: Option<String>,
-    /// Query parameter name (required for kind = "query")
-    pub param: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CredKind {
-    Bearer,
-    Query,
-}
-
-impl CredKind {
-    /// The lowercase string the TOML / bindings use for this kind
-    /// (`"bearer"` or `"query"`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CredKind::Bearer => "bearer",
-            CredKind::Query => "query",
-        }
-    }
-}
-
 /// Parse a VFS config from a TOML string.
 pub fn parse_config(toml_str: &str) -> io::Result<VfsConfig> {
     toml::from_str(toml_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
-}
-
-/// A resolved credential ready for use at runtime.
-#[derive(Clone)]
-pub struct ResolvedCred {
-    pub url: String,
-    pub methods: Vec<String>,
-    pub kind: CredKind,
-    pub api_key: String,
-    /// Query parameter name (for kind = Query)
-    pub param: Option<String>,
-}
-
-/// Resolve credentials from config, reading env vars as needed.
-pub fn resolve_creds(creds: &[CredEntry]) -> io::Result<Vec<ResolvedCred>> {
-    creds
-        .iter()
-        .map(|c| {
-            let api_key = if let Some(ref key) = c.api_key {
-                key.clone()
-            } else if let Some(ref env_var) = c.api_key_env {
-                std::env::var(env_var).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("cred: environment variable {env_var} not set"),
-                    )
-                })?
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cred: must specify api_key or api_key_env",
-                ));
-            };
-            // Validate that Query credentials have a param
-            if matches!(c.kind, CredKind::Query) && c.param.is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cred: kind=query requires param field",
-                ));
-            }
-            Ok(ResolvedCred {
-                url: c.url.clone(),
-                methods: c.methods.iter().map(|m| m.to_uppercase()).collect(),
-                kind: c.kind,
-                api_key,
-                param: c.param.clone(),
-            })
-        })
-        .collect()
 }
 
 /// Build a VFS from a config.
@@ -290,11 +202,10 @@ pub fn build_vfs(config: &VfsConfig) -> io::Result<Vfs> {
 
 /// Load a VFS config from a TOML file and build the VFS.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_config(path: &Path) -> io::Result<(Vfs, Vec<ResolvedCred>, Vec<McpConfigEntry>)> {
+pub fn load_config(path: &Path) -> io::Result<(Vfs, Vec<McpConfigEntry>)> {
     let content = std::fs::read_to_string(path)?;
     let config = parse_config(&content)?;
-    let creds = resolve_creds(&config.cred)?;
     let mcp = config.mcp.clone();
     let vfs = build_vfs(&config)?;
-    Ok((vfs, creds, mcp))
+    Ok((vfs, mcp))
 }

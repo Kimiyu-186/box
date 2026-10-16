@@ -104,10 +104,9 @@ impl FileInfo {
 // --------------------------------------------------------------------------- #
 // Read-only config snapshot carriers
 //
-// These mirror the Rust `crate::shell::{ShellConfig, BindInfo, CredInfo,
-// LimitsInfo}` view types. They are the low-level surface; the pure-Python
-// wrapper (`strands_shell/__init__.py`) re-shapes them into frozen public
-// dataclasses. Secret values are never carried — see `CredInfo`.
+// These mirror the Rust `crate::shell::{ShellConfig, BindInfo, LimitsInfo}`
+// view types. They are the low-level surface; the pure-Python wrapper
+// (`strands_shell/__init__.py`) re-shapes them into frozen public dataclasses.
 // --------------------------------------------------------------------------- #
 
 /// A single bind mount in a config snapshot.
@@ -134,42 +133,6 @@ impl BindInfo {
             self.destination,
             self.mode,
             if self.readonly { "True" } else { "False" }
-        )
-    }
-}
-
-/// A single credential rule in a config snapshot. Never carries the secret.
-#[pyclass(skip_from_py_object)]
-#[derive(Clone)]
-pub struct CredInfo {
-    #[pyo3(get)]
-    pub url: String,
-    /// `"bearer"` or `"query"`.
-    #[pyo3(get)]
-    pub kind: String,
-    #[pyo3(get)]
-    pub methods: Vec<String>,
-    #[pyo3(get)]
-    pub param: Option<String>,
-    /// Name of the env var the secret is read from, or `None` for a literal.
-    #[pyo3(get)]
-    pub env_var: Option<String>,
-    /// True when a literal token was supplied (value itself never exposed).
-    #[pyo3(get)]
-    pub from_literal: bool,
-}
-
-#[pymethods]
-impl CredInfo {
-    fn __repr__(&self) -> String {
-        format!(
-            "CredInfo(url={:?}, kind={:?}, methods={:?}, param={:?}, env_var={:?}, from_literal={})",
-            self.url,
-            self.kind,
-            self.methods,
-            self.param,
-            self.env_var,
-            if self.from_literal { "True" } else { "False" }
         )
     }
 }
@@ -219,10 +182,6 @@ impl LimitsInfo {
 pub struct ShellConfig {
     #[pyo3(get)]
     pub binds: Vec<BindInfo>,
-    #[pyo3(get)]
-    pub credentials: Vec<CredInfo>,
-    #[pyo3(get)]
-    pub allowed_urls: Vec<String>,
     /// List of `(key, value)` pairs, in declaration order.
     #[pyo3(get)]
     pub env: Vec<(String, String)>,
@@ -239,10 +198,8 @@ pub struct ShellConfig {
 impl ShellConfig {
     fn __repr__(&self) -> String {
         format!(
-            "ShellConfig(binds={} entries, credentials={} entries, allowed_urls={:?}, env={} vars, umask={:#o}, timeout={:?})",
+            "ShellConfig(binds={} entries, env={} vars, umask={:#o}, timeout={:?})",
             self.binds.len(),
-            self.credentials.len(),
-            self.allowed_urls,
             self.env.len(),
             self.umask,
             self.timeout
@@ -315,28 +272,6 @@ impl ShellBuilder {
         chain(slf, |b| b.bind_direct_readonly(source, destination))
     }
 
-    /// Add a bearer token credential for URLs matching a pattern.
-    fn credential<'py>(
-        slf: PyRefMut<'py, Self>,
-        url_pattern: &str,
-        token: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        chain(slf, |b| {
-            b.credential(url_pattern, crate::CredKind::Bearer, token)
-        })
-    }
-
-    /// Add a bearer token credential from an environment variable.
-    fn credential_from_env<'py>(
-        slf: PyRefMut<'py, Self>,
-        url_pattern: &str,
-        env_var: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        chain(slf, |b| {
-            b.credential_from_env(url_pattern, crate::CredKind::Bearer, env_var)
-        })
-    }
-
     /// Set an environment variable.
     fn env<'py>(slf: PyRefMut<'py, Self>, key: &str, value: &str) -> PyResult<PyRefMut<'py, Self>> {
         chain(slf, |b| b.env(key, value))
@@ -390,11 +325,6 @@ impl ShellBuilder {
     /// Set max inodes (files + directories) in VFS.
     fn max_inodes(slf: PyRefMut<'_, Self>, n: usize) -> PyResult<PyRefMut<'_, Self>> {
         chain(slf, |b| b.max_inodes(n))
-    }
-
-    /// Allow curl requests to URLs matching prefix (bypasses SSRF protection).
-    fn allow_url<'py>(slf: PyRefMut<'py, Self>, prefix: &str) -> PyResult<PyRefMut<'py, Self>> {
-        chain(slf, |b| b.allow_url(prefix))
     }
 
     /// Load config from a TOML file.
@@ -487,8 +417,7 @@ impl Shell {
 
     /// Read-only snapshot of the configuration this shell was built with.
     ///
-    /// Mirrors `Shell::config()` in the core. Never carries secret values —
-    /// each credential reports its source (literal vs env-var name) only.
+    /// Mirrors `Shell::config()` in the core.
     fn config(&self) -> PyResult<ShellConfig> {
         let shell = self
             .inner
@@ -506,19 +435,6 @@ impl Shell {
                     readonly: b.readonly,
                 })
                 .collect(),
-            credentials: c
-                .credentials
-                .iter()
-                .map(|cr| CredInfo {
-                    url: cr.url.clone(),
-                    kind: cr.kind.to_string(),
-                    methods: cr.methods.clone(),
-                    param: cr.param.clone(),
-                    env_var: cr.env_var.clone(),
-                    from_literal: cr.from_literal,
-                })
-                .collect(),
-            allowed_urls: c.allowed_urls.clone(),
             env: c.env.clone(),
             umask: c.umask,
             timeout: c.timeout_secs,
@@ -636,7 +552,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileInfo>()?;
     m.add_class::<ShellConfig>()?;
     m.add_class::<BindInfo>()?;
-    m.add_class::<CredInfo>()?;
     m.add_class::<LimitsInfo>()?;
     m.add("NativeShellError", m.py().get_type::<NativeShellError>())?;
     m.add_function(wrap_pyfunction!(cli_main, m)?)?;
