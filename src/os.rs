@@ -254,6 +254,8 @@ pub struct Process {
     pub traps: HashMap<String, String>,
     /// File creation mask.
     pub umask: u32,
+    /// `shopt` option names currently set; recorded, with no effect on execution.
+    pub shopts: std::collections::BTreeSet<String>,
 }
 
 /// Resource limits that can be extracted from a configured Process
@@ -373,6 +375,7 @@ impl Process {
             captured_stderr: String::new(),
             traps: HashMap::new(),
             umask: 0o022,
+            shopts: std::collections::BTreeSet::new(),
         }
     }
 
@@ -414,6 +417,7 @@ impl Process {
             captured_stderr: String::new(),
             traps: HashMap::new(),
             umask: 0o022,
+            shopts: std::collections::BTreeSet::new(),
         }
     }
 
@@ -465,6 +469,7 @@ impl Process {
             captured_stderr: String::new(),
             traps: self.traps.clone(),
             umask: self.umask,
+            shopts: self.shopts.clone(),
         }
     }
 
