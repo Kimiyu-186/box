@@ -18,6 +18,7 @@ mod mkdir;
 mod mktemp;
 mod mv;
 mod pwd;
+mod python;
 mod readlink;
 mod rm;
 mod rmdir;
@@ -92,6 +93,8 @@ pub fn lookup(name: &str) -> Option<CommandFn> {
             "mktemp" => |os, args| Box::pin(mktemp::cmd_mktemp(os, args)),
             "mv" => |os, args| Box::pin(mv::cmd_mv(os, args)),
             "pwd" => |os, args| Box::pin(pwd::cmd_pwd(os, args)),
+            "python" => |os, args| Box::pin(python::cmd_python(os, args)),
+            "python3" => |os, args| Box::pin(python::cmd_python3(os, args)),
             "readlink" => |os, args| Box::pin(readlink::cmd_readlink(os, args)),
             "rm" => |os, args| Box::pin(rm::cmd_rm(os, args)),
             "rmdir" => |os, args| Box::pin(rmdir::cmd_rmdir(os, args)),

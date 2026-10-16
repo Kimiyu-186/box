@@ -692,6 +692,7 @@ pub struct ShellBuilder {
     timeout: Option<Duration>,
     network_enabled: bool,
     egress_proxy: Option<EgressProxy>,
+    script_interpreter: Option<crate::os::ScriptInterpreter>,
     egress_refusal_header: Option<String>,
     effect_interceptor: Option<Arc<dyn EffectInterceptor>>,
     kernel: Option<Arc<dyn Kernel>>,
@@ -715,6 +716,7 @@ impl Default for ShellBuilder {
             timeout: Some(std::time::Duration::from_secs(30)),
             network_enabled: true,
             egress_proxy: None,
+            script_interpreter: None,
             egress_refusal_header: None,
             effect_interceptor: None,
             kernel: None,
@@ -1041,6 +1043,18 @@ impl ShellBuilder {
         }
     }
 
+    /// Install the interpreter that backs [`Kernel::run_script`](crate::os::Kernel::run_script).
+    ///
+    /// A stated position, the counterpart of the built-in commands: an embedder that
+    /// wants the Shell's `python`/`python3` command to reach an out-of-Shell interpreter
+    /// installs the hook here. Without it, `run_script` is `Unsupported` and a `python`
+    /// command refuses. Applies only to the bundled kernel; a kernel supplied through
+    /// [`kernel`](Self::kernel) owns its own `run_script`.
+    pub fn script_interpreter(mut self, hook: crate::os::ScriptInterpreter) -> Self {
+        self.script_interpreter = Some(hook);
+        self
+    }
+
     /// Name the response header the egress proxy sets on a refusal it originates itself.
     ///
     /// State it before [`egress_proxy`](Self::egress_proxy), which reads it. Without it a refusal the
@@ -1186,6 +1200,7 @@ impl ShellBuilder {
                 let mut kernel = VfsKernel::new(vfs);
                 kernel.network_enabled = self.network_enabled;
                 kernel.egress_proxy = self.egress_proxy;
+                kernel.script_interpreter = self.script_interpreter;
                 Arc::new(kernel)
             }
         };

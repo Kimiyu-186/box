@@ -589,6 +589,15 @@ impl Mediated {
     pub async fn http_request(&self, req: HttpRequest) -> io::Result<HttpResponse> {
         self.kernel.http_request(req).await
     }
+
+    /// Run a script through the embedder's interpreter.
+    ///
+    /// Raises no admission, for the same reason [`http_request`](Self::http_request)
+    /// does not: the command-level `shell:exec` fired when the command resolved, and the
+    /// script's own effects are judged by the interpreter the hook drives.
+    pub async fn run_script(&self, source: String) -> io::Result<crate::os::ScriptOutcome> {
+        self.kernel.run_script(source).await
+    }
 }
 
 /// One admitted command, owing an outcome report.

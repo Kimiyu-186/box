@@ -53,6 +53,9 @@ pub struct VfsKernel {
     /// When set, `http_request` routes through this proxy rather than dialing the
     /// origin directly. `None` keeps the direct-client behaviour.
     pub egress_proxy: Option<EgressProxy>,
+    /// When set, `run_script` forwards the source to this interpreter hook. `None`
+    /// leaves `run_script` `Unsupported`, so a Shell with no hook refuses a script.
+    pub script_interpreter: Option<crate::os::ScriptInterpreter>,
     resolution_generation: Arc<Mutex<u64>>,
     pending_writes: std::sync::Mutex<Vec<PendingWrite>>,
 }
@@ -73,6 +76,7 @@ impl VfsKernel {
             vfs: Arc::new(Mutex::new(vfs)),
             network_enabled: true,
             egress_proxy: None,
+            script_interpreter: None,
             resolution_generation: Arc::new(Mutex::new(0)),
             pending_writes: std::sync::Mutex::new(Vec::new()),
         }
@@ -1984,6 +1988,20 @@ impl Kernel for VfsKernel {
     /// boundary decides, with the request vocabulary that decision needs.
     async fn http_request(&self, req: HttpRequest) -> io::Result<HttpResponse> {
         self.http_request_effect(req).await
+    }
+
+    /// Forward the source to the installed interpreter hook, or refuse when none is set.
+    ///
+    /// Raises no admission of its own: the hook the box installs runs the script through
+    /// its own policy-governed interpreter (Monty), which judges each effect there.
+    async fn run_script(&self, source: String) -> io::Result<ScriptOutcome> {
+        match &self.script_interpreter {
+            Some(hook) => hook(source).await,
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "script interpreter not available",
+            )),
+        }
     }
 }
 

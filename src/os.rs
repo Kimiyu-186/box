@@ -1098,6 +1098,35 @@ pub struct HttpResponse {
     pub reason: String,
 }
 
+/// The outcome of running a script through [`Kernel::run_script`].
+///
+/// The mirror of [`HttpResponse`] for the script seam: a process-style status and the
+/// captured streams. Buffered, not streamed — the interpreter behind the seam runs to
+/// completion and hands back what it produced.
+pub struct ScriptOutcome {
+    /// The script's process-style exit status.
+    pub status: i32,
+    /// Captured standard output.
+    pub stdout: String,
+    /// Captured standard error.
+    pub stderr: String,
+}
+
+/// A hook that runs a script for [`Kernel::run_script`].
+///
+/// The embedder installs one through [`crate::ShellBuilder::script_interpreter`]. It
+/// takes the script source and returns its outcome. Boxed and shared so the kernel can
+/// hold it behind `&self`, and `Send + Sync` so a per-request Shell can carry it across
+/// threads. It is the script counterpart of [`EgressProxy`](crate::EgressProxy): a
+/// stated destination for a capability the Shell forwards rather than owns.
+///
+/// [`EgressProxy`]: crate::vfs_kernel::EgressProxy
+pub type ScriptInterpreter = std::sync::Arc<dyn Fn(String) -> ScriptFuture + Send + Sync>;
+
+/// The future a [`ScriptInterpreter`] hook returns: the pending [`ScriptOutcome`].
+pub type ScriptFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ScriptOutcome>> + Send>>;
+
 // No `HttpTransport` seam. Routing the Shell's egress through a boundary is not a
 // mechanism the Shell should own: a trait every embedding must wire up correctly is
 // weaker than a proxy destination an operator can inspect, and it can route anywhere —
@@ -1325,6 +1354,24 @@ pub trait Kernel: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "HTTP not available",
+        ))
+    }
+
+    /// Run a script through the embedder's out-of-Shell interpreter.
+    ///
+    /// The counterpart of [`http_request`](Self::http_request) for a scripted
+    /// interpreter. The Shell does not interpret the source itself; it forwards it to a
+    /// hook the embedder installs (for `strands-box`, the Python interpreter Monty). The
+    /// default is `Unsupported`, so a Shell with no hook refuses rather than pretends —
+    /// a `python` command over such a Shell reports that no interpreter is available.
+    ///
+    /// Raises no admission here: the command-level `shell:exec` already fired when the
+    /// command resolved, and the script's own effects are judged by the interpreter the
+    /// hook drives.
+    async fn run_script(&self, _source: String) -> io::Result<ScriptOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "script interpreter not available",
         ))
     }
 }
