@@ -1771,8 +1771,8 @@ async fn run_capturing_status(
                     (exit, out)
                 }
                 Item::Group(cl) => {
-                    let s = Box::pin(run_capturing(os.clone(), proc, cl)).await;
-                    (0, s)
+                    let (s, exit) = Box::pin(run_capturing_status(os.clone(), proc, cl)).await;
+                    (exit, s)
                 }
                 Item::Subshell(cl) => {
                     let mut sub = proc.fork();
@@ -1781,8 +1781,9 @@ async fn run_capturing_status(
                         sub.err_msg(msg);
                         (1, String::new())
                     } else {
-                        let s = Box::pin(run_capturing(os.clone(), &mut sub, cl)).await;
-                        (0, s)
+                        let (s, exit) =
+                            Box::pin(run_capturing_status(os.clone(), &mut sub, cl)).await;
+                        (exit, s)
                     }
                 }
                 Item::If {
@@ -1794,43 +1795,54 @@ async fn run_capturing_status(
                     for (cond, body) in branches {
                         let exit = Box::pin(execute_command_line(os.clone(), proc, cond)).await;
                         if exit == 0 {
-                            let s = Box::pin(run_capturing(os.clone(), proc, body)).await;
-                            result = (0, s);
+                            let (s, exit) =
+                                Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                            result = (exit, s);
                             matched = true;
                             break;
                         }
                     }
                     if !matched && let Some(body) = else_body {
-                        let s = Box::pin(run_capturing(os.clone(), proc, body)).await;
-                        result = (0, s);
+                        let (s, exit) =
+                            Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                        result = (exit, s);
                     }
                     result
                 }
                 Item::While { condition, body } | Item::Until { condition, body } => {
                     let is_until = matches!(item, Item::Until { .. });
                     let mut s = String::new();
+                    let mut body_exit = 0;
                     loop {
                         let cond_exit =
                             Box::pin(execute_command_line(os.clone(), proc, condition)).await;
                         if (is_until && cond_exit == 0) || (!is_until && cond_exit != 0) {
                             break;
                         }
-                        s.push_str(&Box::pin(run_capturing(os.clone(), proc, body)).await);
+                        let (chunk, exit) =
+                            Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                        s.push_str(&chunk);
+                        body_exit = exit;
                     }
-                    (0, s)
+                    (body_exit, s)
                 }
                 Item::For { var, words, body } => {
                     let expanded = expand_words(os.clone(), proc, words).await;
                     let mut s = String::new();
+                    let mut body_exit = 0;
                     for val in &expanded {
                         proc.set_env(var, val);
-                        s.push_str(&Box::pin(run_capturing(os.clone(), proc, body)).await);
+                        let (chunk, exit) =
+                            Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                        s.push_str(&chunk);
+                        body_exit = exit;
                     }
-                    (0, s)
+                    (body_exit, s)
                 }
                 Item::Case { word, arms } => {
                     let value = expand_word(os.clone(), proc, word).await;
                     let mut s = String::new();
+                    let mut arm_exit = 0;
                     for arm in arms {
                         let mut matched = false;
                         for pat in &arm.patterns {
@@ -1841,11 +1853,14 @@ async fn run_capturing_status(
                             }
                         }
                         if matched {
-                            s = Box::pin(run_capturing(os.clone(), proc, &arm.body)).await;
+                            let (out, exit) =
+                                Box::pin(run_capturing_status(os.clone(), proc, &arm.body)).await;
+                            s = out;
+                            arm_exit = exit;
                             break;
                         }
                     }
-                    (0, s)
+                    (arm_exit, s)
                 }
                 Item::CompoundPipeline {
                     compound,
