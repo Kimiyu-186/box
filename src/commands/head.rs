@@ -9,7 +9,7 @@ Options:
 
 #[command("head")]
 async fn cmd_head(os: &dyn Kernel, args: &[String]) -> CommandResult {
-    let mut parser = lexopt::Parser::from_args(args);
+    let mut parser = lexopt::Parser::from_args(legacy_count(args));
     let mut n: usize = 10;
     let mut bytes: Option<u64> = None;
     let mut file = None;
@@ -50,4 +50,19 @@ async fn cmd_head(os: &dyn Kernel, args: &[String]) -> CommandResult {
         w.write_all(line.as_bytes()).await?;
     }
     Ok(0)
+}
+
+/// `-N` spelled as `-n N`, the obsolete form coreutils still accepts.
+fn legacy_count(args: &[String]) -> Vec<String> {
+    let mut rewritten = Vec::with_capacity(args.len() + 1);
+    for arg in args {
+        match arg.strip_prefix('-') {
+            Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                rewritten.push("-n".to_string());
+                rewritten.push(digits.to_string());
+            }
+            _ => rewritten.push(arg.clone()),
+        }
+    }
+    rewritten
 }
