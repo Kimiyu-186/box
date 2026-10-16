@@ -43,6 +43,10 @@ pub fn builtin_unalias<'a>(
     args: &'a [String],
 ) -> Pin<Box<dyn Future<Output = CommandResult> + 'a>> {
     Box::pin(async move {
+        let args = match args.first().map(|s| s.as_str()) {
+            Some("--") => &args[1..],
+            _ => args,
+        };
         if args.first().map(|s| s.as_str()) == Some("-a") {
             proc.clear_aliases();
             return Ok(0);
