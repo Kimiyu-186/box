@@ -131,7 +131,7 @@ async fn run_script(
     let saved_args = std::mem::replace(&mut proc.args, args.to_vec());
     let saved_arg0 = std::mem::replace(&mut proc.arg0, script_path.to_string());
     proc.depth += 1;
-    let (exit, _) = execute_sourced(os, proc, &content).await;
+    let (exit, _) = execute_sourced(os, proc, &content, Some(script_path)).await;
     proc.depth -= 1;
     proc.args = saved_args;
     proc.arg0 = saved_arg0;
@@ -273,7 +273,7 @@ async fn report_stage(permit: Option<CommandPermit>, proc: &mut Process, status:
 /// trap body.
 pub async fn execute(os: Arc<Mediated>, proc: &mut Process, input: &str) -> (i32, bool) {
     let result = if input.contains('\n') {
-        execute_sourced(os.clone(), proc, input).await
+        execute_sourced(os.clone(), proc, input, None).await
     } else {
         execute_with_reader(os.clone(), proc, input, &mut |_| None).await
     };
@@ -373,8 +373,13 @@ async fn execute_admitted_line(
 /// than one for the whole file. That is the finer accounting: a `source` of a hundred
 /// commands is a hundred things happening, and a budget that charged it once could not say
 /// which.
-pub async fn execute_sourced(os: Arc<Mediated>, proc: &mut Process, input: &str) -> (i32, bool) {
-    execute_admitted_source(os, proc, input).await
+pub async fn execute_sourced(
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    input: &str,
+    origin: Option<&str>,
+) -> (i32, bool) {
+    execute_admitted_source(os, proc, input, origin).await
 }
 
 /// [`execute_sourced`]'s body, after admission. See [`execute_admitted_line`] for why it is
@@ -383,16 +388,19 @@ async fn execute_admitted_source(
     os: Arc<Mediated>,
     proc: &mut Process,
     input: &str,
+    origin: Option<&str>,
 ) -> (i32, bool) {
     let mut last_code = 0i32;
     let mut accum = String::new();
-    let mut last_err = String::new();
+    let mut pending: Option<parser::ParseError> = None;
+    let mut statement_line = 0;
     let lines: Vec<&str> = input.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         if accum.is_empty() {
             accum = lines[i].to_string();
+            statement_line = i + 1;
         } else {
             accum.push('\n');
             accum.push_str(lines[i]);
@@ -411,10 +419,11 @@ async fn execute_admitted_source(
         };
 
         match parser::parse_with_aliases(&accum, &mut reader, &proc.aliases) {
+            Ok(cl) if line_idx == i && i < lines.len() && ends_with_and_or(&cl) => {}
             Ok(cl) => {
                 i = line_idx; // advance past any lines consumed by heredoc
                 accum.clear();
-                last_err.clear();
+                pending = None;
                 if cl.is_empty() {
                     continue;
                 }
@@ -436,19 +445,58 @@ async fn execute_admitted_source(
                     }
                 }
             }
+            Err(e) if e.kind() == parser::ParseErrorKind::Incomplete => {
+                pending = Some(e);
+            }
             Err(e) => {
-                last_err = e;
-                continue;
+                report_source_parse_error(proc, origin, statement_line, &e);
+                return (1, false);
             }
         }
     }
 
-    if !accum.is_empty() && !last_err.is_empty() {
-        proc.err_msg(&format!("strands-shell: {last_err}"));
+    if let Some(e) = pending.filter(|_| !accum.is_empty()) {
+        report_source_parse_error(proc, origin, statement_line, &e);
         return (1, false);
     }
 
     (last_code, false)
+}
+
+/// Whether `cl` ends with `&&` or `||`, so its last command is on a later line.
+fn ends_with_and_or(cl: &parser::CommandLine) -> bool {
+    matches!(
+        cl.last(),
+        Some((_, Some(parser::Connector::And | parser::Connector::Or)))
+    )
+}
+
+/// Write what a script stage captured to that stage's stdout and stderr.
+async fn forward_captured_streams(proc: &mut Process) {
+    let output = std::mem::take(&mut proc.captured_output);
+    if !output.is_empty()
+        && let Ok(mut w) = crate::io::stdout()
+    {
+        let _ = w.write_all(output.as_bytes()).await;
+    }
+    let stderr = std::mem::take(&mut proc.captured_stderr);
+    if !stderr.is_empty()
+        && let Ok(mut w) = crate::io::stderr()
+    {
+        let _ = w.write_all(stderr.as_bytes()).await;
+    }
+}
+
+fn report_source_parse_error(
+    proc: &mut Process,
+    origin: Option<&str>,
+    line: usize,
+    error: &parser::ParseError,
+) {
+    match origin {
+        Some(origin) => proc.err_msg(&format!("strands-shell: {origin}: line {line}: {error}")),
+        None => proc.err_msg(&format!("strands-shell: line {line}: {error}")),
+    }
 }
 
 /// Expand a Word into a String using the current environment.
@@ -2758,7 +2806,7 @@ async fn execute_pipeline_checked(
                     };
                     proc.depth += 1;
                     let (exit, should_exit) =
-                        Box::pin(execute_sourced(os.clone(), proc, &content)).await;
+                        Box::pin(execute_sourced(os.clone(), proc, &content, Some(&args[0]))).await;
                     proc.depth -= 1;
                     if let Some(saved) = saved_args {
                         proc.args = saved;
@@ -3360,12 +3408,7 @@ async fn run_pipeline(
                                 return 0;
                             }
                             let exit = run_script(os, &mut state_proc, &args[0], &args[1..]).await;
-                            let output = std::mem::take(&mut state_proc.captured_output);
-                            if !output.is_empty()
-                                && let Ok(mut w) = crate::io::stdout()
-                            {
-                                let _ = w.write_all(output.as_bytes()).await;
-                            }
+                            forward_captured_streams(&mut state_proc).await;
                             return exit;
                         }
                         if let Some(f) = builtin {

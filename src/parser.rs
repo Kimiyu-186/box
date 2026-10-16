@@ -148,6 +148,51 @@ pub struct CaseArm {
 /// A sequence of items with connectors between them.
 pub type CommandLine = Vec<(Item, Option<Connector>)>;
 
+/// Whether more input can complete a statement that failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    /// The input ends inside a construct that a later line can close.
+    Incomplete,
+    /// The input holds a construct that no later line can make valid.
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    kind: ParseErrorKind,
+    message: String,
+}
+
+impl ParseError {
+    #[must_use]
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
+
+    fn incomplete(message: impl Into<String>) -> Self {
+        Self {
+            kind: ParseErrorKind::Incomplete,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            kind: ParseErrorKind::Invalid,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 // Reserved words that terminate a command line when in command position.
 const RESERVED: &[&str] = &[
     "then", "elif", "else", "fi", "do", "done", "{", "}", "esac", ";;",
@@ -172,7 +217,7 @@ pub fn word_to_str(word: &Word) -> Option<String> {
 }
 
 /// Parse a full input line into a command line.
-pub fn parse(input: &str) -> Result<CommandLine, String> {
+pub fn parse(input: &str) -> Result<CommandLine, ParseError> {
     parse_with_aliases(input, &mut |_| None, &std::collections::HashMap::new())
 }
 
@@ -181,7 +226,7 @@ pub fn parse(input: &str) -> Result<CommandLine, String> {
 pub fn parse_with_reader(
     input: &str,
     read_line: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<CommandLine, String> {
+) -> Result<CommandLine, ParseError> {
     parse_with_aliases(input, read_line, &std::collections::HashMap::new())
 }
 
@@ -190,7 +235,7 @@ pub fn parse_with_aliases(
     input: &str,
     read_line: &mut dyn FnMut(&str) -> Option<String>,
     aliases: &std::collections::HashMap<String, String>,
-) -> Result<CommandLine, String> {
+) -> Result<CommandLine, ParseError> {
     let mut tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Ok(vec![]);
@@ -200,7 +245,10 @@ pub fn parse_with_aliases(
     }
     let (mut cl, rest) = parse_command_line(&tokens, &[])?;
     if let Some(tok) = rest.first() {
-        return Err(format!("unexpected token: {}", tok_name(tok)));
+        return Err(ParseError::invalid(format!(
+            "unexpected token: {}",
+            tok_name(tok)
+        )));
     }
     // Resolve pending here-doc bodies
     resolve_heredocs(&mut cl, read_line)?;
@@ -263,7 +311,7 @@ fn expand_aliases(tokens: &mut Vec<Token>, aliases: &std::collections::HashMap<S
 fn resolve_heredocs(
     cl: &mut CommandLine,
     read_line: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ParseError> {
     for (item, _) in cl.iter_mut() {
         match item {
             Item::Pipeline(pipeline, _) => {
@@ -330,7 +378,7 @@ fn read_heredoc_body(
     delim: &str,
     strip: bool,
     read_line: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<String, String> {
+) -> Result<String, ParseError> {
     let mut body = String::new();
     while let Some(line) = read_line(delim) {
         let check = if strip {
@@ -410,7 +458,7 @@ fn tok_name(tok: &Token) -> &str {
 /// Collect a $VAR or ${VAR} name from the char stream. Returns the var name.
 fn collect_var(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<Option<WordPart>, String> {
+) -> Result<Option<WordPart>, ParseError> {
     if chars.peek() == Some(&'{') {
         chars.next();
         // ${#var} — length
@@ -551,7 +599,7 @@ fn collect_var_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> String 
 /// Handles nested ${...}, quotes, and escapes.
 fn collect_brace_word(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<Vec<WordPart>, String> {
+) -> Result<Vec<WordPart>, ParseError> {
     let mut parts = Vec::new();
     let mut lit = String::new();
     let mut depth = 1; // we're inside one ${
@@ -591,7 +639,7 @@ fn collect_brace_word(
                 match chars.next() {
                     Some('\'') => break,
                     Some(c) => sq.push(c),
-                    None => return Err("unterminated single quote".into()),
+                    None => return Err(ParseError::incomplete("unterminated single quote")),
                 }
             }
             if !lit.is_empty() {
@@ -611,10 +659,10 @@ fn collect_brace_word(
                             dq.push('\\');
                             dq.push(c);
                         }
-                        None => return Err("unterminated double quote".into()),
+                        None => return Err(ParseError::incomplete("unterminated double quote")),
                     },
                     Some(c) => dq.push(c),
-                    None => return Err("unterminated double quote".into()),
+                    None => return Err(ParseError::incomplete("unterminated double quote")),
                 }
             }
             lit.push_str(&dq);
@@ -628,7 +676,7 @@ fn collect_brace_word(
                 match chars.next() {
                     Some('`') => break,
                     Some(c) => cmd.push(c),
-                    None => return Err("unterminated backtick".into()),
+                    None => return Err(ParseError::incomplete("unterminated backtick")),
                 }
             }
             parts.push(WordPart::Backtick(cmd));
@@ -647,7 +695,7 @@ fn collect_brace_word(
 /// Handles nested parentheses.
 fn collect_dollar_paren(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<String, String> {
+) -> Result<String, ParseError> {
     let mut cmd = String::new();
     let mut depth = 1;
     loop {
@@ -664,7 +712,7 @@ fn collect_dollar_paren(
                 cmd.push(')');
             }
             Some(c) => cmd.push(c),
-            None => return Err("unterminated $()".into()),
+            None => return Err(ParseError::incomplete("unterminated $()")),
         }
     }
     Ok(cmd)
@@ -674,7 +722,7 @@ fn collect_dollar_paren(
 /// Returns a WordPart or None (bare $).
 fn collect_dollar(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<Option<WordPart>, String> {
+) -> Result<Option<WordPart>, ParseError> {
     if chars.peek() == Some(&'(') {
         chars.next();
         if chars.peek() == Some(&'(') {
@@ -696,11 +744,12 @@ fn collect_dollar(
                         // expect second closing )
                         match chars.next() {
                             Some(')') => break,
-                            _ => return Err("expected '))'".into()),
+                            Some(_) => return Err(ParseError::invalid("expected '))'")),
+                            None => return Err(ParseError::incomplete("unterminated $(())")),
                         }
                     }
                     Some(c) => expr.push(c),
-                    None => return Err("unterminated $(())".into()),
+                    None => return Err(ParseError::incomplete("unterminated $(())")),
                 }
             }
             Ok(Some(WordPart::Arith(expr)))
@@ -716,11 +765,11 @@ fn collect_dollar(
 /// Public version of collect_dollar for use by the executor (here-doc expansion).
 pub fn collect_dollar_pub(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<Option<WordPart>, String> {
+) -> Result<Option<WordPart>, ParseError> {
     collect_dollar(chars)
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, String> {
+fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
 
@@ -887,7 +936,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                                 match chars.next() {
                                     Some('\'') => break,
                                     Some(c) => sq.push(c),
-                                    None => return Err("unterminated single quote".into()),
+                                    None => {
+                                        return Err(ParseError::incomplete(
+                                            "unterminated single quote",
+                                        ));
+                                    }
                                 }
                             }
                             parts.push(WordPart::SingleQuoted(sq));
@@ -909,7 +962,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                                             dq_lit.push('\\');
                                             dq_lit.push(c);
                                         }
-                                        None => return Err("unterminated escape".into()),
+                                        None => {
+                                            return Err(ParseError::incomplete(
+                                                "unterminated escape",
+                                            ));
+                                        }
                                     },
                                     Some('$') => match collect_dollar(&mut chars)? {
                                         Some(part) => {
@@ -933,13 +990,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                                             match chars.next() {
                                                 Some('`') => break,
                                                 Some(c) => cmd.push(c),
-                                                None => return Err("unterminated backtick".into()),
+                                                None => {
+                                                    return Err(ParseError::incomplete(
+                                                        "unterminated backtick",
+                                                    ));
+                                                }
                                             }
                                         }
                                         dq_parts.push(WordPart::Backtick(cmd));
                                     }
                                     Some(c) => dq_lit.push(c),
-                                    None => return Err("unterminated double quote".into()),
+                                    None => {
+                                        return Err(ParseError::incomplete(
+                                            "unterminated double quote",
+                                        ));
+                                    }
                                 }
                             }
                             if !dq_lit.is_empty() {
@@ -969,7 +1034,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                                 match chars.next() {
                                     Some('`') => break,
                                     Some(c) => cmd.push(c),
-                                    None => return Err("unterminated backtick".into()),
+                                    None => {
+                                        return Err(ParseError::incomplete(
+                                            "unterminated backtick",
+                                        ));
+                                    }
                                 }
                             }
                             parts.push(WordPart::Backtick(cmd));
@@ -1038,7 +1107,7 @@ fn collect_compound_pipe(
     _pipeline_tokens: &mut Vec<&Token>,
     item: Item,
     negated: bool,
-) -> Result<Item, String> {
+) -> Result<Item, ParseError> {
     // Collect any redirects after the compound command (e.g. `done < file`)
     let mut redirects: Vec<Redirect> = Vec::new();
     while *i < tokens.len() {
@@ -1062,7 +1131,10 @@ fn collect_compound_pipe(
         let tok = tokens[*i].clone();
         *i += 1;
         if *i >= tokens.len() || !is_word_token(&tokens[*i]) {
-            return Err(format!("expected filename after '{}'", tok_name(&tok)));
+            return Err(ParseError::invalid(format!(
+                "expected filename after '{}'",
+                tok_name(&tok)
+            )));
         }
         let word = tok_to_word(&tokens[*i]);
         *i += 1;
@@ -1118,7 +1190,11 @@ fn collect_compound_pipe(
             }
         }
         if tail_tokens.is_empty() {
-            return Err("expected command after '|'".into());
+            return Err(if *i >= tokens.len() {
+                ParseError::incomplete("expected command after '|'")
+            } else {
+                ParseError::invalid("expected command after '|'")
+            });
         }
         let tail = build_pipeline(&tail_tokens)?;
         let inner = match item {
@@ -1147,7 +1223,7 @@ fn collect_compound_pipe(
 fn parse_command_line<'a>(
     tokens: &'a [Token],
     stop: &[&str],
-) -> Result<(CommandLine, &'a [Token]), String> {
+) -> Result<(CommandLine, &'a [Token]), ParseError> {
     let mut result: CommandLine = Vec::new();
     let mut pipeline_tokens: Vec<&Token> = Vec::new();
     let mut negated = false;
@@ -1186,11 +1262,14 @@ fn parse_command_line<'a>(
                 result.push((item, None));
                 continue;
             }
-            return Err(format!("unexpected '{}'", tok_name(&tokens[i])));
+            return Err(ParseError::invalid(format!(
+                "unexpected '{}'",
+                tok_name(&tokens[i])
+            )));
         }
 
         match &tokens[i] {
-            Token::RParen => return Err("unexpected ')'".into()),
+            Token::RParen => return Err(ParseError::invalid("unexpected ')'")),
             // Function definition: name() { body; }
             Token::Word(name)
                 if at_start
@@ -1211,7 +1290,7 @@ fn parse_command_line<'a>(
                 let (group, rest) = parse_command_line(&tokens[i + 1..], &[")"])?;
                 let rest = expect_rparen(rest)?;
                 if group.is_empty() {
-                    return Err("empty group".into());
+                    return Err(ParseError::invalid("empty group"));
                 }
                 i = tokens.len() - rest.len();
                 let item = Item::Subshell(group);
@@ -1276,15 +1355,15 @@ fn parse_command_line<'a>(
                 } else if let Some(last) = result.last_mut() {
                     last.1 = Some(connector);
                 } else if connector != Connector::Semi {
-                    return Err("unexpected operator".into());
+                    return Err(ParseError::invalid("unexpected operator"));
                 }
                 // Skip consecutive semicolons (from blank lines)
                 while i + 1 < tokens.len() && tokens[i + 1] == Token::Semi {
                     i += 1;
                 }
             }
-            Token::DoubleSemi => return Err("unexpected ';;'".into()),
-            Token::LParen => return Err("Opened parentheses without closing".into()),
+            Token::DoubleSemi => return Err(ParseError::invalid("unexpected ';;'")),
+            Token::LParen => return Err(ParseError::invalid("Opened parentheses without closing")),
             _ => {
                 pipeline_tokens.push(&tokens[i]);
             }
@@ -1293,6 +1372,9 @@ fn parse_command_line<'a>(
     }
 
     if !pipeline_tokens.is_empty() {
+        if i == tokens.len() && pipeline_tokens.last() == Some(&&Token::Pipe) {
+            return Err(ParseError::incomplete("expected command after '|'"));
+        }
         result.push((
             Item::Pipeline(build_pipeline(&pipeline_tokens)?, negated),
             None,
@@ -1303,25 +1385,32 @@ fn parse_command_line<'a>(
 }
 
 /// Expect `)` at the front of the slice, consuming it.
-fn expect_rparen(tokens: &[Token]) -> Result<&[Token], String> {
+fn expect_rparen(tokens: &[Token]) -> Result<&[Token], ParseError> {
     match tokens.first() {
         Some(Token::RParen) => Ok(&tokens[1..]),
-        Some(t) => Err(format!("expected ')', got '{}'", tok_name(t))),
-        None => Err("expected ')'".into()),
+        Some(t) => Err(ParseError::invalid(format!(
+            "expected ')', got '{}'",
+            tok_name(t)
+        ))),
+        None => Err(ParseError::incomplete("expected ')'")),
     }
 }
 
-fn expect_word<'a>(tokens: &'a [Token], word: &str) -> Result<&'a [Token], String> {
+fn expect_word<'a>(tokens: &'a [Token], word: &str) -> Result<&'a [Token], ParseError> {
     match tokens.first() {
         Some(Token::Word(w)) if w == word => Ok(&tokens[1..]),
-        Some(t) => Err(format!("expected '{}', got '{}'", word, tok_name(t))),
-        None => Err(format!("expected '{}'", word)),
+        Some(t) => Err(ParseError::invalid(format!(
+            "expected '{}', got '{}'",
+            word,
+            tok_name(t)
+        ))),
+        None => Err(ParseError::incomplete(format!("expected '{}'", word))),
     }
 }
 
 /// Parse `if cond; then body; [elif cond; then body;]... [else body;] fi`
 /// Assumes the `if` keyword has already been consumed.
-fn parse_if(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
+fn parse_if(tokens: &[Token]) -> Result<(Item, &[Token]), ParseError> {
     let mut branches = Vec::new();
     let mut rest = tokens;
 
@@ -1364,7 +1453,7 @@ fn parse_if(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
 }
 
 /// Parse `while cond; do body; done` or `until cond; do body; done`.
-fn parse_while_until(tokens: &[Token], is_until: bool) -> Result<(Item, &[Token]), String> {
+fn parse_while_until(tokens: &[Token], is_until: bool) -> Result<(Item, &[Token]), ParseError> {
     let (condition, rest) = parse_command_line(tokens, &["do"])?;
     let rest = expect_word(rest, "do")?;
     let (body, rest) = parse_command_line(rest, &["done"])?;
@@ -1378,17 +1467,17 @@ fn parse_while_until(tokens: &[Token], is_until: bool) -> Result<(Item, &[Token]
 }
 
 /// Parse `for var [in word...]; do body; done`.
-fn parse_for(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
+fn parse_for(tokens: &[Token]) -> Result<(Item, &[Token]), ParseError> {
     // Expect variable name
     let var = match tokens.first() {
         Some(Token::Word(w)) => w.clone(),
         Some(t) => {
-            return Err(format!(
+            return Err(ParseError::invalid(format!(
                 "expected variable name after 'for', got '{}'",
                 tok_name(t)
-            ));
+            )));
         }
-        None => return Err("expected variable name after 'for'".into()),
+        None => return Err(ParseError::incomplete("expected variable name after 'for'")),
     };
     let mut rest = &tokens[1..];
 
@@ -1423,12 +1512,17 @@ fn parse_for(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
 }
 
 /// Parse `case word in [pattern [| pattern]...) body ;;]... esac`.
-fn parse_case(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
+fn parse_case(tokens: &[Token]) -> Result<(Item, &[Token]), ParseError> {
     // Expect the word to match on
     let word = match tokens.first() {
         Some(tok) if is_word_token(tok) => tok_to_word(tok),
-        Some(t) => return Err(format!("expected word after 'case', got '{}'", tok_name(t))),
-        None => return Err("expected word after 'case'".into()),
+        Some(t) => {
+            return Err(ParseError::invalid(format!(
+                "expected word after 'case', got '{}'",
+                tok_name(t)
+            )));
+        }
+        None => return Err(ParseError::incomplete("expected word after 'case'")),
     };
     let mut rest = &tokens[1..];
     rest = expect_word(rest, "in")?;
@@ -1440,7 +1534,7 @@ fn parse_case(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
     let mut arms = Vec::new();
     while rest.first() != Some(&Token::Word("esac".into())) {
         if rest.is_empty() {
-            return Err("expected 'esac'".into());
+            return Err(ParseError::incomplete("expected 'esac'"));
         }
         // Optional leading (
         if rest.first() == Some(&Token::LParen) {
@@ -1454,7 +1548,8 @@ fn parse_case(tokens: &[Token]) -> Result<(Item, &[Token]), String> {
                     patterns.push(tok_to_word(tok));
                     rest = &rest[1..];
                 }
-                _ => return Err("expected pattern in case".into()),
+                Some(_) => return Err(ParseError::invalid("expected pattern in case")),
+                None => return Err(ParseError::incomplete("expected pattern in case")),
             }
             if rest.first() == Some(&Token::Pipe) {
                 rest = &rest[1..];
@@ -1492,7 +1587,7 @@ fn is_redirect_token(tok: &Token) -> bool {
     )
 }
 
-fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, String> {
+fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, ParseError> {
     let mut pipeline = Vec::new();
     let mut env_prefix: Vec<(Word, Word)> = Vec::new();
     let mut args: Vec<Word> = Vec::new();
@@ -1520,7 +1615,7 @@ fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, String> {
         match tokens[i] {
             Token::Pipe => {
                 if args.is_empty() {
-                    return Err("expected command before '|'".into());
+                    return Err(ParseError::invalid("expected command before '|'"));
                 }
                 pipeline.push(Command {
                     env: std::mem::take(&mut env_prefix),
@@ -1540,7 +1635,10 @@ fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, String> {
                 let tok = tokens[i].clone();
                 i += 1;
                 if i >= tokens.len() || !is_word_token(tokens[i]) {
-                    return Err(format!("expected filename after '{}'", tok_name(&tok)));
+                    return Err(ParseError::invalid(format!(
+                        "expected filename after '{}'",
+                        tok_name(&tok)
+                    )));
                 }
                 let word = tok_to_word(tokens[i]);
                 let redir = match tok {
@@ -1614,13 +1712,18 @@ fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, String> {
                 }
                 args.push(word);
             }
-            _ => return Err(format!("unexpected token: {}", tok_name(tokens[i]))),
+            _ => {
+                return Err(ParseError::invalid(format!(
+                    "unexpected token: {}",
+                    tok_name(tokens[i])
+                )));
+            }
         }
         i += 1;
     }
 
     if args.is_empty() && env_prefix.is_empty() && redirects.is_empty() {
-        return Err("expected command".into());
+        return Err(ParseError::invalid("expected command"));
     }
     pipeline.push(Command {
         env: env_prefix,
@@ -1635,8 +1738,70 @@ fn build_pipeline(tokens: &[&Token]) -> Result<Pipeline, String> {
 mod tests {
     use super::*;
 
-    fn p(input: &str) -> Result<CommandLine, String> {
+    fn p(input: &str) -> Result<CommandLine, ParseError> {
         parse(input)
+    }
+
+    fn kind(input: &str) -> ParseErrorKind {
+        p(input).expect_err("the input does not parse").kind()
+    }
+
+    #[test]
+    fn input_that_ends_inside_a_construct_is_incomplete() {
+        for input in [
+            "echo 'open",
+            "echo \"open",
+            "echo `open",
+            "echo $(open",
+            "echo $((1 + 2",
+            "echo \"a\\",
+            "(echo",
+            "{ echo",
+            "f() {",
+            "f()",
+            "if true; then echo",
+            "while true",
+            "for",
+            "for i in a b",
+            "case",
+            "case x in",
+            "case x in a|",
+            "case x in a) echo",
+            "echo a |",
+            "{ echo; } |",
+            "if true &&",
+            "echo $((1 + 2)",
+        ] {
+            assert_eq!(kind(input), ParseErrorKind::Incomplete, "{input}");
+        }
+    }
+
+    #[test]
+    fn input_that_no_later_line_can_close_is_invalid() {
+        for input in [
+            "echo )",
+            "echo *(N)",
+            "f() { echo *(N); }",
+            "fi",
+            "}",
+            "if true; echo; fi",
+            "if true; then echo; done",
+            ";;",
+            "()",
+            "echo $((1 + 2) )",
+            "echo >",
+            "| echo",
+            "echo a | ;",
+            "echo a && }",
+            "&& echo",
+            "{ echo; } | ;",
+            "for (",
+            "case ( in",
+            "case x in ;; esac",
+            "1(",
+        ] {
+            assert_eq!(kind(input), ParseErrorKind::Invalid, "{input}");
+        }
     }
 
     /// `word_is_literal` separates a word the script stated from one whose value arrives at runtime.
@@ -1676,6 +1841,7 @@ mod tests {
             assert!(!word_is_literal(&word), "{line}: {word:?} expands");
         }
     }
+
     /// Helper: extract the literal string from a Word (panics if not all literal/single-quoted).
     fn word_str(w: &Word) -> String {
         word_to_str(w).expect("expected literal word")

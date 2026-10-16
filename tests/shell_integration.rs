@@ -1488,6 +1488,173 @@ fn source_not_found() {
     }));
 }
 
+#[test]
+fn source_stops_at_an_invalid_statement_and_names_its_line() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(r#"printf '%s\n' 'a() { echo a; }' 'b() { echo *(N); }' 'c() { echo c; }' 'export AFTER=1' 'echo "never closed' > /tmp/bad.sh"#)
+            .await;
+        let out = shell
+            .run(r#". /tmp/bad.sh; echo "status=$?"; a; echo "AFTER=$AFTER""#)
+            .await;
+        assert_eq!(out.stdout.trim(), "status=1\na\nAFTER=");
+        assert!(
+            out.stderr
+                .contains("/tmp/bad.sh: line 2: Opened parentheses without closing"),
+            "stderr: {}",
+            out.stderr
+        );
+        assert!(
+            shell.run("c").await.stderr.contains("command not found"),
+            "a definition after the invalid statement must not load"
+        );
+    }));
+}
+
+#[test]
+fn source_runs_nothing_after_an_invalid_top_level_statement() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(r#"printf '%s\n' 'echo one' 'echo )' 'echo three' 'echo "never closed' > /tmp/bad.sh"#)
+            .await;
+        let out = shell.run("sh /tmp/bad.sh").await;
+        assert_eq!(out.stdout.trim(), "one");
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr.contains("/tmp/bad.sh: line 2: unexpected ')'"),
+            "stderr: {}",
+            out.stderr
+        );
+        let out = shell.run(". /tmp/bad.sh").await;
+        assert_eq!(out.stdout.trim(), "one");
+        assert!(
+            out.stderr.contains("/tmp/bad.sh: line 2: unexpected ')'"),
+            "stderr: {}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn source_still_joins_lines_of_an_incomplete_statement() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(
+                r#"printf '%s\n' 'f() {' '  if true; then' '    echo in-f' '  fi' '}' 'for i in 1 2' 'do echo $i; done' 'x=$(' 'echo sub)' 'echo "$x"' 'echo a |' '  tr a b' 'cat <<EOF' 'here' 'EOF' 'case q in' '  q) echo case;;' 'esac' 'false &&' 'echo never' 'true ||' 'echo never' 'true &&' '  echo and' 'cat <<EOF &&' 'body' 'EOF' 'echo after-heredoc' 'alias x="false &&"' 'x' 'echo alias-skipped' 'f' > /tmp/ok.sh"#,
+            )
+            .await;
+        let out = shell.run(". /tmp/ok.sh").await;
+        assert_eq!(
+            out.stdout.trim(),
+            "1\n2\nsub\nb\nhere\ncase\nand\nbody\nafter-heredoc\nin-f"
+        );
+        assert_eq!(out.status, 0, "stderr: {}", out.stderr);
+    }));
+}
+
+#[test]
+fn source_reports_an_unclosed_statement_at_the_line_where_it_starts() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(r#"printf '%s\n' 'echo one' 'echo "open' 'echo two' > /tmp/open.sh"#)
+            .await;
+        let out = shell.run(". /tmp/open.sh").await;
+        assert_eq!(out.stdout.trim(), "one");
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr
+                .contains("/tmp/open.sh: line 2: unterminated double quote"),
+            "stderr: {}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn a_script_run_by_sh_reports_its_errors_to_the_caller() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(r#"printf '%s\n' 'echo one' 'not_a_command_here' > /tmp/nf.sh"#)
+            .await;
+        let out = shell.run("sh /tmp/nf.sh").await;
+        assert_eq!(out.stdout.trim(), "one");
+        assert_eq!(out.status, 127);
+        assert!(
+            out.stderr.contains("not_a_command_here: command not found"),
+            "stderr: {}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn an_operator_at_end_of_input_keeps_its_meaning_outside_a_sourced_file() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        for (line, stdout) in [
+            ("echo single &&", "single\n"),
+            (r#"x=$(echo sub &&); echo "$x""#, "sub\n"),
+            ("eval 'echo eval ||'", "eval\n"),
+        ] {
+            let out = shell.run(line).await;
+            assert_eq!(out.stdout, stdout, "{line}");
+            assert_eq!(out.status, 0, "{line}: {}", out.stderr);
+        }
+        shell
+            .run(r#"printf '%s\n' 'echo one' 'echo two &&' > /tmp/and.sh"#)
+            .await;
+        let out = shell.run(". /tmp/and.sh").await;
+        assert_eq!(out.stdout, "one\ntwo\n");
+        assert_eq!(out.status, 0, "stderr: {}", out.stderr);
+    }));
+}
+
+#[test]
+fn source_counts_lines_past_a_heredoc_and_a_multi_line_function() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        shell
+            .run(r#"printf '%s\n' 'cat <<EOF' 'one' 'two' 'EOF' 'f() {' '  echo f' '}' 'echo )' 'echo never' > /tmp/lines.sh"#)
+            .await;
+        let out = shell.run(". /tmp/lines.sh").await;
+        assert_eq!(out.stdout.trim(), "one\ntwo");
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr.contains("/tmp/lines.sh: line 8: unexpected ')'"),
+            "stderr: {}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn multi_line_input_stops_at_an_invalid_statement_and_names_its_line() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        let out = shell.run("echo one\necho )\necho three").await;
+        assert_eq!(out.stdout.trim(), "one");
+        assert_eq!(out.status, 1);
+        assert!(
+            out.stderr.contains("strands-shell: line 2: unexpected ')'"),
+            "stderr: {}",
+            out.stderr
+        );
+    }));
+}
+
 // ── exec builtin ────────────────────────────────────────────────────
 
 expect!(exec_command, "exec echo hello", "hello");
