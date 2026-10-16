@@ -7853,7 +7853,9 @@ fn max_output_truncates_in_capture_mode() {
     }));
 }
 
-// ── empty pipeline stage does not panic ───────────────────────────#[test]
+// ── empty pipeline stage does not panic ───────────────────────────
+
+#[test]
 fn empty_pipeline_stage_no_panic() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
