@@ -8045,6 +8045,99 @@ fn uniq_skip_chars_multibyte_no_panic() {
         assert_eq!(out.stdout, "éx\néy\n");
     }));
 }
+
+// Regression: a spawned host program must run in its own session. Without
+// `setsid()`, the child inherits the test runner's session and an interactive
+// open of `/dev/tty` can stop the whole box with SIGTTIN.
+#[cfg(unix)]
+#[test]
+fn host_program_runs_in_its_own_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let parent_sid = unsafe { libc::getsid(0) };
+        assert!(parent_sid >= 0, "getsid(0) failed");
+
+        // The probe reports its own session with `os.getsid`, so it needs a real interpreter on
+        // the host. Resolve one rather than assume a fixed path, and skip when none is present:
+        // an interpreter-dependent test skips rather than fails.
+        let Some(python) = find_python3() else {
+            eprintln!("skipping: no python3 interpreter on this host");
+            return;
+        };
+
+        // `shell:spawn` resolves against the operator's host `PATH`, not the Shell's `proc.env`
+        // (see `exec.rs::host_path_lookup`), so the probe must sit in a directory already on the
+        // host `PATH`. Write it into the first writable one under a unique name, and skip when none
+        // is writable — an environment-dependent test skips rather than fails. A per-Shell
+        // `env("PATH")` no longer steers resolution.
+        let probe_name = format!(
+            "strands-shell-session-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        let script = format!("#!{python}\nimport os\nprint(os.getpid(), os.getsid(0))\n");
+        let Some(probe) = host_path
+            .split(':')
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| std::path::Path::new(dir).join(&probe_name))
+            .find(|candidate| std::fs::write(candidate, &script).is_ok())
+        else {
+            eprintln!("skipping: no writable directory on the host PATH");
+            return;
+        };
+        let mut perms = std::fs::metadata(&probe).unwrap().permissions();
+        perms.set_mode(0o755);
+        if let Err(error) = std::fs::set_permissions(&probe, perms) {
+            let _ = std::fs::remove_file(&probe);
+            panic!("failed to chmod the probe: {error}");
+        }
+
+        // `spawn_host` now fails closed, so a hookless Shell refuses a host binary.
+        // This test measures the built-in `fork`+`exec`'s session detachment, so it installs
+        // `builtin_spawn_host` as an explicit hook — the supported way to opt into uncontained exec.
+        let hook: strands_shell::os::HostSpawner =
+            std::sync::Arc::new(|spawn| Box::pin(strands_shell::os::builtin_spawn_host(spawn)));
+        let mut shell = Shell::builder().host_spawner(hook).build().unwrap();
+        // `/tmp` exists in both the VFS and on the host, so the spawned child gets a host cwd that
+        // resolves. Run both commands, then remove the probe BEFORE asserting: it sits on a shared
+        // host `PATH` directory, so a failed assertion must not leak a `0o755` executable there.
+        let cd = shell.run("cd /tmp").await;
+        let out = shell.run(&probe_name).await;
+        let _ = std::fs::remove_file(&probe);
+
+        assert_eq!(cd.status, 0, "cd /tmp failed: {}", cd.stderr);
+        assert_eq!(out.status, 0, "stderr: {}", out.stderr);
+
+        let mut fields = out.stdout.split_whitespace();
+        let pid: libc::pid_t = fields
+            .next()
+            .expect("missing pid from ps output")
+            .parse()
+            .expect("pid was not numeric");
+        let sid: libc::pid_t = fields
+            .next()
+            .expect("missing sid from ps output")
+            .parse()
+            .expect("sid was not numeric");
+        assert!(
+            fields.next().is_none(),
+            "unexpected extra ps output: {:?}",
+            out.stdout
+        );
+        assert_eq!(sid, pid, "child did not become its own session leader");
+        assert_ne!(
+            sid, parent_sid,
+            "child inherited the parent session instead of detaching"
+        );
+    }));
+}
+
 // Fail closed: with no `host_spawner` hook installed there is no contained path, so a
 // host binary is REFUSED rather than run uncontained. This is the guarantee that made the box's
 // containment a property of construction — a Shell that forgot to wire the hook cannot silently run
@@ -8074,4 +8167,24 @@ fn a_host_binary_is_refused_when_no_spawn_hook_is_installed() {
             out.stderr
         );
     }));
+}
+
+// Return the first `python3` that exists, from the common install locations and `PATH`, or `None`.
+#[cfg(unix)]
+fn find_python3() -> Option<String> {
+    let mut roots: Vec<String> = ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/bin"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Ok(path) = std::env::var("PATH") {
+        roots.extend(
+            path.split(':')
+                .filter(|d| !d.is_empty())
+                .map(str::to_string),
+        );
+    }
+    roots
+        .into_iter()
+        .map(|d| format!("{d}/python3"))
+        .find(|p| std::path::Path::new(p).is_file())
 }

@@ -1439,7 +1439,8 @@ pub trait Kernel: Send + Sync {
 ///
 /// The default behind [`Kernel::spawn_host`], and what a [`crate::vfs_kernel::VfsKernel`] with no
 /// [`HostSpawner`] installed falls back to. The environment is exactly [`HostSpawn::env`] — cleared
-/// first, never inherited — the working directory is [`HostSpawn::cwd`], and `stdin` is null.
+/// first, never inherited — the working directory is [`HostSpawn::cwd`], `stdin` is null, and the
+/// child is detached into a new session so it cannot suspend the caller by opening `/dev/tty`.
 pub async fn builtin_spawn_host(spawn: HostSpawn) -> io::Result<HostSpawnOutcome> {
     let mut command = tokio::process::Command::new(&spawn.program);
     #[cfg(unix)]
@@ -1456,6 +1457,15 @@ pub async fn builtin_spawn_host(spawn: HostSpawn) -> io::Result<HostSpawnOutcome
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    // SAFETY: `setsid` is async-signal-safe, takes no arguments, and is the only action in the
+    // child between fork and exec.
+    unsafe {
+        command.pre_exec(|| match libc::setsid() {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
     let output = command.output().await?;
     Ok(HostSpawnOutcome {
         status: output.status.code().unwrap_or_else(|| {
