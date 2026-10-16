@@ -627,6 +627,20 @@ fn expand_part_split<'a>(
                     segments.last_mut().unwrap().push(&val, splittable, false);
                 }
             }
+            WordPart::VarOp(name, op, word, colon) if op == "-" || op == "+" => {
+                let val = resolve_var(proc, name);
+                let is_unset_or_null = match &val {
+                    None => true,
+                    Some(v) => *colon && v.is_empty(),
+                };
+                if is_unset_or_null == (op == "-") {
+                    for p in word {
+                        expand_part_split(os.clone(), proc, p, segments, ifs, quoted).await;
+                    }
+                } else if let Some(v) = val.filter(|_| op == "-") {
+                    segments.last_mut().unwrap().push(&v, !quoted, false);
+                }
+            }
             WordPart::VarOp(..)
             | WordPart::Backtick(_)
             | WordPart::DollarParen(_)
@@ -646,8 +660,15 @@ fn expand_part_split<'a>(
                     expand_part_split(os.clone(), proc, p, segments, ifs, true).await;
                 }
             }
+            WordPart::ArrayLiteral(_) => refuse_array(proc),
         }
     })
+}
+
+/// Arrays parse so that a function body holding one defines as in bash; running one is refused.
+fn refuse_array(proc: &mut Process) {
+    proc.err_msg("strands-shell: arrays are not supported");
+    proc.nounset_error = true;
 }
 
 /// Perform IFS field splitting on a single segment.
@@ -1396,8 +1417,19 @@ fn resolve_var(proc: &Process, name: &str) -> Option<String> {
                 None
             }
         }
-        _ => proc.env.get(name).cloned(),
+        _ => match split_subscript(name) {
+            Some((base, "@" | "*" | "0")) => proc.env.get(base).cloned(),
+            Some(_) => None,
+            None => proc.env.get(name).cloned(),
+        },
     }
+}
+
+/// `name[subscript]` split in two, or `None` for a plain name.
+fn split_subscript(name: &str) -> Option<(&str, &str)> {
+    let open = name.find('[')?;
+    let inner = name[open + 1..].strip_suffix(']')?;
+    Some((&name[..open], inner))
 }
 
 /// Check nounset: if `set -u` is active and the variable is unset, print error and set flag.
@@ -1412,7 +1444,7 @@ fn check_nounset(proc: &mut Process, name: &str) -> bool {
         n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => return false,
         _ => {}
     }
-    if proc.env.get(name).is_none() {
+    if resolve_var(proc, name).is_none() {
         proc.err_msg(&format!("strands-shell: {name}: parameter not set"));
         proc.nounset_error = true;
         return true;
@@ -1445,7 +1477,10 @@ fn expand_part<'a>(
                 };
                 match op.as_str() {
                     "len" => {
-                        let len = val.as_deref().unwrap_or("").len();
+                        let len = match split_subscript(name) {
+                            Some((_, "@" | "*")) => usize::from(val.is_some()),
+                            _ => val.as_deref().unwrap_or("").len(),
+                        };
                         out.push_str(&len.to_string());
                     }
                     "-" => {
@@ -1538,6 +1573,7 @@ fn expand_part<'a>(
                     expand_part(os.clone(), proc, p, out).await;
                 }
             }
+            WordPart::ArrayLiteral(_) => refuse_array(proc),
         }
     })
 }
@@ -2963,10 +2999,16 @@ async fn run_pipeline(
         literal_args.push(literal);
         let mut env = Vec::new();
         for (k, v) in &cmd.env {
-            env.push((
-                expand_word(os.clone(), shell_proc, k).await,
-                expand_word(os.clone(), shell_proc, v).await,
-            ));
+            let key = expand_word(os.clone(), shell_proc, k).await;
+            let value = expand_word(os.clone(), shell_proc, v).await;
+            match key.strip_suffix('+') {
+                Some(base) => {
+                    let mut joined = shell_proc.env.get(base).cloned().unwrap_or_default();
+                    joined.push_str(&value);
+                    env.push((base.to_string(), joined));
+                }
+                None => env.push((key, value)),
+            }
         }
         expanded_env.push(env);
         let mut redirs = Vec::new();

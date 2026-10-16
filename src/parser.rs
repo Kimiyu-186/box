@@ -28,6 +28,8 @@ pub enum WordPart {
     Tilde(String),
     /// A double-quoted region containing expandable parts.
     DoubleQuoted(Vec<WordPart>),
+    /// `name=(…)` or `name+=(…)` — the parenthesised list, kept as text.
+    ArrayLiteral(String),
 }
 
 /// A word is a sequence of parts that get concatenated after expansion.
@@ -41,7 +43,7 @@ pub type Word = Vec<WordPart>;
 #[must_use]
 pub fn word_is_literal(word: &[WordPart]) -> bool {
     word.iter().all(|part| match part {
-        WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
+        WordPart::Literal(_) | WordPart::SingleQuoted(_) | WordPart::ArrayLiteral(_) => true,
         WordPart::DoubleQuoted(parts) => word_is_literal(parts),
         WordPart::Var(_)
         | WordPart::VarOp(..)
@@ -592,6 +594,20 @@ fn collect_var_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> String 
             break;
         }
     }
+    if !name.is_empty() && chars.peek() == Some(&'[') {
+        let mut lookahead = chars.clone();
+        let mut subscript = String::new();
+        for ch in lookahead.by_ref() {
+            subscript.push(ch);
+            if ch == ']' {
+                break;
+            }
+        }
+        if subscript.ends_with(']') {
+            name.push_str(&subscript);
+            *chars = lookahead;
+        }
+    }
     name
 }
 
@@ -648,24 +664,10 @@ fn collect_brace_word(
             parts.push(WordPart::SingleQuoted(sq));
         } else if ch == '"' {
             chars.next();
-            // Simplified: collect as literal for now
-            let mut dq = String::new();
-            loop {
-                match chars.next() {
-                    Some('"') => break,
-                    Some('\\') => match chars.next() {
-                        Some(c @ ('$' | '`' | '"' | '\\')) => dq.push(c),
-                        Some(c) => {
-                            dq.push('\\');
-                            dq.push(c);
-                        }
-                        None => return Err(ParseError::incomplete("unterminated double quote")),
-                    },
-                    Some(c) => dq.push(c),
-                    None => return Err(ParseError::incomplete("unterminated double quote")),
-                }
+            if !lit.is_empty() {
+                parts.push(WordPart::Literal(std::mem::take(&mut lit)));
             }
-            lit.push_str(&dq);
+            parts.push(collect_double_quoted(chars)?);
         } else if ch == '`' {
             chars.next();
             if !lit.is_empty() {
@@ -720,6 +722,57 @@ fn collect_dollar_paren(
 
 /// Collect a $VAR, ${VAR}, ${VAR op WORD}, or $(cmd) from the char stream.
 /// Returns a WordPart or None (bare $).
+/// Collect a double-quoted region. Assumes the opening `"` has been consumed.
+fn collect_double_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<WordPart, ParseError> {
+    let mut dq_parts: Vec<WordPart> = Vec::new();
+    let mut dq_lit = String::new();
+    loop {
+        match chars.next() {
+            Some('"') => break,
+            Some('\\') => match chars.next() {
+                Some(c @ ('$' | '`' | '"' | '\\')) => dq_lit.push(c),
+                Some('\n') => {} // line continuation
+                Some(c) => {
+                    dq_lit.push('\\');
+                    dq_lit.push(c);
+                }
+                None => return Err(ParseError::incomplete("unterminated escape")),
+            },
+            Some('$') => match collect_dollar(chars)? {
+                Some(part) => {
+                    if !dq_lit.is_empty() {
+                        dq_parts.push(WordPart::Literal(std::mem::take(&mut dq_lit)));
+                    }
+                    dq_parts.push(part);
+                }
+                None => dq_lit.push('$'),
+            },
+            Some('`') => {
+                if !dq_lit.is_empty() {
+                    dq_parts.push(WordPart::Literal(std::mem::take(&mut dq_lit)));
+                }
+                let mut cmd = String::new();
+                loop {
+                    match chars.next() {
+                        Some('`') => break,
+                        Some(c) => cmd.push(c),
+                        None => return Err(ParseError::incomplete("unterminated backtick")),
+                    }
+                }
+                dq_parts.push(WordPart::Backtick(cmd));
+            }
+            Some(c) => dq_lit.push(c),
+            None => return Err(ParseError::incomplete("unterminated double quote")),
+        }
+    }
+    if !dq_lit.is_empty() {
+        dq_parts.push(WordPart::Literal(dq_lit));
+    }
+    Ok(WordPart::DoubleQuoted(dq_parts))
+}
+
 fn collect_dollar(
     chars: &mut std::iter::Peekable<std::str::Chars>,
 ) -> Result<Option<WordPart>, ParseError> {
@@ -909,6 +962,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 }
 
                 while let Some(&ch) = chars.peek() {
+                    if ch == '(' && parts.is_empty() && is_assignment_prefix(&literal) {
+                        chars.next();
+                        parts.push(WordPart::Literal(std::mem::take(&mut literal)));
+                        parts.push(WordPart::ArrayLiteral(collect_array_literal(&mut chars)?));
+                        continue;
+                    }
                     if " \t\n\r|;&<>()#".contains(ch) {
                         break;
                     }
@@ -950,67 +1009,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                                 parts.push(WordPart::Literal(std::mem::take(&mut literal)));
                             }
                             chars.next();
-                            let mut dq_parts: Vec<WordPart> = Vec::new();
-                            let mut dq_lit = String::new();
-                            loop {
-                                match chars.next() {
-                                    Some('"') => break,
-                                    Some('\\') => match chars.next() {
-                                        Some(c @ ('$' | '`' | '"' | '\\')) => dq_lit.push(c),
-                                        Some('\n') => {} // line continuation
-                                        Some(c) => {
-                                            dq_lit.push('\\');
-                                            dq_lit.push(c);
-                                        }
-                                        None => {
-                                            return Err(ParseError::incomplete(
-                                                "unterminated escape",
-                                            ));
-                                        }
-                                    },
-                                    Some('$') => match collect_dollar(&mut chars)? {
-                                        Some(part) => {
-                                            if !dq_lit.is_empty() {
-                                                dq_parts.push(WordPart::Literal(std::mem::take(
-                                                    &mut dq_lit,
-                                                )));
-                                            }
-                                            dq_parts.push(part);
-                                        }
-                                        None => dq_lit.push('$'),
-                                    },
-                                    Some('`') => {
-                                        if !dq_lit.is_empty() {
-                                            dq_parts.push(WordPart::Literal(std::mem::take(
-                                                &mut dq_lit,
-                                            )));
-                                        }
-                                        let mut cmd = String::new();
-                                        loop {
-                                            match chars.next() {
-                                                Some('`') => break,
-                                                Some(c) => cmd.push(c),
-                                                None => {
-                                                    return Err(ParseError::incomplete(
-                                                        "unterminated backtick",
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                        dq_parts.push(WordPart::Backtick(cmd));
-                                    }
-                                    Some(c) => dq_lit.push(c),
-                                    None => {
-                                        return Err(ParseError::incomplete(
-                                            "unterminated double quote",
-                                        ));
-                                    }
-                                }
-                            }
-                            if !dq_lit.is_empty() {
-                                dq_parts.push(WordPart::Literal(dq_lit));
-                            }
-                            parts.push(WordPart::DoubleQuoted(dq_parts));
+                            parts.push(collect_double_quoted(&mut chars)?);
                         }
                         '$' => {
                             chars.next();
@@ -1073,6 +1072,74 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     }
 
     Ok(tokens)
+}
+
+/// Whether `text` is `name=`, `name+=`, or `name[index]=` — the spelling an array literal follows.
+fn is_assignment_prefix(text: &str) -> bool {
+    let Some(name) = text.strip_suffix('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let name = match name.find('[') {
+        Some(open) if name.ends_with(']') => &name[..open],
+        Some(_) => return false,
+        None => name,
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Collect the text of an array literal. Assumes the opening `(` has been consumed.
+fn collect_array_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<String, ParseError> {
+    let mut text = String::new();
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    loop {
+        let Some(ch) = chars.next() else {
+            return Err(ParseError::incomplete("unterminated array literal"));
+        };
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else if ch == '\\' && q == '"' {
+                    text.push(ch);
+                    if let Some(next) = chars.next() {
+                        text.push(next);
+                    }
+                    continue;
+                }
+                text.push(ch);
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    text.push(ch);
+                }
+                '\\' => {
+                    text.push(ch);
+                    if let Some(next) = chars.next() {
+                        text.push(next);
+                    }
+                }
+                '(' => {
+                    depth += 1;
+                    text.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(text);
+                    }
+                    text.push(ch);
+                }
+                _ => text.push(ch),
+            },
+        }
+    }
 }
 
 /// Get the Word representation from a token.
@@ -1270,6 +1337,29 @@ fn parse_command_line<'a>(
 
         match &tokens[i] {
             Token::RParen => return Err(ParseError::invalid("unexpected ')'")),
+            // Function definition: function name { body; } or function name() { body; }
+            Token::Word(keyword)
+                if at_start
+                    && keyword == "function"
+                    && matches!(tokens.get(i + 1), Some(Token::Word(name)) if !is_reserved(&tokens[i + 1]) && !name.is_empty()) =>
+            {
+                let Token::Word(fname) = &tokens[i + 1] else {
+                    unreachable!()
+                };
+                let fname = fname.clone();
+                i += 2;
+                if tokens.get(i) == Some(&Token::LParen)
+                    && tokens.get(i + 1) == Some(&Token::RParen)
+                {
+                    i += 2;
+                }
+                let rest = expect_word(&tokens[i..], "{")?;
+                let (body, rest) = parse_command_line(rest, &["}"])?;
+                let rest = expect_word(rest, "}")?;
+                i = tokens.len() - rest.len();
+                result.push((Item::Function { name: fname, body }, None));
+                continue;
+            }
             // Function definition: name() { body; }
             Token::Word(name)
                 if at_start
@@ -1759,6 +1849,8 @@ mod tests {
             "{ echo",
             "f() {",
             "f()",
+            "function f {",
+            "arr=(a b",
             "if true; then echo",
             "while true",
             "for",
