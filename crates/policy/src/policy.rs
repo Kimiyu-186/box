@@ -172,8 +172,12 @@ impl PolicyEngine {
     }
 
     #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
-    pub(crate) fn pack_bound_to(&self, program_path: &str) -> Option<&crate::pack::Pack> {
-        self.packs.bound_to(program_path)
+    pub(crate) fn pack_coverage(
+        &self,
+        program_path: &str,
+        name: &str,
+    ) -> Option<crate::pack::PackCoverage<'_>> {
+        self.packs.coverage(program_path, name)
     }
 
     /// The pack refinement of one permitted `shell:spawn`: only a `forbid` or a fault refuses it.

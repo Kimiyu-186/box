@@ -1,5 +1,6 @@
-# Rendered by demo.sh: <DEMO> becomes the scratch directory, <TOOLCHAIN> the rustup toolchain
-# directory that `rustup which cargo` names, and the AGENT_SCRIPT marker the commands to run.
+# Rendered by demo.sh: <DEMO> becomes the scratch directory, <CARGO_BIN> the directory of the rustup
+# proxies (~/.cargo/bin), <RUSTUP_HOME> the rustup home (~/.rustup), and the AGENT_SCRIPT marker the
+# commands to run.
 # The pack is the full example pack, examples/packs/cargo.pack.toml.
 name = "packs-demo-cargo"
 box_dir = "<DEMO>/state"
@@ -14,13 +15,22 @@ run() { zsh -c "$1"; echo "    -> exit=$? : $1"; }
 workspace = "<DEMO>/work/hello"
 env = { PATH = "/usr/bin:/bin", HOME = "<DEMO>/home", TERM = "dumb" }
 
-# The toolchain's own cargo, not the rustup proxy: `run` starts with <TOOLCHAIN>/bin first on PATH,
-# so the box's shell resolves `cargo` to this file. CARGO_HOME is a scratch directory, so the
-# tool never reaches the operator's ~/.cargo.
+# The rustup proxy: `cargo` and `rustc` are both symlinks to one `rustup` file. The cargo pack binds
+# that file only when it is called as `cargo`, so `rustc` is not parsed as cargo. `run` starts with
+# <CARGO_BIN> first on PATH, so the box's shell resolves both names there. CARGO_HOME is a scratch
+# directory, so the tool never writes the operator's ~/.cargo.
 [tool.cargo]
-command = ["<TOOLCHAIN>/bin/cargo"]
-env = { HOME = "<DEMO>/home", CARGO_HOME = "<DEMO>/cargo-home", RUSTC = "<TOOLCHAIN>/bin/rustc", TMPDIR = "<DEMO>/tmp" }
+command = ["<CARGO_BIN>/cargo"]
+env = { HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", CARGO_HOME = "<DEMO>/cargo-home", TMPDIR = "<DEMO>/tmp" }
 
 [tool.cargo.filesystem]
-read = ["<DEMO>/work", "<DEMO>/cargo-home", "<DEMO>/tmp", "<TOOLCHAIN>"]
+read = ["<DEMO>/work", "<DEMO>/cargo-home", "<DEMO>/tmp", "<CARGO_BIN>", "<RUSTUP_HOME>"]
 write = ["<DEMO>/work", "<DEMO>/cargo-home", "<DEMO>/tmp"]
+
+[tool.rustc]
+command = ["<CARGO_BIN>/rustc"]
+env = { HOME = "<DEMO>/home", PATH = "<CARGO_BIN>:/usr/bin:/bin", RUSTUP_HOME = "<RUSTUP_HOME>", TMPDIR = "<DEMO>/tmp" }
+
+[tool.rustc.filesystem]
+read = ["<DEMO>/work", "<DEMO>/tmp", "<CARGO_BIN>", "<RUSTUP_HOME>"]
+write = ["<DEMO>/tmp"]

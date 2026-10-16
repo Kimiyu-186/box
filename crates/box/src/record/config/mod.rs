@@ -883,23 +883,26 @@ impl Record {
         paths
     }
 
-    /// Every pack bound to the resolved program identity of each `[tool]` that runs its program.
+    /// Every pack bound to the resolved program file and command name of each `[tool]` that runs its
+    /// program, and every other `[tool]` name declared against its file.
     pub(crate) fn pack_bindings(&self, packs: &[policy::Pack]) -> policy::PackBindings {
         let mut bindings = policy::PackBindings::new(packs.to_vec());
-        for pack in packs {
-            for spec in self.tool.values() {
-                if !runs_program(spec, pack.program()) {
-                    continue;
+        for spec in self.tool.values() {
+            let Ok(program) =
+                crate::run::contain::executable::resolve(spec.program(), &spec.search_path())
+            else {
+                continue;
+            };
+            let path = program.granted_path().to_string_lossy().into_owned();
+            let name = Path::new(spec.program()).file_name().map_or_else(
+                || spec.program().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            bindings.declare(path.clone(), name.clone());
+            for pack in packs {
+                if runs_program(spec, pack.program()) {
+                    bindings.bind(path.clone(), name.clone(), pack.name());
                 }
-                let Ok(program) =
-                    crate::run::contain::executable::resolve(spec.program(), &spec.search_path())
-                else {
-                    continue;
-                };
-                bindings.bind(
-                    program.granted_path().to_string_lossy().into_owned(),
-                    pack.name(),
-                );
             }
         }
         bindings

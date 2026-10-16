@@ -7,6 +7,9 @@
 #   demo.sh allow      # no pack rule: the push reaches the bare remote
 #   demo.sh nopack     # the push forbid stays but box.toml installs no pack: the box refuses to start
 #   demo.sh unmodeled  # forbid Tool::git::Action::"unmodeled": `git log -1` (the -<n> form) is refused
+#   demo.sh symlink    # the box shell refuses `ln -s /usr/bin/git`, because the target is outside its
+#                      # binds. A link a leaf could plant (demo.sh plants bin/g) is the git file under a
+#                      # name no [tool] declares, so it decides as unmodeled and is refused
 #   demo.sh baseline   # no pack and no pack rule: every command decides as it does without packs
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
@@ -38,6 +41,8 @@ git remote add origin "$DEMO/work/remote.git"
 git remote add upstream "$DEMO/work/upstream.git"
 git push -q -u origin main
 $G commit -q --allow-empty -m "second commit"
+# A link a tool leaf with a write grant on the workspace could make; the box shell cannot.
+[ "$MODE" = symlink ] && mkdir bin && ln -s /usr/bin/git bin/g
 cd "$DEMO" || exit 1
 
 case "$MODE" in
@@ -74,6 +79,21 @@ forbid (principal, action == Tool::git::Action::"unmodeled", resource);'
     SCRIPT='run "git status --short --branch"
 run "git log -1 --oneline"
 run "git log -n 1 --oneline"' ;;
+  symlink)
+    RULES='@id("spawn_git_file")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program_path == "/usr/bin/git" };
+
+@id("link_in_workspace")
+permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
+when { context.input.path like "*packs-demo-git/work/repo/*g" || context.input.path == "/usr/bin/git" };
+
+@id("no_unmodeled_git")
+forbid (principal, action == Tool::git::Action::"unmodeled", resource);'
+    SCRIPT='run "ln -s /usr/bin/git g"
+run "git status --short --branch"
+run "./bin/g status --short --branch"
+run "$PWD/bin/g status --short --branch"' ;;
   allow|baseline)
     RULES=''
     SCRIPT='run "git status --short --branch"

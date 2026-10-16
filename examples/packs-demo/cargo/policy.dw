@@ -1,10 +1,14 @@
-// The Strands Shell may run its builtins, and may start cargo.
+// The Strands Shell may run its builtins, and may start cargo and rustc.
 @id("shell_builtins")
 permit (principal, action == Box::Action::"shell:exec", resource);
 
 @id("spawn_cargo")
 permit (principal, action == Box::Action::"shell:spawn", resource)
 when { context.input.program == "cargo" };
+
+@id("spawn_rustc")
+permit (principal, action == Box::Action::"shell:spawn", resource)
+when { context.input.program == "rustc" };
 
 @id("demo_read")
 permit (principal, action == Box::Action::"fs:read", resource)

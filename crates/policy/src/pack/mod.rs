@@ -276,11 +276,20 @@ pub(crate) fn is_identifier(raw: &str) -> bool {
     !raw.is_empty() && cedar_identifier(raw) == raw
 }
 
-/// The installed packs, and the resolved program paths each one is bound to.
+/// The installed packs, each bound to a resolved program file and the name it is called by.
 #[derive(Debug, Clone, Default)]
 pub struct PackBindings {
     packs: Vec<std::sync::Arc<Pack>>,
-    by_path: std::collections::BTreeMap<String, usize>,
+    by_program: std::collections::BTreeMap<(String, String), usize>,
+    known_names: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+/// How a pack covers one spawn.
+pub(crate) enum PackCoverage<'a> {
+    /// The file and the name are bound to this pack: parse with its grammar.
+    Parsed(&'a Pack),
+    /// The file is bound to this pack under a name no `[tool]` declares.
+    Unmodeled(&'a Pack),
 }
 
 impl PackBindings {
@@ -289,14 +298,25 @@ impl PackBindings {
     pub fn new(packs: Vec<Pack>) -> Self {
         Self {
             packs: packs.into_iter().map(std::sync::Arc::new).collect(),
-            by_path: std::collections::BTreeMap::new(),
+            by_program: std::collections::BTreeMap::new(),
+            known_names: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Bind the pack named `pack` to one resolved program path.
-    pub fn bind(&mut self, program_path: impl Into<String>, pack: &str) {
+    /// Declare that a `[tool]` runs the file at `program_path` under the name `name`.
+    pub fn declare(&mut self, program_path: impl Into<String>, name: impl Into<String>) {
+        self.known_names
+            .entry(program_path.into())
+            .or_default()
+            .insert(name.into());
+    }
+
+    /// Bind the pack named `pack` to one resolved program file called by `name`.
+    pub fn bind(&mut self, program_path: impl Into<String>, name: impl Into<String>, pack: &str) {
         if let Some(index) = self.packs.iter().position(|loaded| loaded.name() == pack) {
-            self.by_path.insert(program_path.into(), index);
+            let (program_path, name) = (program_path.into(), name.into());
+            self.declare(program_path.clone(), name.clone());
+            self.by_program.insert((program_path, name), index);
         }
     }
 
@@ -306,15 +326,15 @@ impl PackBindings {
         &self.packs
     }
 
-    /// The resolved program paths each pack is bound to.
+    /// The resolved program file, the name, and the pack of each binding.
     #[must_use]
-    pub fn bound_paths(&self) -> Vec<(&str, &str)> {
-        self.by_path
+    pub fn bound_programs(&self) -> Vec<(&str, &str, &str)> {
+        self.by_program
             .iter()
-            .filter_map(|(path, index)| {
+            .filter_map(|((path, name), index)| {
                 self.packs
                     .get(*index)
-                    .map(|pack| (path.as_str(), pack.name()))
+                    .map(|pack| (path.as_str(), name.as_str(), pack.name()))
             })
             .collect()
     }
@@ -323,10 +343,25 @@ impl PackBindings {
         self.packs.iter().map(|pack| pack.schema()).collect()
     }
 
-    pub(crate) fn bound_to(&self, program_path: &str) -> Option<&Pack> {
-        self.by_path
+    pub(crate) fn coverage(&self, program_path: &str, name: &str) -> Option<PackCoverage<'_>> {
+        let pack = |index: &usize| self.packs.get(*index).map(std::convert::AsRef::as_ref);
+        if let Some(index) = self
+            .by_program
+            .get(&(program_path.to_string(), name.to_string()))
+        {
+            return pack(index).map(PackCoverage::Parsed);
+        }
+        if self
+            .known_names
             .get(program_path)
-            .and_then(|index| self.packs.get(*index))
-            .map(std::convert::AsRef::as_ref)
+            .is_some_and(|names| names.contains(name))
+        {
+            return None;
+        }
+        self.by_program
+            .iter()
+            .find(|((path, _), _)| path == program_path)
+            .and_then(|(_, index)| pack(index))
+            .map(PackCoverage::Unmodeled)
     }
 }

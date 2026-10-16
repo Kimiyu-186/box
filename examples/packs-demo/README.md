@@ -16,11 +16,13 @@ binary) and recreates its scratch directory under `/tmp` (set `DEMO` to move it)
 bash examples/packs-demo/git/demo.sh <mode>
 ```
 
-The modes are `force`, `upstream`, `forbid`, `allow`, `nopack`, `unmodeled`, and `baseline`. They
+The modes are `force`, `upstream`, `forbid`, `allow`, `nopack`, `unmodeled`, `symlink`, and
+`baseline`. They
 show that one rule on the `force_push` effect catches every way to spell a force push, that a rule
 can read a parsed field such as `remote`, that a pack action can be refused outright, that a box
 with the pack but no pack rule behaves as before, that a policy naming a pack the box does not
-install will not load, and that a command the pack does not model decides as `unmodeled`.
+install will not load, that a command the pack does not model decides as `unmodeled`, and that the git file run under a
+name no `[tool]` declares (a planted `bin/g -> /usr/bin/git`) also decides as `unmodeled`.
 
 ## cargo
 
@@ -29,8 +31,9 @@ bash examples/packs-demo/cargo/demo.sh
 ```
 
 One rule on the `update_lockfile` effect refuses `cargo build`, `cargo test`, `cargo t`, and
-`cargo update`, and lets `cargo build --locked` run. `Cargo.lock` is unchanged at the end. The box
-runs the toolchain's own `cargo`, not the rustup proxy.
+`cargo update`, and lets `cargo build --locked` run. `Cargo.lock` is unchanged at the end. `cargo`
+and `rustc` are the rustup proxies in `~/.cargo/bin`, two names for one file. The pack binds the
+file only under the name `cargo`, so `rustc --version` runs with no cargo action.
 
 ## aws
 
@@ -51,9 +54,8 @@ bash examples/packs-demo/temporal/demo.sh unscoped   # the effect rule over ever
 
 `git push` is allowed only after a passing `cargo test` in the last hour, and a rule over
 `Tool::cargo::Action::"*"` (every cargo action) refuses any cargo command that can rewrite
-`Cargo.lock`. A push before a test, after a failing test, and after `cargo +stable test` (which
-the toolchain cargo cannot run, so it exits non-zero) is refused. A push after a passing
-`cargo t --locked` lands. A second `strands-box run` pushes again with no test, because history is
+`Cargo.lock`. A push before a test and after a failing test is refused. `cargo` is the rustup proxy,
+so a passing `cargo +stable test --locked` runs, and the push after it lands. A second `strands-box run` pushes again with no test, because history is
 durable across runs.
 
 `unscoped` writes the same effect rule over `action`, with no scope. The box refuses to start,

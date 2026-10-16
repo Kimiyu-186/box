@@ -7,9 +7,9 @@
 #   1. git push before any test                 -> refused by push_after_tests
 #   2. cargo build, cargo test (no --locked)    -> refused by lockfile_is_frozen; git status runs
 #   3. cargo test --locked that fails, git push -> the push is still refused
-#   4. cargo +stable test --locked              -> decided as the test action; the toolchain cargo
-#                                                  is not the rustup proxy, so it exits non-zero
-#   5. cargo t --locked that passes, git push   -> allowed, and the push lands in the bare remote
+#   4. cargo +stable test --locked that passes,  -> allowed, and the push lands in the bare remote;
+#      then git push                               cargo is the rustup proxy, so +stable runs
+#   5. cargo t --locked that passes, git push   -> allowed; nothing new to push
 # Run 2 (a new `strands-box run` on the same box_dir): a new commit, and git push with no test in
 #   this run -> allowed, because the passing test from run 1 is in the durable history.
 #
@@ -30,6 +30,11 @@ esac
 MODE=${1:-run}
 # The toolchain outside this repository's rust-toolchain.toml.
 TOOLCHAIN=$(cd "$(dirname "$(cd /tmp && rustup which cargo)")/.." && pwd -P)
+CARGO_BIN=$(cd "${CARGO_HOME:-$HOME/.cargo}/bin" && pwd -P)
+RUSTUP_HOME=$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)
+# A toolchain name for `cargo +<name>`: stable when it is installed, else the default.
+PLUS=$(rustup toolchain list | awk '/^stable/ {print "stable"; exit}')
+PLUS=${PLUS:-$(rustup toolchain list | awk '/default/ {print $1; exit}')}
 
 rm -rf "$DEMO"
 mkdir -p "$DEMO/config" "$DEMO/home" "$DEMO/work" "$DEMO/cargo-home" "$DEMO/target" "$DEMO/tmp"
@@ -66,7 +71,7 @@ DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || echo "$DEMO/config")
 SDKROOT=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || echo "$DEMO/config")
 render() {
   sed -e "s#<DEMO>#$DEMO#g" -e "s#<DEVELOPER_DIR>#$DEVELOPER_DIR#g" -e "s#<SDKROOT>#$SDKROOT#g" \
-      -e "s#<TOOLCHAIN>#$TOOLCHAIN#g" -e "s#<AGENT_SCRIPT>#$2#g" "$HERE/$1"
+      -e "s#<CARGO_BIN>#$CARGO_BIN#g" -e "s#<RUSTUP_HOME>#$RUSTUP_HOME#g" -e "s#<AGENT_SCRIPT>#$2#g" "$HERE/$1"
 }
 cp "$HERE/policy.dw" "$DEMO/config/"
 cp "$REPO_ROOT/examples/packs/git.pack.toml" "$REPO_ROOT/examples/packs/cargo.pack.toml" "$DEMO/config/"
@@ -86,14 +91,15 @@ echo "### 3. a failing cargo test --locked, then git push"
 echo fail > verdict.txt
 zsh -c 'cargo test -q --locked; echo "cargo test --locked exit=$?"'
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
-echo "### 4. cargo +stable test --locked (the toolchain cargo is not the rustup proxy)"
+echo "### 4. a passing cargo +PLUS test --locked through the rustup proxy, then git push"
 echo pass > verdict.txt
-zsh -c 'cargo +stable test -q --locked; echo "cargo +stable test --locked exit=$?"'
+zsh -c 'cargo +PLUS test -q --locked; echo "cargo +PLUS test --locked exit=$?"'
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
 echo "### 5. a passing cargo t --locked, then git push"
 zsh -c 'cargo t -q --locked; echo "cargo t --locked exit=$?"'
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
 SH
+sed -i.bak "s#+PLUS#+$PLUS#g" "$DEMO/config/run1.sh" && rm -f "$DEMO/config/run1.sh.bak"
 cat > "$DEMO/config/run2.sh" <<'SH'
 echo "### 6. a new box run on the same box_dir: git push with no test in this run"
 zsh -c 'git push -q origin main; echo "git push exit=$?"'
@@ -104,7 +110,7 @@ run_box() {
   render box.toml "$DEMO/config/$1.sh" > "$DEMO/config/box.toml"
   echo "=== strands-box run ($1)"
   set +e
-  PATH="$TOOLCHAIN/bin:$PATH" "$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
+  PATH="$CARGO_BIN:$PATH" "$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
     grep -Ev '^strands-box: \[|^  (read|write|metadata|exec|enter|list|deny|read_file|write_file|\(no) '; fi
   echo "=== strands-box exit=${PIPESTATUS[0]}"
   set -e

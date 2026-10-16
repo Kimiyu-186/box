@@ -385,9 +385,21 @@ impl EffectInterceptor for ShellPolicyInterceptor {
                     ..
                 },
                 allowed @ Decision::Allow { .. },
-            ) => match self.policy.pack_bound_to(program_path) {
-                Some(pack) => {
-                    let parsed = pack.grammar().parse(args, Path::new(cwd));
+            ) => match self.policy.pack_coverage(
+                program_path,
+                Path::new(program)
+                    .file_name()
+                    .map_or(*program, |name| name.to_str().unwrap_or(program)),
+            ) {
+                Some(coverage) => {
+                    let (pack, parsed) = match coverage {
+                        crate::pack::PackCoverage::Parsed(pack) => {
+                            (pack, pack.grammar().parse(args, Path::new(cwd)))
+                        }
+                        crate::pack::PackCoverage::Unmodeled(pack) => {
+                            (pack, crate::pack::Parsed::Unmodeled)
+                        }
+                    };
                     let invocation = crate::pack::PackInvocation {
                         pack,
                         parsed: &parsed,

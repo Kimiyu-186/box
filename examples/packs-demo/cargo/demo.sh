@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run the cargo pack demo in a real box, with the full pack in examples/packs/cargo.pack.toml.
 # One forbid on Tool::cargo::Effect::"update_lockfile" refuses `cargo build`, `cargo test`,
-# `cargo t`, and `cargo update`, and lets `cargo build --locked` run.
+# `cargo t`, and `cargo update`, and lets `cargo build --locked` run. cargo and rustc are the rustup
+# proxies in ~/.cargo/bin, two names for one file, and `rustc --version` raises no cargo action.
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
 # DEMO names the scratch directory (default: /tmp/packs-demo-cargo). Both are recreated per run.
@@ -22,6 +23,8 @@ DEMO=$(cd "$DEMO" && pwd -P)
 cd "$DEMO" || exit 1
 # The toolchain outside this repository's rust-toolchain.toml.
 TOOLCHAIN=$(cd "$(dirname "$(rustup which cargo)")/.." && pwd -P)
+CARGO_BIN=$(cd "${CARGO_HOME:-$HOME/.cargo}/bin" && pwd -P)
+RUSTUP_HOME=$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)
 
 # A library crate with no dependencies, so nothing needs the network and nothing links.
 cat > "$DEMO/work/hello/Cargo.toml" <<'TOML'
@@ -38,22 +41,23 @@ run "cargo test"
 run "cargo t"
 run "cargo update"
 run "cargo build --locked"
-run "ls target/debug"'
-python3 - "$HERE" "$DEMO" "$TOOLCHAIN" "$SCRIPT" <<'PY'
+run "ls target/debug"
+run "rustc --version"'
+python3 - "$HERE" "$DEMO" "$CARGO_BIN" "$RUSTUP_HOME" "$SCRIPT" <<'PY'
 import sys
-here, demo, toolchain, script = sys.argv[1:]
+here, demo, cargo_bin, rustup_home, script = sys.argv[1:]
 for name in ("box.toml", "policy.dw"):
     text = open(f"{here}/{name}").read()
-    text = text.replace("<DEMO>", demo).replace("<TOOLCHAIN>", toolchain).replace("<AGENT_SCRIPT>", script)
+    text = text.replace("<DEMO>", demo).replace("<CARGO_BIN>", cargo_bin).replace("<RUSTUP_HOME>", rustup_home).replace("<AGENT_SCRIPT>", script)
     open(f"{demo}/config/{name}", "w").write(text)
 PY
 cp "$REPO_ROOT/examples/packs/cargo.pack.toml" "$DEMO/config/cargo.pack.toml"
 
-echo "=== cargo pack demo (toolchain $TOOLCHAIN)"
+echo "=== cargo pack demo (rustup proxies in $CARGO_BIN: cargo -> $(readlink "$CARGO_BIN/cargo"), rustc -> $(readlink "$CARGO_BIN/rustc"))"
 echo "--- Cargo.lock before: $(shasum "$DEMO/work/hello/Cargo.lock" | cut -c1-12)"
 echo "--- strands-box run"
 set +e
-PATH="$TOOLCHAIN/bin:$PATH" "$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
+PATH="$CARGO_BIN:$PATH" "$BOX" run --config "$DEMO/config/box.toml" 2>&1 | if [ -n "${FULL:-}" ]; then cat; else
   grep -Ev '^strands-box: \[|^  (read|write|metadata|exec|enter|list|deny|read_file|write_file|\(no) '; fi
 status=${PIPESTATUS[0]}
 set -e
