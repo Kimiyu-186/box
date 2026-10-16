@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "strands-shell"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "strands-shell-wasm"
@@ -23,7 +24,9 @@ path = "src/wasm_main.rs"
 required-features = ["wasm"]
 
 [features]
-python = ["pyo3"]
+default = ["cli"]
+cli = ["rustyline"]
+python = ["pyo3", "cli"]
 node = ["napi", "napi-derive", "napi-build"]
 wasm = []
 
@@ -50,7 +53,7 @@ napi = { version = "3", features = ["napi9", "tokio_rt"], optional = true }
 napi-derive = { version = "3", optional = true }
 pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
-rustyline = "18"
+rustyline = { version = "18", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "io-std", "fs", "time", "process"] }
 
 # ----- WASM dependencies -----
