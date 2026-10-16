@@ -1295,6 +1295,66 @@ impl VfsKernel {
         }
     }
 
+    /// Refuse a host symlink whose target is absolute or escapes the bind mount.
+    #[cfg(unix)]
+    fn verify_symlink_target(
+        target: &str,
+        host_link: &std::path::Path,
+        canon_base: &std::path::Path,
+    ) -> io::Result<()> {
+        let escaped = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "symlink target escapes the bind mount",
+            )
+        };
+        if target.starts_with('/') {
+            return Err(escaped());
+        }
+        let link_dir = host_link.parent().unwrap_or(canon_base);
+        let mut resolved = link_dir.canonicalize().map_err(|_| escaped())?;
+        if !resolved.starts_with(canon_base) {
+            return Err(escaped());
+        }
+        let mut exists = true;
+        for component in std::path::Path::new(target).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                    if !resolved.starts_with(canon_base) {
+                        return Err(escaped());
+                    }
+                    exists = match std::fs::symlink_metadata(&resolved) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                        Err(_) => return Err(escaped()),
+                    };
+                }
+                std::path::Component::Normal(name) => {
+                    resolved.push(name);
+                    if exists {
+                        match std::fs::symlink_metadata(&resolved) {
+                            Ok(metadata) if metadata.file_type().is_symlink() => {
+                                resolved = resolved.canonicalize().map_err(|_| escaped())?;
+                            }
+                            Ok(_) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                exists = false;
+                            }
+                            Err(_) => return Err(escaped()),
+                        }
+                    }
+                    if !resolved.starts_with(canon_base) {
+                        return Err(escaped());
+                    }
+                }
+                _ => return Err(escaped()),
+            }
+        }
+        Ok(())
+    }
+
     async fn symlink_effect(
         &self,
         proc: &Process,
@@ -1319,7 +1379,7 @@ impl VfsKernel {
             }
             #[cfg(unix)]
             {
-                let _ = &canon_base;
+                Self::verify_symlink_target(target, &host_link, &canon_base)?;
                 return Self::create_host_symlink(target, &host_link, expected);
             }
             #[cfg(not(unix))]
@@ -1383,9 +1443,19 @@ impl VfsKernel {
                     "read-only bind mount",
                 ));
             }
+            // The Shell runs outside the OS cage on inodes a writable bind shares with the
+            // operator's real filesystem, so setuid/setgid/sticky here would land an authority
+            // bit on the real disk honoured by a process outside the box. `write` cannot set one;
+            // `chmod` can, so refuse it here rather than silently strip.
+            if mode & 0o7000 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "setuid/setgid/sticky bits are not permitted in this box",
+                ));
+            }
             #[cfg(unix)]
             {
-                return Self::set_host_permissions(&host_path, mode & 0o7777, expected);
+                return Self::set_host_permissions(&host_path, mode & 0o777, expected);
             }
             #[cfg(not(unix))]
             {

@@ -9,7 +9,7 @@ fn parse_symbolic_mode(
     mode_str: &str,
     current: u32,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let mut result = current & 0o7777;
+    let mut result = current & 0o777;
     for clause in mode_str.split(',') {
         let mut chars = clause.chars().peekable();
         // Parse who: u, g, o, a

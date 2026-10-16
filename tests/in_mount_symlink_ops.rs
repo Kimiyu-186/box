@@ -153,6 +153,170 @@ async fn chmod_restores_a_host_file_with_no_permissions() {
 }
 
 #[tokio::test]
+async fn chmod_refuses_setuid_and_leaves_the_host_mode_unchanged() {
+    let (ws, ro) = fixture("chmod_setuid");
+    let before = host_mode(&ws.join("mode.txt"));
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("chmod 4755 mode.txt").await;
+            assert_ne!(
+                out.status, 0,
+                "chmod with setuid must be refused: {}",
+                out.stderr
+            );
+        })
+        .await;
+    let after = host_mode(&ws.join("mode.txt"));
+    assert_eq!(
+        after & 0o7000,
+        0,
+        "no setuid/setgid/sticky bit on the host inode"
+    );
+    assert_eq!(
+        after, before,
+        "a refused chmod must not change the host mode"
+    );
+}
+
+#[tokio::test]
+async fn ln_s_to_an_absolute_target_is_refused() {
+    let (ws, ro) = fixture("ln_absolute");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("ln -s /etc/passwd escape").await;
+            assert_ne!(
+                out.status, 0,
+                "ln -s to an absolute host target must be refused: {}",
+                out.stderr
+            );
+            assert!(
+                ws.join("escape").symlink_metadata().is_err(),
+                "no escaping link may be planted on the host bind"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ln_s_to_a_target_that_climbs_out_of_the_bind_is_refused() {
+    let (ws, ro) = fixture("ln_climb");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("ln -s ../../../../etc/passwd escape").await;
+            assert_ne!(
+                out.status, 0,
+                "ln -s to a target outside the bind must be refused: {}",
+                out.stderr
+            );
+            assert!(
+                ws.join("escape").symlink_metadata().is_err(),
+                "no escaping link may be planted on the host bind"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ln_s_through_a_non_directory_component_is_refused() {
+    // `real.txt` is a regular file, so canonicalizing `real.txt/sub` fails with a non-NotFound
+    // error (ENOTDIR). The target floor must fail closed on that rather than fold the failing
+    // component as an ordinary directory.
+    let (ws, ro) = fixture("ln_enotdir");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("ln -s real.txt/sub link").await;
+            assert_ne!(
+                out.status, 0,
+                "ln -s through a non-directory component must be refused: {}",
+                out.stderr
+            );
+            assert!(
+                ws.join("link").symlink_metadata().is_err(),
+                "no link may be planted when the target floor fails closed"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ln_s_to_an_in_bind_target_with_missing_dirs_is_allowed() {
+    let (ws, ro) = fixture("ln_dangling");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("ln -s newsub/file link").await;
+            assert_eq!(
+                out.status, 0,
+                "ln -s to an in-bind target whose dirs do not exist yet must succeed: {}",
+                out.stderr
+            );
+            let link = ws.join("link");
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link exists on host")
+                    .file_type()
+                    .is_symlink(),
+                "a real host symlink was created"
+            );
+            assert_eq!(
+                std::fs::read_link(&link).expect("read the host link"),
+                std::path::Path::new("newsub/file")
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ln_s_through_a_dangling_symlink_prefix_is_refused() {
+    let (ws, ro) = fixture("ln_dangling_prefix");
+    std::os::unix::fs::symlink("../outside-missing", ws.join("dangling"))
+        .expect("dangling host symlink");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("ln -s dangling/file link").await;
+            assert_ne!(
+                out.status, 0,
+                "a dangling symlink prefix cannot prove an in-bind target: {}",
+                out.stderr
+            );
+            assert!(
+                ws.join("link").symlink_metadata().is_err(),
+                "no link may be planted through a dangling prefix"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn symbolic_chmod_on_a_setgid_host_file_succeeds() {
+    let (ws, ro) = fixture("chmod_symbolic_setgid");
+    let mode_file = ws.join("mode.txt");
+    std::fs::set_permissions(&mode_file, std::fs::Permissions::from_mode(0o2644))
+        .expect("seed g+s");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sh = build(&ws, &ro);
+            let out = sh.run("chmod +x mode.txt").await;
+            assert_eq!(
+                out.status, 0,
+                "chmod +x on a file already carrying setgid must succeed: {}",
+                out.stderr
+            );
+        })
+        .await;
+    assert_eq!(
+        host_mode(&mode_file),
+        0o755,
+        "the ordinary bits changed and the special bits were dropped"
+    );
+}
+
+#[tokio::test]
 async fn chmod_on_a_readonly_bind_is_refused() {
     let (ws, ro) = fixture("chmod_readonly");
     let before = host_mode(&ro.join("ro.txt"));
