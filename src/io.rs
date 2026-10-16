@@ -114,6 +114,14 @@ pub async fn stat(os: &Mediated, path: &str) -> crate::os::FileStat {
     result
 }
 
+/// Stat a file via the kernel, and report a refused probe as `None`.
+pub(crate) async fn stat_if_admitted(os: &Mediated, path: &str) -> Option<crate::os::FileStat> {
+    let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));
+    let result = os.stat_if_admitted(&proc, path).await;
+    CURRENT_PROCESS.with(|p| p.replace(proc));
+    result
+}
+
 /// Remove a file via the kernel.
 pub async fn remove_file(os: &Mediated, path: &str) -> std::io::Result<()> {
     let proc = CURRENT_PROCESS.with(|p| p.replace(Process::empty()));

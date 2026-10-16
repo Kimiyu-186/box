@@ -948,6 +948,76 @@ fn mv_through_a_directory_symlink_is_judged_on_its_target() {
     );
 }
 
+/// `mkdir -p` creates no ancestor whose metadata probe is denied.
+///
+/// A denied probe reports not-found, which is also what a missing directory reports. The
+/// builtin must not act on that answer for an ancestor: it creates only below the first
+/// component the kernel reports missing, and raises no `create_dir` above it.
+#[test]
+fn mkdir_p_creates_no_ancestor_whose_probe_is_denied() {
+    let above_the_grant = ["/home", "/home/lash", "/home/lash/project"];
+    let (interceptor, admitted, armed) = Recorder::armable(move |effect| {
+        above_the_grant
+            .iter()
+            .any(|path| effect.ends_with(&format!(" {path}")))
+    });
+    let mut shell = shell_with(interceptor.clone());
+
+    let (made, listing, setup_attempts) = run(async {
+        let setup = shell.run("mkdir -p /home/lash/project").await;
+        assert_eq!(setup.status, 0, "setup: {}", setup.stderr);
+        let setup_attempts = interceptor.attempted.lock().unwrap().len();
+        armed.store(true, Ordering::SeqCst);
+        let made = shell.run("mkdir -p /home/lash/project/c/d").await;
+        let listing = shell.run("ls /home/lash/project/c").await;
+        (made, listing, setup_attempts)
+    });
+
+    assert_eq!(made.status, 0, "{}", made.stderr);
+    assert_eq!(listing.stdout.trim(), "d", "{}", listing.stderr);
+    let admitted = admitted.lock().unwrap();
+    assert!(
+        admitted.contains(&"create_dir /home/lash/project/c".to_string())
+            && admitted.contains(&"create_dir /home/lash/project/c/d".to_string()),
+        "{admitted:?}"
+    );
+    let attempted = interceptor.attempted.lock().unwrap();
+    let created_above = attempted[setup_attempts..]
+        .iter()
+        .filter(|effect| effect.starts_with("create_dir "))
+        .filter(|effect| {
+            above_the_grant
+                .iter()
+                .any(|path| effect.ends_with(&format!(" {path}")))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        created_above.is_empty(),
+        "no create_dir may reach an ancestor the probe could not see: {created_above:?}"
+    );
+}
+
+/// `mkdir -p` accepts a `.` or `..` component after a component it created.
+#[test]
+fn mkdir_p_accepts_a_dot_component_after_a_created_one() {
+    let (interceptor, _admitted) = Recorder::allowing_everything();
+    let mut shell = shell_with(interceptor);
+    let (made, listing) = run(async {
+        let made = shell
+            .run("mkdir -p /home/lash/x/new/../sib && mkdir -p /home/lash/y/b/.")
+            .await;
+        let listing = shell.run("ls /home/lash/x /home/lash/y").await;
+        (made, listing)
+    });
+    assert_eq!(made.status, 0, "{}", made.stderr);
+    assert_eq!(
+        listing.stdout.split_whitespace().collect::<Vec<_>>(),
+        ["/home/lash/x:", "new", "sib", "/home/lash/y:", "b"],
+        "{}",
+        listing.stderr
+    );
+}
+
 /// `Kernel::resolve` is the sole mint point for a path identity.
 ///
 /// Tested directly rather than through a command, because these are the properties
