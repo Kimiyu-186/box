@@ -584,7 +584,7 @@ fn readonly_prevents_unset() {
         let mut shell = Shell::builder().build().unwrap();
         shell.run("readonly X=1").await;
         let out = shell.run("unset X 2>&1; echo $X").await;
-        assert_eq!(out.stdout.trim(), "1");
+        assert_eq!(out.stdout, "strands-shell: X: readonly variable\n1\n");
     }));
 }
 

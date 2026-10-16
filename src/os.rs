@@ -614,6 +614,11 @@ impl Process {
         self.err_tx = None;
     }
 
+    /// Remove and return the stderr channel, if one is set.
+    pub fn take_err_tx(&mut self) -> Option<mpsc::Sender<Bytes>> {
+        self.err_tx.take()
+    }
+
     /// Send `text` to the channel writer on `fd` within its budget, or `None` when `fd` has no channel writer.
     fn send_to_channel(&mut self, fd: Fd, text: String) -> Option<io::Result<()>> {
         let Some(FdKind::ChannelWriter { tx, limit }) = self.fds.get(&fd) else {
@@ -635,6 +640,57 @@ impl Process {
             0 => Ok(()),
             rest => limit.admit(rest).map(|_| ()),
         })
+    }
+
+    /// Write text to stderr by the same route as [`Self::err_msg`], without a trailing newline.
+    pub fn err_raw(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.err_tx {
+            let _ = tx.try_send(Bytes::from(text.to_string()));
+        } else if let Some(sent) = self.send_to_channel(STDERR, text.to_string()) {
+            if sent.is_err() {
+                self.last_exit = 1;
+            }
+        } else if self.capture {
+            if !self.append_captured_stderr(text) {
+                self.last_exit = 1;
+            }
+        } else {
+            eprint!("{text}");
+        }
+    }
+
+    /// Write text to stdout by the same route as [`Self::out_msg`], without a trailing newline.
+    pub fn out_raw(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(sent) = self.send_to_channel(STDOUT, text.to_string()) {
+            if let Err(e) = sent {
+                self.err_msg(&format!("strands-shell: {e}"));
+                self.last_exit = 1;
+            }
+        } else if self.capture {
+            if !self.append_captured_output(text) {
+                self.append_captured_stderr("strands-shell: output size limit exceeded\n");
+                self.last_exit = 1;
+            }
+        } else {
+            print!("{text}");
+        }
+    }
+
+    /// A writer on a duplicate of `fd`, leaving the descriptor in place.
+    pub async fn clone_writer(&self, fd: Fd) -> io::Result<FdWriter> {
+        let kind = self
+            .fds
+            .get(&fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad fd {fd}")))?
+            .try_clone()
+            .await?;
+        Ok(FdWriter { kind })
     }
 
     /// Write an error message to the process stderr channel, or real stderr as fallback.

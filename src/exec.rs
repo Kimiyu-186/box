@@ -1792,7 +1792,7 @@ async fn run_capturing_status(
             let (exit, out) = match item {
                 Item::Pipeline(pipeline, negated) => {
                     let (mut exit, out) =
-                        execute_pipeline_capture(os.clone(), proc, pipeline).await;
+                        capture_pipeline_checked(os.clone(), proc, pipeline).await;
                     if *negated {
                         exit = if exit == 0 { 1 } else { 0 };
                     }
@@ -1962,10 +1962,15 @@ async fn run_capturing_status(
                             item: item.clone(),
                             redirects: redirects.clone(),
                         };
+                        let saved_capture = proc.capture;
+                        let saved_output = std::mem::take(&mut proc.captured_output);
+                        proc.capture = true;
                         let exit = Box::pin(execute_item(os.clone(), proc, &cr))
                             .await
                             .unwrap_or(1);
-                        (exit, String::new())
+                        proc.capture = saved_capture;
+                        let out = std::mem::replace(&mut proc.captured_output, saved_output);
+                        (exit, out)
                     } else {
                         let inner_cl = vec![(*item.clone(), None)];
                         let s = Box::pin(run_capturing(os.clone(), &mut sub, &inner_cl)).await;
@@ -1985,6 +1990,29 @@ async fn run_capturing_status(
         }
     }
     (output, last_exit)
+}
+
+/// Run one pipeline with its stdout captured, through the same dispatch a direct run takes.
+async fn capture_pipeline_checked(
+    os: Arc<Mediated>,
+    proc: &mut Process,
+    pipeline: &[parser::Command],
+) -> (i32, String) {
+    let saved_capture = proc.capture;
+    let saved_output = std::mem::take(&mut proc.captured_output);
+    let mut saved_stdout = Process::empty();
+    proc.transfer_fd(STDOUT, &mut saved_stdout);
+    proc.capture = true;
+    let result = Box::pin(execute_pipeline_checked(os, proc, pipeline)).await;
+    proc.capture = saved_capture;
+    proc.close(STDOUT);
+    saved_stdout.transfer_fd(STDOUT, proc);
+    let output = std::mem::replace(&mut proc.captured_output, saved_output);
+    let exit = match result {
+        Ok(code) | Err(ControlFlow::Exit(code)) | Err(ControlFlow::Return(code)) => code,
+        Err(_) => proc.last_exit,
+    };
+    (exit, output)
 }
 
 /// Public-facing execute_command_line that swallows break/continue.
@@ -2230,37 +2258,85 @@ async fn execute_item_unsettled(
             }
             // For stdout/stderr redirects, capture output and write to target
             if !stdout_expanded.is_empty() {
+                let redirects_stderr = stdout_expanded
+                    .iter()
+                    .any(|(redir, _)| written_fd(redir) == Some(STDERR));
+                let diverted = redirects_stderr.then(|| DivertedStderr::begin(proc));
+                let outer_stderr = std::mem::take(&mut proc.captured_stderr);
                 let inner_cl = vec![(*item.clone(), None)];
                 let captured = Box::pin(run_capturing(os.clone(), proc, &inner_cl)).await;
+                let mut stderr_text = match diverted {
+                    Some(diverted) => {
+                        let (text, complete) = diverted.end(proc).await;
+                        if !complete {
+                            proc.err_msg("strands-shell: output size limit exceeded");
+                            proc.last_exit = 1;
+                        }
+                        text
+                    }
+                    None => String::new(),
+                };
+                stderr_text.push_str(&std::mem::replace(&mut proc.captured_stderr, outer_stderr));
                 if !stdin_expanded.is_empty() {
                     proc.close(STDIN);
                     saved_stdin.transfer_fd(STDIN, proc);
                 }
-                // Write captured output to each redirect target
+                // fd 1 and fd 2 each end at one sink, decided by the redirects in order.
+                let mut sinks = [GroupSink::Stdout, GroupSink::Stderr];
                 for (redir, target) in &stdout_expanded {
-                    let fd_num = match redir {
-                        Redirect::Write(fd, _)
-                        | Redirect::Append(fd, _)
-                        | Redirect::Clobber(fd, _)
-                        | Redirect::DupWrite(fd, _) => *fd,
+                    let Some(fd_num) = written_fd(redir) else {
+                        continue;
+                    };
+                    let index = match fd_num {
+                        STDOUT => 0,
+                        STDERR => 1,
                         _ => continue,
                     };
-                    if fd_num == STDOUT || fd_num == 1 {
-                        let flags = match redir {
-                            Redirect::Append(..) => OpenFlags::append(),
-                            _ => OpenFlags::write(),
-                        };
-                        let written = match os.open(proc, target, flags).await {
-                            Ok(fd) => match proc.take_writer(fd) {
-                                Ok(mut w) => w.write_all(captured.as_bytes()).await,
-                                Err(e) => Err(e),
-                            },
-                            Err(e) => Err(e),
-                        };
-                        if let Err(e) = written {
-                            proc.err_msg(&format!("strands-shell: {target}: {e}"));
-                            proc.last_exit = 1;
+                    sinks[index] = match redir {
+                        Redirect::DupWrite(..) => match target.as_str() {
+                            "1" => sinks[0].clone(),
+                            "2" => sinks[1].clone(),
+                            _ => continue,
+                        },
+                        Redirect::Append(..) => GroupSink::File {
+                            path: target.clone(),
+                            append: true,
+                        },
+                        _ => GroupSink::File {
+                            path: target.clone(),
+                            append: false,
+                        },
+                    };
+                }
+                let mut files: Vec<(String, bool, String)> = Vec::new();
+                for (sink, text) in [(&sinks[0], &captured), (&sinks[1], &stderr_text)] {
+                    match sink {
+                        GroupSink::Stdout => proc.out_raw(text),
+                        GroupSink::Stderr => proc.err_raw(text),
+                        GroupSink::File { path, append } => {
+                            match files.iter_mut().find(|(known, _, _)| known == path) {
+                                Some((_, _, body)) => body.push_str(text),
+                                None => files.push((path.clone(), *append, text.clone())),
+                            }
                         }
+                    }
+                }
+                for (path, append, body) in files {
+                    let flags = if append {
+                        OpenFlags::append()
+                    } else {
+                        OpenFlags::write()
+                    };
+                    let written = match os.open(proc, &path, flags).await {
+                        Ok(fd) => match proc.take_writer(fd) {
+                            Ok(mut w) => w.write_all(body.as_bytes()).await,
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = written {
+                        proc.err_msg(&format!("strands-shell: {path}: {e}"));
+                        proc.last_exit = 1;
                     }
                 }
                 Ok(proc.last_exit)
@@ -2273,6 +2349,70 @@ async fn execute_item_unsettled(
                 result
             }
         }
+    }
+}
+
+/// The descriptor a redirect writes, or `None` for one that reads.
+fn written_fd(redirect: &Redirect) -> Option<os::Fd> {
+    match redirect {
+        Redirect::Write(fd, _)
+        | Redirect::Append(fd, _)
+        | Redirect::Clobber(fd, _)
+        | Redirect::DupWrite(fd, _) => Some(*fd),
+        _ => None,
+    }
+}
+
+/// Where one of a redirected group's two output streams ends.
+#[derive(Clone)]
+enum GroupSink {
+    Stdout,
+    Stderr,
+    File { path: String, append: bool },
+}
+
+/// A process's stderr, both the descriptor and the shell's own diagnostics, drained into a
+/// buffer for the span of a redirected group.
+struct DivertedStderr {
+    drain: tokio::task::JoinHandle<(String, bool)>,
+    saved_err_tx: Option<mpsc::Sender<Bytes>>,
+    saved_fd: Process,
+}
+
+impl DivertedStderr {
+    fn begin(proc: &mut Process) -> Self {
+        let (tx, mut rx) = os::pipe(64);
+        let max_output = proc.max_output;
+        let drain = tokio::task::spawn_local(async move {
+            let mut text = String::new();
+            let mut complete = true;
+            while let Some(chunk) = rx.recv().await {
+                complete &=
+                    os::append_limited(&mut text, &String::from_utf8_lossy(&chunk), max_output);
+            }
+            (text, complete)
+        });
+        let saved_err_tx = proc.take_err_tx();
+        let mut saved_fd = Process::empty();
+        proc.transfer_fd(STDERR, &mut saved_fd);
+        proc.set_channel_writer(STDERR, tx.clone());
+        proc.set_err_tx(tx);
+        Self {
+            drain,
+            saved_err_tx,
+            saved_fd,
+        }
+    }
+
+    /// What the group wrote to stderr, and whether all of it fit the output limit.
+    async fn end(mut self, proc: &mut Process) -> (String, bool) {
+        proc.clear_err_tx();
+        proc.close(STDERR);
+        self.saved_fd.transfer_fd(STDERR, proc);
+        if let Some(tx) = self.saved_err_tx {
+            proc.set_err_tx(tx);
+        }
+        self.drain.await.unwrap_or_default()
     }
 }
 
@@ -2525,6 +2665,21 @@ async fn execute_pipeline_checked(
                     redirects: pipeline[0].redirects.clone(),
                 };
                 return Box::pin(execute_pipeline_checked(os, proc, &[unprefixed])).await;
+            }
+            // A redirect on `source` or `eval` covers everything the sourced text does, so it is
+            // applied the way a redirect on a group is.
+            if matches!(name.as_str(), "." | "source" | "eval") && !pipeline[0].redirects.is_empty()
+            {
+                let bare = parser::Command {
+                    env: pipeline[0].env.clone(),
+                    args: pipeline[0].args.clone(),
+                    redirects: Vec::new(),
+                };
+                let redirected = Item::CompoundRedirect {
+                    item: Box::new(Item::Pipeline(vec![bare], false)),
+                    redirects: pipeline[0].redirects.clone(),
+                };
+                return Box::pin(execute_item(os, proc, &redirected)).await;
             }
             match name.as_str() {
                 "break" => {
@@ -2915,8 +3070,13 @@ async fn run_pipeline(
             // `err_rx` is drained by nobody, so pointing `err_msg` at it would silently swallow
             // every diagnostic the shell itself reports — a refused redirect exits non-zero with
             // no reason, which is the exact defect the `clear_err_tx` fix below was written for.
+            // A redirect of fd 2 is the exception: the local pipe is then drained into the
+            // redirect's target, so the diagnostic goes where the command sent its stderr.
+            let redirects_stderr = expanded_redirects[0]
+                .iter()
+                .any(|(redirect, _)| written_fd(redirect) == Some(STDERR));
             let err_target = match inherited_err.clone() {
-                Some(inherited) => inherited,
+                Some(inherited) if !redirects_stderr => inherited,
                 _ => err_tx.clone(),
             };
             drop(err_tx);
@@ -2952,6 +3112,12 @@ async fn run_pipeline(
                 return (1, String::new());
             }
 
+            let stderr_sink = if redirects_stderr {
+                io_proc.clone_writer(STDERR).await.ok()
+            } else {
+                None
+            };
+
             // Drain stdout/stderr concurrently with the builtin to avoid
             // deadlock when the builtin produces more output than the channel
             // capacity.
@@ -2983,7 +3149,16 @@ async fn run_pipeline(
                     }
                 }))
             };
-            let stderr_drain = if capture {
+            let stderr_drain = if let Some(mut sink) = stderr_sink {
+                let mut err_rx = err_rx;
+                Drain::Copy(tokio::task::spawn_local(async move {
+                    while let Some(chunk) = err_rx.recv().await {
+                        if sink.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                }))
+            } else if capture {
                 Drain::Capture(tokio::task::spawn_local(async move {
                     let mut reader = FdReader::from_receiver(err_rx);
                     os::read_to_string_limited(&mut reader, max_output)
