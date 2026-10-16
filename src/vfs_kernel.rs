@@ -23,10 +23,28 @@ use crate::vfs::{self, InodeData, LASH_GID, LASH_UID, Vfs};
 /// The most dangling symlinks `resolved_target` replaces in one path.
 const MAX_SYMLINK_HOPS: u32 = 40;
 
+/// An outbound HTTP proxy the kernel routes every request through.
+///
+/// When a [`VfsKernel`] carries one, `http_request` dials the proxy instead of the
+/// origin directly, and trusts `ca_pem` for the leaf certificates the proxy forges
+/// on interception. This is how an embedder routes the Shell's outbound HTTP through
+/// a governed boundary rather than letting the kernel reach the network itself. The
+/// kernel still runs its SSRF floor first; the proxy is an *addition*, not a bypass.
+#[derive(Clone)]
+pub struct EgressProxy {
+    /// The proxy URL, for example `http://127.0.0.1:8080`.
+    pub target: String,
+    /// PEM bytes of the CA the proxy signs its intercept leaves with.
+    pub ca_pem: Vec<u8>,
+}
+
 /// A Kernel backed entirely by the in-memory VFS.
 pub struct VfsKernel {
     pub vfs: Arc<Mutex<Vfs>>,
     pub network_enabled: bool,
+    /// When set, `http_request` routes through this proxy rather than dialing the
+    /// origin directly. `None` keeps the direct-client behaviour.
+    pub egress_proxy: Option<EgressProxy>,
     resolution_generation: Arc<Mutex<u64>>,
     pending_writes: std::sync::Mutex<Vec<PendingWrite>>,
 }
@@ -46,6 +64,7 @@ impl VfsKernel {
         Self {
             vfs: Arc::new(Mutex::new(vfs)),
             network_enabled: true,
+            egress_proxy: None,
             resolution_generation: Arc::new(Mutex::new(0)),
             pending_writes: std::sync::Mutex::new(Vec::new()),
         }
@@ -1404,12 +1423,46 @@ impl VfsKernel {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // 1. Build reqwest client, guarding DNS with the SSRF-aware resolver so a name
-            // cannot resolve onto a floored address.
-            let client_builder = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(req.insecure)
-                .dns_resolver(std::sync::Arc::new(SafeResolver));
+            // 1. Build reqwest client. `req.insecure` (a `curl -k`) is honored ONLY on the
+            // direct-dial path below — never on the proxy path, where it would let the
+            // caller turn off the gateway-CA pin from inside the Shell.
+            let client_builder =
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+            let client_builder = match &self.egress_proxy {
+                // Route through the governed boundary and trust its intercept CA. DNS
+                // is the proxy's job on the CONNECT path, so `SafeResolver` does not
+                // apply here — the proxy enforces its own destination floor, and the
+                // kernel already ran `check_url_effect` above.
+                Some(proxy) => client_builder
+                    .proxy(
+                        reqwest::Proxy::all(&proxy.target)
+                            .map_err(|e| io::Error::other(e.to_string()))?,
+                    )
+                    // Trust ONLY the gateway's intercept CA — drop the built-in WebPKI
+                    // roots. The gateway forges every leaf from that one CA, so nothing
+                    // else should validate: a real public-CA certificate reaching this
+                    // client (a proxy misconfig, a future direct-dial bug) must fail
+                    // rather than be accepted. This mirrors the workload, whose
+                    // `SSL_CERT_FILE` is the gateway CA alone, not an addition to the
+                    // system store.
+                    //
+                    // `req.insecure` is deliberately NOT applied here: the gateway-CA pin
+                    // must not be defeatable from inside the Shell. A `curl -k` cannot
+                    // disable validation on the client→gateway leg; the gateway's forged
+                    // leaf is always valid against its own CA, and whether the *upstream*
+                    // leg tolerates a bad cert is the gateway's decision, not the client's.
+                    .tls_built_in_root_certs(false)
+                    .add_root_certificate(
+                        reqwest::Certificate::from_pem(&proxy.ca_pem)
+                            .map_err(|e| io::Error::other(e.to_string()))?,
+                    ),
+                // No proxy: dial the origin directly, guarding DNS with the SSRF-aware
+                // resolver so a name cannot resolve onto a floored address. Only here does
+                // `req.insecure` (a `curl -k`) relax certificate validation.
+                None => client_builder
+                    .danger_accept_invalid_certs(req.insecure)
+                    .dns_resolver(std::sync::Arc::new(SafeResolver)),
+            };
             let client = client_builder
                 .build()
                 .map_err(|e| io::Error::other(e.to_string()))?;

@@ -21,7 +21,7 @@ use crate::mcp_client::{McpConfigEntry, NamedMcpClient};
 use crate::mediate::Mediated;
 use crate::os::{Kernel, OpenFlags, Process};
 use crate::vfs_config::{BindEntry, BindMode, VfsConfig, build_vfs};
-use crate::vfs_kernel::VfsKernel;
+use crate::vfs_kernel::{EgressProxy, VfsKernel};
 
 // The `shell:run` denial and interceptor-failure statuses moved to `exec.rs` with the
 // admission point. They are not duplicated here: two spellings of "denied"
@@ -691,6 +691,7 @@ pub struct ShellBuilder {
     max_inodes: usize,
     timeout: Option<Duration>,
     network_enabled: bool,
+    egress_proxy: Option<EgressProxy>,
     effect_interceptor: Option<Arc<dyn EffectInterceptor>>,
     kernel: Option<Arc<dyn Kernel>>,
 }
@@ -712,6 +713,7 @@ impl Default for ShellBuilder {
             max_inodes: 10_000,
             timeout: Some(std::time::Duration::from_secs(30)),
             network_enabled: true,
+            egress_proxy: None,
             effect_interceptor: None,
             kernel: None,
         }
@@ -948,6 +950,94 @@ impl ShellBuilder {
         self
     }
 
+    /// Route this Shell's outbound HTTP through an egress proxy instead of dialing
+    /// origins directly.
+    ///
+    /// `target` is the proxy URL (for example `http://127.0.0.1:8080`), and `ca_path`
+    /// points at the PEM certificate the proxy signs its intercepted leaves with, read
+    /// once here. This is a *stated position*, the counterpart of
+    /// [`disable_network`](Self::disable_network): an embedder that wants the Shell's
+    /// egress to meet a governed boundary configures it here rather than relying on a
+    /// default. It enables the network, so it and `disable_network` are opposites — the
+    /// last call wins, and the SSRF floor still runs before any request either way.
+    ///
+    /// This applies only to the bundled kernel. A kernel supplied through
+    /// [`kernel`](Self::kernel) owns its own transport and ignores this setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA certificate at `ca_path` cannot be read, or if its
+    /// contents are not a valid PEM certificate. The parse happens here so a bad CA is
+    /// a configuration-time error, matching this method's stated-position intent, rather
+    /// than a failure on every later request.
+    ///
+    /// On `wasm32` this refuses unconditionally: the bundled kernel's wasm request path
+    /// dials the host directly and does not honor a proxy, so enabling the network there
+    /// would route around the gateway. Refusing keeps the fail-closed invariant — the
+    /// network is never enabled unless the route can be honored.
+    pub fn egress_proxy(
+        self,
+        target: impl Into<String>,
+        ca_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        // On wasm the kernel's `http_request_effect` reaches the host directly and never
+        // reads `egress_proxy`, so turning the network on here would be a silent bypass of
+        // the gateway. Refuse before touching `network_enabled`, so the network cannot be
+        // enabled without a route that honors it.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (target, ca_path);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "egress_proxy is not supported on wasm: the kernel cannot route through the \
+                 gateway on this target",
+            ));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ca_pem = std::fs::read(ca_path.as_ref())?;
+            self.egress_proxy_pem(target, ca_pem)
+        }
+    }
+
+    /// Route outbound HTTP through an egress proxy with already-loaded CA bytes.
+    pub fn egress_proxy_pem(
+        mut self,
+        target: impl Into<String>,
+        ca_pem: Vec<u8>,
+    ) -> io::Result<Self> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (target, ca_pem);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "egress_proxy is not supported on wasm: the kernel cannot route through the \
+                 gateway on this target",
+            ));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Validate the CA now, not per-request. `Certificate::from_pem` is lazy — it does
+            // not parse the DER — so a malformed certificate is only rejected when a client is
+            // *built* with it.
+            let cert = reqwest::Certificate::from_pem(&ca_pem)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            reqwest::Client::builder()
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(cert)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            self.egress_proxy = Some(EgressProxy {
+                target: target.into(),
+                ca_pem,
+            });
+            self.network_enabled = true;
+            Ok(self)
+        }
+    }
+
     /// Load additional configuration from a TOML file.
     ///
     /// Bind mounts from the file are appended to whatever is already
@@ -1081,6 +1171,7 @@ impl ShellBuilder {
                 vfs.max_inodes = self.max_inodes;
                 let mut kernel = VfsKernel::new(vfs);
                 kernel.network_enabled = self.network_enabled;
+                kernel.egress_proxy = self.egress_proxy;
                 Arc::new(kernel)
             }
         };
