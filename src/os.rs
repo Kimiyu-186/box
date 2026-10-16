@@ -502,6 +502,20 @@ impl Process {
         }
     }
 
+    /// The sender of a channel writer installed on `fd`, if there is one.
+    ///
+    /// Lets a fork inherit an embedder's output sink instead of replacing it. `fork` starts with an
+    /// empty descriptor table, so a caller who installed a writer on this process — the documented
+    /// way to receive output as it is produced — would otherwise have it discarded by the forked
+    /// process's own pipes. `transfer_fd` is the equivalent for stdin, which moves rather than
+    /// clones because only one reader may hold it.
+    pub fn channel_writer(&self, fd: Fd) -> Option<mpsc::Sender<Bytes>> {
+        match self.fds.get(&fd) {
+            Some(FdKind::ChannelWriter { tx, .. }) => Some(tx.clone()),
+            _ => None,
+        }
+    }
+
     /// Remove an fd from this process and install it in another.
     /// Used to pass stdin across fork boundaries (e.g. CompoundPipeline).
     pub fn transfer_fd(&mut self, fd: Fd, target: &mut Process) {

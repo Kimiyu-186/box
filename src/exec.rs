@@ -2830,11 +2830,37 @@ async fn run_pipeline(
             let mut io_proc = shell_proc.fork();
             // Inherit stdin from shell_proc if present (e.g. CompoundPipeline).
             shell_proc.transfer_fd(STDIN, &mut io_proc);
+            // Inherit an embedder's output sinks the same way, and for the same reason.
+            //
+            // `fork` starts with an empty descriptor table, so the pipes installed below used to
+            // replace whatever the caller had put on `shell_proc` — silently, and for exactly the
+            // commands that go through this arm. `Process::out_msg` checks a `ChannelWriter` on
+            // `STDOUT` before its fallbacks, so installing one is the documented way to receive
+            // output as it is produced; discarding it here made that API unreachable for builtins.
+            //
+            // Cloned rather than moved (unlike `transfer_fd` for stdin) because the sender is a
+            // sink many writers may hold, while stdin has exactly one reader.
+            let inherited_err = shell_proc.channel_writer(STDERR);
             let (out_tx, out_rx) = os::pipe(64);
             let (err_tx, err_rx) = os::pipe(64);
-            io_proc.set_channel_writer(STDOUT, out_tx);
-            io_proc.set_channel_writer(STDERR, err_tx.clone());
-            shell_proc.set_err_tx(err_tx);
+            if shell_proc.inherit_channel_writer(STDOUT, &mut io_proc) {
+                drop(out_tx);
+            } else {
+                io_proc.set_channel_writer(STDOUT, out_tx);
+            }
+            if !shell_proc.inherit_channel_writer(STDERR, &mut io_proc) {
+                io_proc.set_channel_writer(STDERR, err_tx.clone());
+            }
+            // `err_msg` must reach the same place fd 2 does. With an inherited writer the local
+            // `err_rx` is drained by nobody, so pointing `err_msg` at it would silently swallow
+            // every diagnostic the shell itself reports — a refused redirect exits non-zero with
+            // no reason, which is the exact defect the `clear_err_tx` fix below was written for.
+            let err_target = match inherited_err.clone() {
+                Some(inherited) => inherited,
+                _ => err_tx.clone(),
+            };
+            drop(err_tx);
+            shell_proc.set_err_tx(err_target);
 
             // Apply redirects to the io_proc so builtins see them.
             //
@@ -2853,7 +2879,15 @@ async fn run_pipeline(
             // alive on the success path, `err_rx` never reaches end-of-stream, and the drain
             // below hangs until the command deadline. Measured — every redirect took 30s.
             if let Err(e) = apply_redirects(&os, &mut io_proc, &expanded_redirects[0]).await {
-                shell_proc.clear_err_tx();
+                // With an embedder's sink installed, keep `err_msg` pointed at it: that sink is
+                // drained by the embedder, not by the task below that this early return skips. Only
+                // the local pipe has to be cleared, and clearing it when a sink is inherited would
+                // route the reason into `captured_stderr`, which a streaming consumer never reads —
+                // reproducing the very silence the `clear_err_tx` call was added to fix.
+                match inherited_err {
+                    Some(inherited) => shell_proc.set_err_tx(inherited),
+                    None => shell_proc.clear_err_tx(),
+                }
                 shell_proc.err_msg(&format!("strands-shell: {e}"));
                 return (1, String::new());
             }
@@ -3020,16 +3054,36 @@ async fn run_pipeline(
         procs[i + 1].set_channel_reader(STDIN, rx);
     }
 
-    // Last stage stdout: channel back to us
+    // Last stage stdout: the embedder's sink when one is installed, else a channel back to us.
+    //
+    // Same inheritance as the single-builtin arm above, and needed separately because this is a
+    // different construction: `commands::lookup` names a *distinct* registry from
+    // `builtins::lookup`, so `cat`, `ls`, and every other external command reach here rather than
+    // there. Patching only the builtin arm left `printf` streaming and `cat` silent.
+    let inherited_err = shell_proc.channel_writer(STDERR);
     let (last_tx, last_rx) = os::pipe(64);
-    procs[len - 1].set_channel_writer(STDOUT, last_tx);
+    if shell_proc.inherit_channel_writer(STDOUT, &mut procs[len - 1]) {
+        drop(last_tx);
+    } else {
+        procs[len - 1].set_channel_writer(STDOUT, last_tx);
+    }
 
-    // Every stage gets a stderr channel back to us
+    // Every stage gets a stderr channel back to us, or the embedder's if it installed one.
     let mut stderr_rxs = Vec::with_capacity(len);
     for p in &mut procs {
         let (tx, rx) = os::pipe(64);
-        p.set_err_tx(tx.clone());
-        p.set_channel_writer(STDERR, tx);
+        match &inherited_err {
+            // `set_err_tx` and fd 2 must name the same place, or a diagnostic reported through
+            // `err_msg` lands in a receiver nobody drains.
+            Some(sink) => {
+                p.set_err_tx(sink.clone());
+                shell_proc.inherit_channel_writer(STDERR, p);
+            }
+            None => {
+                p.set_err_tx(tx.clone());
+                p.set_channel_writer(STDERR, tx);
+            }
+        }
         stderr_rxs.push(rx);
     }
 
