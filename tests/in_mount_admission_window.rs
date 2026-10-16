@@ -518,3 +518,200 @@ fn a_writable_bind_point_is_not_removed_or_replaced() {
     );
     assert_eq!(after.stdout, "host", "the bind is still in place");
 }
+
+/// Records the program each host spawn receives, so the test can compare it with the decision.
+fn recording_spawner(
+    received: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> strands_shell::os::HostSpawner {
+    Arc::new(move |spawn: strands_shell::os::HostSpawn| {
+        let received = Arc::clone(&received);
+        Box::pin(async move {
+            received.lock().expect("record").push(spawn.program.clone());
+            Ok(strands_shell::os::HostSpawnOutcome {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+    })
+}
+
+/// Admits every attempt, records the program each `shell:spawn` decision names, and on the first
+/// one re-points `link` at `other` — the swap a real attacker races into the window between the
+/// decision and the spawn.
+struct LinkSwapper {
+    link: PathBuf,
+    other: PathBuf,
+    decided: Arc<std::sync::Mutex<Vec<String>>>,
+    swapped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl EffectInterceptor for LinkSwapper {
+    async fn intercept(
+        &self,
+        effect: &EffectAttempt<'_>,
+    ) -> std::io::Result<Box<dyn EffectPermit>> {
+        if let EffectAttempt::ShellSpawn { program_path, .. } = effect {
+            self.decided
+                .lock()
+                .expect("record")
+                .push((*program_path).to_string());
+            if !self.swapped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::remove_file(&self.link).expect("remove the approved link");
+                std::os::unix::fs::symlink(&self.other, &self.link).expect("swap in the other");
+            }
+        }
+        Ok(Box::new(Pass))
+    }
+}
+
+/// **The spawn seam receives the identity the decision named.** A symbolic link spelling is
+/// judged as its canonical target, and a link swapped inside the admission window cannot hand the
+/// seam a different program.
+#[cfg(unix)]
+#[test]
+fn a_symlink_swapped_inside_the_admission_window_cannot_divert_a_host_spawn() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("host-spawn-window");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("out")).expect("fixture root");
+    for program in ["out/built", "out/other"] {
+        std::fs::write(base.join(program), "#!/bin/sh\n").expect("a program");
+        std::fs::set_permissions(base.join(program), std::fs::Permissions::from_mode(0o755))
+            .expect("an executable program");
+    }
+    let base = base.canonicalize().expect("a canonical root");
+    let link = base.join("out/link");
+    std::os::unix::fs::symlink(base.join("out/built"), &link).expect("the approved link");
+
+    let decided = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let swapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let local = tokio::task::LocalSet::new();
+
+    let status = local.block_on(&rt, async {
+        let mut shell = Shell::builder()
+            .disable_network()
+            .effect_interceptor(Arc::new(LinkSwapper {
+                link: link.clone(),
+                other: base.join("out/other"),
+                decided: Arc::clone(&decided),
+                swapped: Arc::clone(&swapped),
+            }))
+            .host_spawner(recording_spawner(Arc::clone(&received)))
+            .build()
+            .expect("shell builds");
+        shell.run(link.to_str().expect("UTF-8 link")).await.status
+    });
+    rt.block_on(local);
+
+    let built = base.join("out/built");
+    assert!(
+        swapped.load(std::sync::atomic::Ordering::SeqCst),
+        "the interceptor must have run and performed the swap",
+    );
+    assert_eq!(status, 0, "the permitted program runs");
+    assert_eq!(
+        *decided.lock().expect("read"),
+        vec![built.display().to_string()],
+        "the decision names the canonical target of the spelling, not the spelling",
+    );
+    assert_eq!(
+        *received.lock().expect("read"),
+        vec![built],
+        "the seam receives the program the decision named, not the swapped-in one",
+    );
+}
+
+/// Admits every attempt, records the program each `shell:spawn` decision names, and on the first
+/// one plants a program at `at` — the file an attacker races into the window after a decision on a
+/// spelling that named nothing.
+struct Planter {
+    at: PathBuf,
+    decided: Arc<std::sync::Mutex<Vec<String>>>,
+    planted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl EffectInterceptor for Planter {
+    async fn intercept(
+        &self,
+        effect: &EffectAttempt<'_>,
+    ) -> std::io::Result<Box<dyn EffectPermit>> {
+        if let EffectAttempt::ShellSpawn { program_path, .. } = effect {
+            self.decided
+                .lock()
+                .expect("record")
+                .push((*program_path).to_string());
+            if !self.planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::os::unix::fs::symlink("/bin/sh", &self.at).expect("plant the program");
+            }
+        }
+        Ok(Box::new(Pass))
+    }
+}
+
+/// **A spelling that bound no file at decision time never reaches the seam.** The decision is
+/// raised on the folded spelling, a permit answers `command not found`, and a program planted
+/// inside the admission window does not run.
+#[cfg(unix)]
+#[test]
+fn a_program_planted_inside_the_admission_window_does_not_reach_the_seam() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("host-spawn-plant");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("tools")).expect("fixture root");
+    let base = base.canonicalize().expect("a canonical root");
+    let at = base.join("tools/g");
+
+    let decided = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let planted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let local = tokio::task::LocalSet::new();
+
+    let out = local.block_on(&rt, async {
+        let mut shell = Shell::builder()
+            .disable_network()
+            .effect_interceptor(Arc::new(Planter {
+                at: at.clone(),
+                decided: Arc::clone(&decided),
+                planted: Arc::clone(&planted),
+            }))
+            .host_spawner(recording_spawner(Arc::clone(&received)))
+            .build()
+            .expect("shell builds");
+        shell
+            .run(&format!("{}/tools/../tools/g", base.display()))
+            .await
+    });
+    rt.block_on(local);
+
+    assert!(
+        planted.load(std::sync::atomic::Ordering::SeqCst),
+        "the interceptor must have run and planted the program",
+    );
+    assert_eq!(
+        *decided.lock().expect("read"),
+        vec![at.display().to_string()],
+        "the decision names the folded spelling",
+    );
+    assert!(
+        received.lock().expect("read").is_empty(),
+        "an unbound spelling must not reach the seam: {:?}",
+        received.lock().expect("read")
+    );
+    assert_eq!(out.status, 127, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("command not found"),
+        "a permitted spelling that bound no file is not found: {}",
+        out.stderr
+    );
+}

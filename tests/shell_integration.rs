@@ -8045,3 +8045,33 @@ fn uniq_skip_chars_multibyte_no_panic() {
         assert_eq!(out.stdout, "éx\néy\n");
     }));
 }
+// Fail closed: with no `host_spawner` hook installed there is no contained path, so a
+// host binary is REFUSED rather than run uncontained. This is the guarantee that made the box's
+// containment a property of construction — a Shell that forgot to wire the hook cannot silently run
+// a program on the host. `hostname` is a real host binary the Shell does not implement and ships on
+// every supported platform.
+#[cfg(unix)]
+#[test]
+fn a_host_binary_is_refused_when_no_spawn_hook_is_installed() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        let out = shell.run("hostname").await;
+        assert_ne!(
+            out.status, 0,
+            "a host binary must be refused when no spawn hook is installed, not run uncontained: \
+             status={} stderr={}",
+            out.status, out.stderr
+        );
+        assert!(
+            out.stdout.trim().is_empty(),
+            "a refused host binary must produce no output: stdout={}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("contained spawner") || out.stderr.contains("not available"),
+            "the refusal must name the missing contained spawner: stderr={}",
+            out.stderr
+        );
+    }));
+}

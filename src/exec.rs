@@ -166,10 +166,184 @@ async fn admit(
     // a substring of this.
     let command = canonical_command_line(program, args);
     let cwd = proc.cwd.to_string_lossy().into_owned();
-    match os.admit_run(&command, program, args, literal, &cwd).await {
-        Ok(permit) => Ok(permit),
+
+    // Which action judges this command: `shell:run` when this Shell implements the program,
+    // `shell:spawn` when a host binary would run instead. Decided here, once, because this is
+    // the only admission point — so the action a rule names is the action the dispatch below
+    // takes, and the two cannot disagree.
+    //
+    // `host_program` performs the `PATH` walk, so the decision carries the resolved
+    // `program_path` rather than a name. That is what a `shell:spawn` rule pins: the name is
+    // workload-influenced through `PATH`, and the path is what will execute.
+    let resolved = match host_program(os, proc, program).await {
+        Some(resolved) => resolved,
+        None => {
+            return match os.admit_run(&command, program, args, literal, &cwd).await {
+                Ok(permit) => Ok(permit),
+                Err(error) => Err(refuse(proc, &error)),
+            };
+        }
+    };
+    match os
+        .admit_spawn(&command, program, &resolved.path, args, literal, &cwd)
+        .await
+    {
+        Ok(permit) => Ok(permit.with_spawn_program(resolved)),
         Err(error) => Err(refuse(proc, &error)),
     }
+}
+
+/// The resolved path of a host binary this Shell does **not** implement, if there is one.
+///
+/// `None` means the program is internal, or is nowhere on `PATH` — both of which are
+/// `shell:run` questions. An internal program is checked first, so a builtin always wins over
+/// a same-named host binary: otherwise a `git` on `PATH` could not be told apart from the
+/// Shell's own `echo`, and an operator's `shell:run` rule would silently start describing a
+/// host exec.
+async fn host_program(os: &Arc<Mediated>, proc: &Process, program: &str) -> Option<HostProgram> {
+    if builtins::lookup(program).is_some()
+        || commands::lookup(program).is_some()
+        || proc.get_function(program).is_some()
+    {
+        return None;
+    }
+    // Not `find_in_path`, and the difference is the whole reason this function exists.
+    //
+    // `find_in_path` walks `PATH` through the Shell's own VFS, where **only the box home and the
+    // declared binds exist**. So it can never see
+    // `/usr/bin/git`: measured, `ls /usr/bin/git` inside the box answers "No such file or
+    // directory" while `PATH` is `/usr/bin:/bin`. A VFS walk therefore always answers `None` for
+    // a host binary, and passthrough would be unreachable however the policy were written.
+    //
+    // This walk consults the **host** filesystem instead. That is a deliberate hole in the mount
+    // floor, and it is bounded to *finding an executable file by a bare name*: it discloses
+    // whether a name exists on `PATH` and nothing about content. A spelling with a separator is
+    // judged whether or not it names a file, so a refused spelling discloses nothing. What
+    // keeps the walk from widening the floor generally is that its only consumer is the
+    // `shell:spawn` decision — the path it finds is not returned to the workload, is not openable
+    // through the VFS, and reaches nothing unless a rule permits that exact program.
+    let _ = os;
+    host_program_path(program, &proc.cwd)
+}
+
+/// A host program a `shell:spawn` decision names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostProgram {
+    /// The path the decision names: the canonical identity of a bound file, else the spelling made
+    /// absolute.
+    pub(crate) path: String,
+    /// The spelling the caller used, made absolute, which the program reads as `argv[0]`.
+    pub(crate) spelling: String,
+    /// Whether an existing file was bound at decision time; an unbound program never reaches the
+    /// seam.
+    pub(crate) bound: bool,
+}
+
+impl HostProgram {
+    fn bound(identity: &std::path::Path, spelling: &std::path::Path) -> Self {
+        Self {
+            path: identity.to_string_lossy().into_owned(),
+            spelling: spelling.to_string_lossy().into_owned(),
+            bound: true,
+        }
+    }
+
+    fn unbound(spelling: &std::path::Path) -> Self {
+        let spelling = lexical_absolute(spelling).to_string_lossy().into_owned();
+        Self {
+            path: spelling.clone(),
+            spelling,
+            bound: false,
+        }
+    }
+}
+
+/// The host program a spelling names: a spelling with a separator is that path, absolute or
+/// relative to `cwd`, bound to its canonical identity when it names a file; a bare name is found on
+/// the operator's host `PATH` and bound the same way.
+fn host_program_path(program: &str, cwd: &std::path::Path) -> Option<HostProgram> {
+    let path_var = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    host_program_on(program, cwd, &path_var.to_string_lossy())
+}
+
+/// [`host_program_path`] against one `PATH` value.
+fn host_program_on(program: &str, cwd: &std::path::Path, path_var: &str) -> Option<HostProgram> {
+    if program.contains('/') {
+        let spelled = std::path::Path::new(program);
+        let candidate = if spelled.is_absolute() {
+            spelled.to_path_buf()
+        } else {
+            cwd.join(spelled)
+        };
+        return Some(match candidate.canonicalize() {
+            Ok(identity) => HostProgram::bound(&identity, &lexical_absolute(&candidate)),
+            Err(_) => HostProgram::unbound(&candidate),
+        });
+    }
+    let found = std::path::PathBuf::from(host_path_lookup(program, path_var)?);
+    let identity = found.canonicalize().ok()?;
+    Some(HostProgram::bound(&identity, &lexical_absolute(&found)))
+}
+
+/// The spelling made absolute by the path grammar alone: `.` dropped and `..` folded, nothing
+/// consulted on the host.
+fn lexical_absolute(candidate: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut folded = std::path::PathBuf::from("/");
+    for component in candidate.components() {
+        match component {
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::Normal(part) => folded.push(part),
+        }
+    }
+    folded
+}
+
+/// Find `program` on `path_var`, the operator's host `PATH` — this trusted process's real
+/// environment, falling back to `/usr/bin:/bin` — against the host filesystem, not the Shell's
+/// synthetic `proc.env`.
+///
+/// A host binary is resolved against the host, so it is searched on the host's own `PATH`; the
+/// synthetic `/usr/bin:/bin` in `proc.env` never saw a tool under Homebrew, nvm, or mise. A wider
+/// resolution `PATH` changes only *where* a permitted program is found, never *whether* an
+/// unpermitted one runs — the `shell:spawn` decision is the allowlist — and `proc.env` stays
+/// synthetic, so the operator's real `PATH` is not disclosed to the workload.
+///
+/// A candidate must be a regular file with an execute bit, so a directory named `git` on `PATH` is
+/// skipped rather than reported as a program. An empty `PATH` entry is skipped, not resolved
+/// against the cwd.
+fn host_path_lookup(program: &str, path_var: &str) -> Option<String> {
+    for directory in path_var.split(':') {
+        if directory.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(directory).join(program);
+        if is_host_executable(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Whether `candidate` is a regular file on the host with an execute bit.
+fn is_host_executable(candidate: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Turn an admission error into the status the caller reports.
@@ -185,6 +359,80 @@ fn refuse(proc: &mut Process, error: &std::io::Error) -> i32 {
     };
     proc.err_msg(&format!("strands-shell: {label}: {error}"));
     status
+}
+
+/// Run one host binary that `shell:spawn` admission already permitted, or `None` when no
+/// `shell:spawn` decision named one.
+///
+/// **Policy is the allowlist.** There is no separate list of permitted binaries: a program
+/// reaches here only after `admit` raised `shell:spawn` with this resolved path and the
+/// authority returned `Allow`. An absent rule denies, so passthrough is opt-in by writing a
+/// rule and nothing else.
+///
+/// Resolution happens once, in `admit`, and the bound identity travels with the permit to this
+/// call; an unbound spelling is "not found" here and never reaches the seam.
+///
+/// Three properties of what runs, each deliberate:
+///
+/// - **Output is captured and relayed through the Shell's own streams**, never inherited.
+///   Inheriting was measured wrong in a way that matters twice: `git --version` returned status 0
+///   while printing nothing to the caller, because the child wrote to the *daemon's* stdout — the
+///   daemon's log — instead of the broker's channel. So the caller saw silence, and the daemon's
+///   log gained a line per passthrough program, which
+///   `crates/box/CLAUDE.md` forbids ("never log per request or per command there").
+///   Handing a child the daemon's descriptors is also a small capability leak: it writes wherever
+///   the daemon's fd 1 points.
+/// - **The environment is the Shell's own**, which the box composed. It is not the daemon's:
+///   the daemon's environment holds the operator's real `env://` secrets, and a passthrough
+///   binary must not inherit them.
+/// - **The working directory is the Shell's**, so a relative argument means what the decision's
+///   `cwd` said it meant.
+async fn spawn_host_program(
+    os: &Mediated,
+    name: &str,
+    args: &[String],
+    admitted: Option<HostProgram>,
+) -> Option<i32> {
+    let proc = CURRENT_PROCESS.with(|p| p.borrow().fork());
+    // The identity the decision bound, carried rather than resolved again, beside the spelling the
+    // caller used.
+    let program = admitted.filter(|program| program.bound)?;
+
+    // Hand the resolved spawn to the kernel's host-spawn seam. The box installs a hook that runs
+    // the binary inside a contained leaf box; with no hook the seam fails closed and the binary
+    // is refused, not run uncontained. The environment is the Shell's composed one — cleared
+    // and never inherited — so a spawned binary sees no daemon environment.
+    let spawn = crate::os::HostSpawn {
+        program: program.path.into(),
+        invoked: program.spelling.into(),
+        args: args.to_vec(),
+        cwd: proc.cwd.clone(),
+        env: proc
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    };
+    let outcome = match os.spawn_host(spawn).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Ok(mut w) = crate::io::stderr() {
+                let _ = w
+                    .write_all(format!("strands-shell: {name}: {error}\n").as_bytes())
+                    .await;
+            }
+            // 126 — found and permitted, but not runnable. Distinct from 127.
+            return Some(126);
+        }
+    };
+    // The captured bytes leave through the Shell's own streams, never a child's inherited fds.
+    if let Ok(mut w) = crate::io::stdout() {
+        let _ = w.write_all(&outcome.stdout).await;
+    }
+    if let Ok(mut w) = crate::io::stderr() {
+        let _ = w.write_all(&outcome.stderr).await;
+    }
+    Some(outcome.status)
 }
 
 /// The program and its arguments as one line, for `context.input.command`.
@@ -3566,6 +3814,10 @@ async fn run_pipeline(
             ));
         } else {
             // External commands
+            let admitted_program = permits
+                .get(i)
+                .and_then(Option::as_ref)
+                .and_then(|permit| permit.spawn_program().cloned());
             handles.push((
                 i,
                 tokio::task::spawn_local(CURRENT_KERNEL.scope(
@@ -3585,17 +3837,38 @@ async fn run_pipeline(
                                     1
                                 }
                             },
-                            None => {
-                                if let Ok(mut w) = crate::io::stderr() {
-                                    let _ = w
-                                        .write_all(
-                                            format!("strands-shell: {name}: command not found\n")
+                            // Not a program this Shell implements. Try the host binary, which
+                            // `admit` has already judged as `shell:spawn` — and fall through to
+                            // `command not found` when no bound program reached this point.
+                            //
+                            // **127 is kept, not replaced.** A bare name that is neither internal
+                            // nor on `PATH` is "not found" before any decision; a spelling with a
+                            // separator is judged first, so it is "not found" only once a permit
+                            // let it through and no file was bound. The three outcomes stay
+                            // distinct: `126` denied, the binary's own status, `127` absent.
+                            None => match spawn_host_program(
+                                os.as_ref(),
+                                &name,
+                                &args,
+                                admitted_program,
+                            )
+                            .await
+                            {
+                                Some(status) => status,
+                                None => {
+                                    if let Ok(mut w) = crate::io::stderr() {
+                                        let _ = w
+                                            .write_all(
+                                                format!(
+                                                    "strands-shell: {name}: command not found\n"
+                                                )
                                                 .as_bytes(),
-                                        )
-                                        .await;
+                                            )
+                                            .await;
+                                    }
+                                    127
                                 }
-                                127
-                            }
+                            },
                         }
                     }),
                 )),
@@ -3714,4 +3987,168 @@ async fn read_receivers_limited(receivers: Vec<mpsc::Receiver<Bytes>>, limit: us
         }
     }
     output
+}
+
+#[cfg(test)]
+mod host_program_path_tests {
+    use super::{HostProgram, host_program_on, host_program_path, lexical_absolute};
+    use std::path::{Path, PathBuf};
+
+    fn root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("host-program-path-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("out")).expect("an out directory");
+        std::fs::write(root.join("out/built"), "#!/bin/sh\nprintf ran\n").expect("a program");
+        std::fs::write(root.join("out/notes.txt"), "").expect("a file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                root.join("out/built"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("an executable program");
+            std::os::unix::fs::symlink(root.join("out/built"), root.join("out/link"))
+                .expect("a link to the program");
+            std::os::unix::fs::symlink(root.join("out"), root.join("bin"))
+                .expect("a link to the directory");
+        }
+        root.canonicalize().expect("a canonical root")
+    }
+
+    fn bound(path: PathBuf) -> Option<HostProgram> {
+        bound_as(path.clone(), path)
+    }
+
+    fn bound_as(path: PathBuf, spelling: PathBuf) -> Option<HostProgram> {
+        Some(HostProgram {
+            path: path.to_string_lossy().into_owned(),
+            spelling: spelling.to_string_lossy().into_owned(),
+            bound: true,
+        })
+    }
+
+    fn unbound(path: PathBuf) -> Option<HostProgram> {
+        Some(HostProgram {
+            path: path.to_string_lossy().into_owned(),
+            spelling: path.to_string_lossy().into_owned(),
+            bound: false,
+        })
+    }
+
+    /// **A path spelling names its file as the canonical path**, absolute or relative to the cwd.
+    #[test]
+    fn a_path_spelling_names_an_executable_file_absolute_or_relative_to_the_cwd() {
+        let root = root("spelling");
+        let built = root.join("out/built");
+        assert_eq!(
+            host_program_path(built.to_str().unwrap(), &root),
+            bound(built.clone())
+        );
+        assert_eq!(host_program_path("out/built", &root), bound(built.clone()));
+        assert_eq!(host_program_path("./out/built", &root), bound(built));
+    }
+
+    /// **A symbolic link spelling names its target and keeps its spelling**, so the decision and
+    /// the box's tool selection judge one identity while the program reads the spelling as
+    /// `argv[0]`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_spelling_names_its_target() {
+        let root = root("symlink");
+        assert_eq!(
+            host_program_path("out/link", &root),
+            bound_as(root.join("out/built"), root.join("out/link"))
+        );
+    }
+
+    /// **A bare name is named by its canonical identity**, so a program found through a symbolic
+    /// `PATH` directory is judged and selected as the file it is; its spelling is where `PATH`
+    /// found it.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_name_is_named_by_its_canonical_identity() {
+        let root = root("bare");
+        let path_var = root.join("bin").to_string_lossy().into_owned();
+        assert_eq!(
+            host_program_on("built", &root, &path_var),
+            bound_as(root.join("out/built"), root.join("bin/built"))
+        );
+        assert_eq!(host_program_on("absent", &root, &path_var), None);
+    }
+
+    /// **Every spelling that reaches the seam canonicalizes to the identity that runs.** This is the
+    /// contract `argv[0]` rests on: the spelling is a second name for the very file the decision
+    /// judged, never a name for another one, so carrying it to the launch cannot redirect the exec.
+    /// An unbound program has no identity to agree with and never reaches the seam.
+    #[cfg(unix)]
+    #[test]
+    fn a_bound_spelling_always_canonicalizes_to_its_identity() {
+        let root = root("agreement");
+        let path_var = root.join("bin").to_string_lossy().into_owned();
+        let spellings = [
+            root.join("out/built").to_string_lossy().into_owned(),
+            "out/built".to_string(),
+            "./out/link".to_string(),
+            "out/link".to_string(),
+        ];
+        for spelled in &spellings {
+            let program = host_program_path(spelled, &root).expect("the spelling is judged");
+            assert!(program.bound, "{spelled} names a file");
+            let identity = std::path::Path::new(&program.spelling)
+                .canonicalize()
+                .unwrap_or_else(|e| panic!("{spelled}: its spelling resolves: {e}"));
+            assert_eq!(
+                identity,
+                std::path::Path::new(&program.path),
+                "{spelled}: the spelling must name the identity that runs"
+            );
+        }
+        // A bare name found on `PATH` keeps the agreement too.
+        let found = host_program_on("built", &root, &path_var).expect("the bare name resolves");
+        assert_eq!(
+            std::path::Path::new(&found.spelling)
+                .canonicalize()
+                .expect("its spelling resolves"),
+            std::path::Path::new(&found.path),
+        );
+        // An unbound spelling has no identity, and `spawn_host_program` drops it.
+        let absent = host_program_path("out/absent", &root).expect("a spelling is judged");
+        assert!(!absent.bound, "an absent spelling is not bound");
+    }
+
+    /// **A spelling with a separator is judged, not hidden**: an existing path is bound, an absent
+    /// one is named by its folded spelling and left unbound, and only a bare name absent from
+    /// `PATH` names nothing.
+    #[test]
+    fn an_absent_spelling_is_judged_and_left_unbound() {
+        let root = root("judged");
+        assert_eq!(
+            host_program_path("out/notes.txt", &root),
+            bound(root.join("out/notes.txt"))
+        );
+        assert_eq!(host_program_path("./out", &root), bound(root.join("out")));
+        assert_eq!(
+            host_program_path("out/absent", &root),
+            unbound(root.join("out/absent"))
+        );
+        assert_eq!(
+            host_program_path("out/../out/./../nowhere/x", &root),
+            unbound(root.join("nowhere/x"))
+        );
+        assert_eq!(
+            host_program_path("no-such-program-for-this-test", &root),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lexical_absolute_folds_parents_and_drops_dots() {
+        assert_eq!(
+            lexical_absolute(Path::new("/proj/tools/../../etc/./x")),
+            PathBuf::from("/etc/x")
+        );
+        assert_eq!(lexical_absolute(Path::new("/../../a")), PathBuf::from("/a"));
+    }
 }

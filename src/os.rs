@@ -1127,6 +1127,49 @@ pub type ScriptInterpreter = std::sync::Arc<dyn Fn(String) -> ScriptFuture + Sen
 pub type ScriptFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ScriptOutcome>> + Send>>;
 
+/// The outcome of running a host binary through [`Kernel::spawn_host`].
+///
+/// The mirror of [`ScriptOutcome`] for the host-binary seam: a process-style status and the
+/// captured streams. Buffered, not streamed — the hook runs the binary to completion and hands
+/// back what it produced.
+pub struct HostSpawnOutcome {
+    /// The binary's process-style exit status.
+    pub status: i32,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+}
+
+/// A hook that runs a host binary for [`Kernel::spawn_host`].
+///
+/// The embedder installs one through [`crate::ShellBuilder::host_spawner`]. It takes the resolved
+/// program, its arguments, and the working directory, and returns the outcome. The host-binary
+/// counterpart of [`ScriptInterpreter`]: a stated destination for execution the Shell forwards
+/// rather than owns, so an embedder can run the binary somewhere the Shell cannot — for
+/// `strands-box`, inside a contained leaf box.
+pub type HostSpawner = std::sync::Arc<dyn Fn(HostSpawn) -> HostSpawnFuture + Send + Sync>;
+
+/// The future a [`HostSpawner`] hook returns: the pending [`HostSpawnOutcome`].
+pub type HostSpawnFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<HostSpawnOutcome>> + Send>>;
+
+/// One resolved host-binary spawn request handed to a [`HostSpawner`].
+pub struct HostSpawn {
+    /// The resolved absolute path of the program to run.
+    pub program: std::path::PathBuf,
+    /// The spelling the caller invoked the program by, made absolute, which the program reads as
+    /// `argv[0]`.
+    pub invoked: std::path::PathBuf,
+    /// The program's arguments, in order.
+    pub args: Vec<String>,
+    /// The working directory the binary runs in.
+    pub cwd: std::path::PathBuf,
+    /// The composed environment the binary runs with. The built-in spawn applies exactly this,
+    /// never the process's inherited environment; an embedder's hook may compose its own instead.
+    pub env: Vec<(String, String)>,
+}
+
 // No `HttpTransport` seam. Routing the Shell's egress through a boundary is not a
 // mechanism the Shell should own: a trait every embedding must wire up correctly is
 // weaker than a proxy destination an operator can inspect, and it can route anywhere —
@@ -1374,4 +1417,59 @@ pub trait Kernel: Send + Sync {
             "script interpreter not available",
         ))
     }
+
+    /// Run a host binary the Shell does not implement.
+    ///
+    /// The counterpart of [`run_script`](Self::run_script) for a host binary. The default is
+    /// `Unsupported`, so a Shell with no [`HostSpawner`] hook **refuses** rather than running the
+    /// binary uncontained — mirroring `run_script`. An embedder installs a hook through
+    /// [`crate::ShellBuilder::host_spawner`] to run it (for `strands-box`, inside a contained leaf
+    /// box), or explicitly opts into the crate's built-in `fork`+`exec` with [`builtin_spawn_host`].
+    /// Raises no admission here: the command-level `shell:spawn` already fired when the command
+    /// resolved.
+    async fn spawn_host(&self, _spawn: HostSpawn) -> io::Result<HostSpawnOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "host-binary spawner not available",
+        ))
+    }
+}
+
+/// Run a host binary with the crate's built-in `fork`+`exec`, capturing its output.
+///
+/// The default behind [`Kernel::spawn_host`], and what a [`crate::vfs_kernel::VfsKernel`] with no
+/// [`HostSpawner`] installed falls back to. The environment is exactly [`HostSpawn::env`] — cleared
+/// first, never inherited — the working directory is [`HostSpawn::cwd`], and `stdin` is null.
+pub async fn builtin_spawn_host(spawn: HostSpawn) -> io::Result<HostSpawnOutcome> {
+    let mut command = tokio::process::Command::new(&spawn.program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().arg0(&spawn.invoked);
+    }
+    command.args(&spawn.args);
+    command.current_dir(&spawn.cwd);
+    command.env_clear();
+    for (key, value) in &spawn.env {
+        command.env(key, value);
+    }
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let output = command.output().await?;
+    Ok(HostSpawnOutcome {
+        status: output.status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                output.status.signal().map_or(128, |signal| 128 + signal)
+            }
+            #[cfg(not(unix))]
+            {
+                128
+            }
+        }),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }

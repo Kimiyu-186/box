@@ -132,7 +132,6 @@ impl Mediated {
     /// Raised by [`run_pipeline`](crate::exec) for a program this Shell does not implement, with
     /// the path its own `PATH` walk resolved. A permit here is what `spawn_host_program` acts on,
     /// so the binary that runs is the binary the authority saw.
-    #[allow(dead_code)]
     pub(crate) async fn admit_spawn(
         &self,
         command: &str,
@@ -162,8 +161,12 @@ impl Mediated {
                 .await
                 .map(|permit| CommandPermit {
                     permit: Some(permit),
+                    spawn_program: None,
                 }),
-            None => Ok(CommandPermit { permit: None }),
+            None => Ok(CommandPermit {
+                permit: None,
+                spawn_program: None,
+            }),
         }
     }
 
@@ -598,6 +601,17 @@ impl Mediated {
     pub async fn run_script(&self, source: String) -> io::Result<crate::os::ScriptOutcome> {
         self.kernel.run_script(source).await
     }
+
+    /// Run a host binary through the embedder's hook, or the built-in spawn.
+    ///
+    /// Raises no admission, for the same reason [`run_script`](Self::run_script) does not: the
+    /// command-level `shell:spawn` fired when the command resolved.
+    pub async fn spawn_host(
+        &self,
+        spawn: crate::os::HostSpawn,
+    ) -> io::Result<crate::os::HostSpawnOutcome> {
+        self.kernel.spawn_host(spawn).await
+    }
 }
 
 /// One admitted command, owing an outcome report.
@@ -611,9 +625,22 @@ impl Mediated {
 /// did not complete and history must not claim it did.
 pub(crate) struct CommandPermit {
     permit: Option<Box<dyn EffectPermit>>,
+    /// The host program a `shell:spawn` decision named, carried to the spawn unchanged.
+    spawn_program: Option<crate::exec::HostProgram>,
 }
 
 impl CommandPermit {
+    /// Carry the host program the `shell:spawn` decision named.
+    pub(crate) fn with_spawn_program(mut self, program: crate::exec::HostProgram) -> Self {
+        self.spawn_program = Some(program);
+        self
+    }
+
+    /// The host program the decision named, or `None` for a `shell:run` command.
+    pub(crate) fn spawn_program(&self) -> Option<&crate::exec::HostProgram> {
+        self.spawn_program.as_ref()
+    }
+
     /// Report the command's exit status, consuming the permit.
     ///
     /// A recording failure is surfaced rather than converted into a denial — the command
@@ -742,5 +769,36 @@ mod disposition_guard {
         // `remove_file` acts on the link (Follow::No); hand it a Follow::Yes token.
         let wrong = kernel.resolve(&proc, "/d/link", Follow::Yes).await;
         let _ = kernel.remove_file(&proc, wrong).await;
+    }
+}
+
+#[cfg(test)]
+mod spawn_admission {
+    use std::sync::Arc;
+
+    use crate::os::Kernel;
+    use crate::vfs::Vfs;
+    use crate::vfs_kernel::VfsKernel;
+
+    use super::Mediated;
+
+    /// A spawn with no interceptor installed is permitted and carries no permit.
+    #[tokio::test]
+    async fn a_spawn_without_an_interceptor_is_permitted() {
+        let kernel: Arc<dyn Kernel> = Arc::new(VfsKernel::new(Vfs::new()));
+        let mediated = Mediated::new(kernel, None);
+        let permit = mediated
+            .admit_spawn("git status", "git", "/usr/bin/git", &[], &[], "/")
+            .await
+            .expect("a spawn with no interceptor is permitted");
+        assert!(permit.permit.is_none(), "no interceptor issues no permit");
+        assert!(
+            permit.spawn_program().is_none(),
+            "no decision names a program"
+        );
+        permit
+            .record(0)
+            .await
+            .expect("an absent permit records nothing");
     }
 }

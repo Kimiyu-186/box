@@ -693,6 +693,7 @@ pub struct ShellBuilder {
     network_enabled: bool,
     egress_proxy: Option<EgressProxy>,
     script_interpreter: Option<crate::os::ScriptInterpreter>,
+    host_spawner: Option<crate::os::HostSpawner>,
     egress_refusal_header: Option<String>,
     effect_interceptor: Option<Arc<dyn EffectInterceptor>>,
     kernel: Option<Arc<dyn Kernel>>,
@@ -717,6 +718,7 @@ impl Default for ShellBuilder {
             network_enabled: true,
             egress_proxy: None,
             script_interpreter: None,
+            host_spawner: None,
             egress_refusal_header: None,
             effect_interceptor: None,
             kernel: None,
@@ -1055,6 +1057,18 @@ impl ShellBuilder {
         self
     }
 
+    /// Install the hook that backs [`Kernel::spawn_host`](crate::os::Kernel::spawn_host).
+    ///
+    /// A stated position, the counterpart of [`script_interpreter`](Self::script_interpreter): an
+    /// embedder that wants a host binary the Shell does not implement to run somewhere other than a
+    /// plain child process installs the hook here. Without it, `spawn_host` uses the built-in
+    /// `fork`+`exec`. Applies only to the bundled kernel; a kernel supplied through
+    /// [`kernel`](Self::kernel) owns its own `spawn_host`.
+    pub fn host_spawner(mut self, hook: crate::os::HostSpawner) -> Self {
+        self.host_spawner = Some(hook);
+        self
+    }
+
     /// Name the response header the egress proxy sets on a refusal it originates itself.
     ///
     /// State it before [`egress_proxy`](Self::egress_proxy), which reads it. Without it a refusal the
@@ -1201,6 +1215,7 @@ impl ShellBuilder {
                 kernel.network_enabled = self.network_enabled;
                 kernel.egress_proxy = self.egress_proxy;
                 kernel.script_interpreter = self.script_interpreter;
+                kernel.host_spawner = self.host_spawner;
                 Arc::new(kernel)
             }
         };

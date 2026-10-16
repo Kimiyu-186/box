@@ -56,6 +56,8 @@ pub struct VfsKernel {
     /// When set, `run_script` forwards the source to this interpreter hook. `None`
     /// leaves `run_script` `Unsupported`, so a Shell with no hook refuses a script.
     pub script_interpreter: Option<crate::os::ScriptInterpreter>,
+    /// When set, `spawn_host` forwards the binary to this hook.
+    pub host_spawner: Option<crate::os::HostSpawner>,
     resolution_generation: Arc<Mutex<u64>>,
     pending_writes: std::sync::Mutex<Vec<PendingWrite>>,
 }
@@ -77,6 +79,7 @@ impl VfsKernel {
             network_enabled: true,
             egress_proxy: None,
             script_interpreter: None,
+            host_spawner: None,
             resolution_generation: Arc::new(Mutex::new(0)),
             pending_writes: std::sync::Mutex::new(Vec::new()),
         }
@@ -2000,6 +2003,20 @@ impl Kernel for VfsKernel {
             None => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "script interpreter not available",
+            )),
+        }
+    }
+
+    /// Forward the binary to the installed host-spawner hook, or refuse when none is set.
+    async fn spawn_host(
+        &self,
+        spawn: crate::os::HostSpawn,
+    ) -> io::Result<crate::os::HostSpawnOutcome> {
+        match &self.host_spawner {
+            Some(hook) => hook(spawn).await,
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host-binary execution requires a contained spawner; none is installed",
             )),
         }
     }
