@@ -17,6 +17,36 @@ fn rt() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {
     (rt, local)
 }
 
+/// A host directory unique to this test, removed on drop.
+struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{name}_{}_{n}", std::process::id()));
+        std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        Self(path)
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0)
+            && !std::thread::panicking()
+        {
+            panic!("remove {}: {e}", self.0.display());
+        }
+    }
+}
+
 async fn start_server() -> String {
     let app = Router::new()
         .route("/hello", get(|| async { "Hello, World!" }))
@@ -434,8 +464,7 @@ fn curl_allowed_url_via_toml_config() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let base = start_server().await;
-        let dir = std::env::temp_dir().join("lsh_curl_toml_allow_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_curl_toml_allow_test");
         let config_path = dir.join("allow.toml");
         std::fs::write(&config_path, format!("allowed_urls = [\"{base}/\"]\n")).unwrap();
 
@@ -451,8 +480,6 @@ fn curl_allowed_url_via_toml_config() {
             out.stdout, "Hello, World!",
             "TOML allowed_urls should permit the in-list loopback URL"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -586,8 +613,7 @@ fn curl_query_credential_injection() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let base = start_server().await;
-        let dir = std::env::temp_dir().join("lsh_query_cred_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_query_cred_test");
         let config_path = dir.join("query_cred.toml");
         std::fs::write(
             &config_path,
@@ -614,7 +640,6 @@ param = "api_key"
             "stdout: {}",
             out.stdout
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -623,8 +648,7 @@ fn curl_query_credential_appends_to_existing_query() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let base = start_server().await;
-        let dir = std::env::temp_dir().join("lsh_query_cred_append_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_query_cred_append_test");
         let config_path = dir.join("query_cred.toml");
         std::fs::write(
             &config_path,
@@ -656,7 +680,6 @@ param = "token"
             "stdout: {}",
             out.stdout
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -664,8 +687,7 @@ param = "token"
 fn curl_query_credential_requires_param() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_query_cred_no_param_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_query_cred_no_param_test");
         let config_path = dir.join("query_cred.toml");
         std::fs::write(
             &config_path,
@@ -685,7 +707,6 @@ api_key = "secret"
             "error: {}",
             err
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 

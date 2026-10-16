@@ -9,6 +9,36 @@ fn rt() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {
     (rt, local)
 }
 
+/// A host directory unique to this test, removed on drop.
+struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{name}_{}_{n}", std::process::id()));
+        std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        Self(path)
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0)
+            && !std::thread::panicking()
+        {
+            panic!("remove {}: {e}", self.0.display());
+        }
+    }
+}
+
 macro_rules! shell_test {
     ($name:ident, $cmd:expr, $check:expr) => {
         #[test]
@@ -1998,9 +2028,7 @@ expect!(
 fn grep_binary_run(tag: &str, cmd: &str) -> strands_shell::Output {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join(format!("lsh_grep_bin_{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(&format!("lsh_grep_bin_{tag}"));
         std::fs::write(dir.join("a.txt"), b"needle\n").unwrap();
         std::fs::write(dir.join("b.txt"), b"needle b\n").unwrap();
         std::fs::write(dir.join("bin.dat"), b"\0\xffneedle\n").unwrap();
@@ -2060,9 +2088,7 @@ fn grep_binary_run(tag: &str, cmd: &str) -> strands_shell::Output {
             .bind_direct(dir.to_str().unwrap(), "/g")
             .build()
             .unwrap();
-        let out = shell.run(cmd).await;
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        shell.run(cmd).await
     }))
 }
 
@@ -3292,8 +3318,7 @@ expect!(
 // ── shell builder coverage ─────────────────────────────────────────
 #[test]
 fn builder_bind_readonly() {
-    let dir = std::env::temp_dir().join("lash_test_bind_ro");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = TestDir::new("lash_test_bind_ro");
     std::fs::write(dir.join("hello.txt"), "hi").unwrap();
 
     let (rt, local) = rt();
@@ -3306,8 +3331,6 @@ fn builder_bind_readonly() {
         assert_eq!(out.status, 0);
         assert!(out.stdout.contains("hello.txt"));
     }));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3348,8 +3371,7 @@ fn builder_zero_timeout_rejected() {
 // Same guard reached through the TOML `[limits]` surface.
 #[test]
 fn config_zero_timeout_rejected() {
-    let dir = std::env::temp_dir().join("lsh_zero_timeout_test");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = TestDir::new("lsh_zero_timeout_test");
     let config_path = dir.join("zero_timeout.toml");
     std::fs::write(&config_path, "[limits]\ntimeout = 0\n").unwrap();
     let result = Shell::builder().config_file(&config_path).unwrap().build();
@@ -3357,7 +3379,6 @@ fn config_zero_timeout_rejected() {
         result.is_err(),
         "TOML timeout = 0 should be rejected at build"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // Regression: the per-command deadline must be reset on every run().
@@ -4622,8 +4643,7 @@ expect_status!(command_v_notfound_exit, "command -v nonexistent_cmd_xyz", 1);
 fn builder_bind_direct_host() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_bind_direct_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_bind_direct_test");
         std::fs::write(dir.join("hello.txt"), "direct_content").unwrap();
         let mut shell = Shell::builder()
             .bind_direct(dir.to_str().unwrap(), "/mnt/direct")
@@ -4631,7 +4651,6 @@ fn builder_bind_direct_host() {
             .unwrap();
         let out = shell.run("cat /mnt/direct/hello.txt").await;
         assert_eq!(out.stdout.trim(), "direct_content");
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4639,8 +4658,7 @@ fn builder_bind_direct_host() {
 fn builder_bind_direct_readonly_host() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_bind_dro_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_bind_dro_test");
         std::fs::write(dir.join("data.txt"), "ro_direct").unwrap();
         let mut shell = Shell::builder()
             .bind_direct_readonly(dir.to_str().unwrap(), "/mnt/dro")
@@ -4650,7 +4668,6 @@ fn builder_bind_direct_readonly_host() {
         assert_eq!(out.stdout.trim(), "ro_direct");
         let out2 = shell.run("echo x > /mnt/dro/newfile").await;
         assert_ne!(out2.status, 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4661,9 +4678,8 @@ fn builder_bind_direct_readonly_host() {
 fn bind_direct_symlink_escape_blocked() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_symlink_escape_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("mount")).unwrap();
+        let dir = TestDir::new("lsh_symlink_escape_test");
+        std::fs::create_dir(dir.join("mount")).unwrap();
         std::fs::write(dir.join("mount/safe.txt"), "safe").unwrap();
         std::fs::write(dir.join("secret.txt"), "ESCAPED").unwrap();
         // Create a symlink inside the mount pointing outside it
@@ -4682,7 +4698,6 @@ fn bind_direct_symlink_escape_blocked() {
             "symlink escape should be blocked; stdout: {}",
             out.stdout
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4738,15 +4753,13 @@ fn builder_credential_from_env_missing_var() {
 fn builder_config_file_toml() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_config_test");
         let config_path = dir.join("test.toml");
         std::fs::write(&config_path, "umask = \"077\"\n").unwrap();
         let shell = Shell::builder().config_file(&config_path);
         assert!(shell.is_ok());
         let shell = shell.unwrap().build();
         assert!(shell.is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4754,8 +4767,7 @@ fn builder_config_file_toml() {
 fn config_file_limits_applied() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_limits_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_limits_config_test");
         let config_path = dir.join("limits.toml");
         std::fs::write(
             &config_path,
@@ -4797,8 +4809,6 @@ timeout = 5
         // timeout=5: command should complete within timeout
         let out = shell.run("echo fast").await;
         assert_eq!(out.stdout.trim(), "fast");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4808,8 +4818,7 @@ fn config_file_vfs_caps_applied() {
     // TOML [limits] table so a config-driven (MCP) deployment can set them.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_vfs_caps_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_vfs_caps_config_test");
         let config_path = dir.join("vfs.toml");
         std::fs::write(
             &config_path,
@@ -4843,8 +4852,6 @@ max_file_size = 16
             .run("printf 'ok' > /tmp/ok.txt && cat /tmp/ok.txt")
             .await;
         assert_eq!(out.stdout.trim(), "ok");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4858,8 +4865,7 @@ fn config_file_allowed_urls_applied() {
     // live server in tests/curl_integration.rs::curl_allowed_url_via_toml_config.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_allowed_urls_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_allowed_urls_config_test");
         let config_path = dir.join("urls.toml");
         std::fs::write(
             &config_path,
@@ -4880,7 +4886,6 @@ allowed_urls = ["https://example.com/"]
             out.status, 0,
             "address outside TOML allowed_urls should stay blocked"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4889,8 +4894,7 @@ fn config_file_env_applied() {
     // A [env] table seeds environment variables into the shell.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_env_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_env_config_test");
         let config_path = dir.join("env.toml");
         std::fs::write(
             &config_path,
@@ -4913,7 +4917,6 @@ DEPLOY_TARGET = "staging"
             "demo staging",
             "TOML [env] should seed env vars"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4926,8 +4929,7 @@ fn config_file_combined_all_sections() {
     // top-level array placed after a [table] is silently absorbed into it.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_combined_config_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_combined_config_test");
         let config_path = dir.join("all.toml");
         std::fs::write(
             &config_path,
@@ -4974,8 +4976,6 @@ max_inodes = 10000
             n <= 32,
             "max_file_size from combined config should bound the write; wrote {n}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -4983,8 +4983,7 @@ max_inodes = 10000
 fn config_file_unknown_limit_key_errors() {
     // An unknown [limits] key (e.g. the old `timeout_seconds` typo) must fail
     // loudly rather than being silently ignored — deny_unknown_fields.
-    let dir = std::env::temp_dir().join("lsh_bad_limit_key_test");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = TestDir::new("lsh_bad_limit_key_test");
     let config_path = dir.join("bad.toml");
     std::fs::write(
         &config_path,
@@ -4999,7 +4998,6 @@ timeout_seconds = 30
         result.is_err(),
         "unknown [limits] key should be rejected, not ignored"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -5007,8 +5005,7 @@ fn config_file_unknown_top_level_key_errors() {
     // A typo'd top-level key (e.g. `allowed_url` singular instead of
     // `allowed_urls`) must also be rejected — deny_unknown_fields on VfsConfig.
     // For an SSRF allowlist, silently dropping a misspelled key would fail open.
-    let dir = std::env::temp_dir().join("lsh_bad_toplevel_key_test");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = TestDir::new("lsh_bad_toplevel_key_test");
     let config_path = dir.join("bad.toml");
     std::fs::write(
         &config_path,
@@ -5022,15 +5019,13 @@ allowed_url = ["https://example.com/"]
         result.is_err(),
         "unknown top-level key should be rejected, not ignored"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn config_file_unknown_table_key_errors() {
     // Unknown keys inside [[bind]], [[cred]], and [[mcp]] tables are also
     // rejected, so the "typos fail the parse" guarantee holds at every level.
-    let dir = std::env::temp_dir().join("lsh_bad_table_key_test");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = TestDir::new("lsh_bad_table_key_test");
 
     // [[cred]] with a misspelled key.
     let cred_path = dir.join("bad_cred.toml");
@@ -5081,8 +5076,6 @@ comand = "/path/to/server"
         Shell::builder().config_file(&mcp_path).is_err(),
         "unknown [[mcp]] key should be rejected"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -5091,8 +5084,7 @@ fn config_file_partial_limits_keeps_defaults() {
     // builder defaults, not reset them to zero. Guards the Option-merge.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_partial_limits_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_partial_limits_test");
         let config_path = dir.join("partial.toml");
         std::fs::write(
             &config_path,
@@ -5129,7 +5121,6 @@ max_depth = 7
             1024 * 1024,
             "omitted max_input should keep default"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -5139,8 +5130,7 @@ fn config_file_env_code_wins_regardless_of_order() {
     // no matter whether .env() or .config_file() is called first.
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_env_precedence_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_env_precedence_test");
         let config_path = dir.join("env.toml");
         std::fs::write(
             &config_path,
@@ -5171,8 +5161,6 @@ ONLY_TOML = "toml_only"
             .unwrap();
         assert_eq!(b.run("echo $SHARED").await.stdout.trim(), "from_code");
         assert_eq!(b.run("echo $ONLY_TOML").await.stdout.trim(), "toml_only");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -5588,8 +5576,7 @@ fn url_check_allowed_prefix_no_confusion() {
 fn bind_direct_write_back() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_bind_write_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_bind_write_test");
         let mut shell = Shell::builder()
             .bind_direct(dir.to_str().unwrap(), "/mnt/wr")
             .build()
@@ -5604,7 +5591,6 @@ fn bind_direct_write_back() {
             "host file content: {:?}",
             content
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -5715,10 +5701,9 @@ fn parser_error_unexpected_rparen() {
 fn config_file_with_binds_and_creds() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_config_full_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("lsh_config_full_test");
         let src_dir = dir.join("src");
-        let _ = std::fs::create_dir_all(&src_dir);
+        std::fs::create_dir(&src_dir).unwrap();
         std::fs::write(src_dir.join("test.txt"), "config_bind_test").unwrap();
         let config_path = dir.join("full.toml");
         std::fs::write(
@@ -5751,7 +5736,6 @@ api_key = "test-key-123"
         assert_eq!(out.stdout.trim(), "config_bind_test");
         let out2 = shell.run("umask").await;
         assert_eq!(out2.stdout.trim(), "0077");
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
@@ -7768,17 +7752,16 @@ expect!(cmd_sleep_zero, "command sleep 0 && echo ok", "ok");
 fn bind_direct_dangling_symlink_blocked() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_dangling_symlink_test");
-        let target = std::env::temp_dir().join("lsh_dangling_escape.txt");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&target);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("lsh_dangling_symlink_test");
+        let mount = dir.join("mount");
+        let target = dir.join("escape.txt");
+        std::fs::create_dir(&mount).unwrap();
         // Create a dangling symlink inside the mount pointing outside
-        std::os::unix::fs::symlink(&target, dir.join("escape_link")).unwrap();
+        std::os::unix::fs::symlink(&target, mount.join("escape_link")).unwrap();
         assert!(!target.exists());
 
         let mut shell = Shell::builder()
-            .bind_direct(dir.to_str().unwrap(), "/mnt")
+            .bind_direct(mount.to_str().unwrap(), "/mnt")
             .build()
             .unwrap();
         // Attempt to write through the dangling symlink
@@ -7786,8 +7769,6 @@ fn bind_direct_dangling_symlink_blocked() {
         assert_ne!(out.status, 0);
         // Verify nothing was written outside the mount
         assert!(!target.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }));
 }
 
