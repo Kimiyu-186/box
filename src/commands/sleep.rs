@@ -31,9 +31,21 @@ async fn cmd_sleep(_os: &dyn Kernel, args: &[String]) -> CommandResult {
     {
         let deadline = io::with_process(|p| p.deadline);
         if let Some(dl) = deadline {
+            // Whichever fires first, but the two outcomes are NOT the same and must not be
+            // reported the same way. Losing to the deadline means the sleep did not happen;
+            // `Ok(0)` there claims it did.
+            //
+            // `Shell::timeout`'s own doc states the contract this restores: an expired
+            // command yields "`status = 1` with `strands-shell: execution timeout exceeded`
+            // in stderr", which is what `check_limits` returns and what the Lua interrupt
+            // hook raises. `sleep` was the one place that raced the deadline correctly and
+            // then discarded the distinction — so `sleep 3600` under a 30s timeout exited 0
+            // after 30s, indistinguishable from having actually slept an hour.
             tokio::select! {
                 _ = tokio::time::sleep(sleep_dur) => {}
-                _ = tokio::time::sleep_until(dl) => {}
+                _ = tokio::time::sleep_until(dl) => {
+                    return Err("strands-shell: execution timeout exceeded".into());
+                }
             }
         } else {
             tokio::time::sleep(sleep_dur).await;
