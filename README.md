@@ -33,16 +33,16 @@
 
 ---
 
-Agents run shell commands in tight loops: Install deps, run tests, grep for errors, iterate. Those loops need speed and isolation. 
+Agents run shell commands in fast loops: install dependencies, run tests, grep for errors, and repeat. Those loops need speed and isolation.
 
-Strands Shell is a Bourne-compatible shell that runs in-process. `grep`, `sed`, `jq`, `curl`, `find`, 50+ commands and it does this without fork, exec, syscalls, or cold starts. You declare what the agent can reach (files, URLs, credentials) and everything else doesn't exist to the agent.
+Strands Shell is a Bourne-compatible shell that runs in-process. It gives `grep`, `sed`, `jq`, `curl`, `find`, and more than 50 other commands, with no fork, no exec, no direct syscall, and no cold start. You declare which files the agent reaches. The agent cannot see anything else.
 
 | | Docker | Cloud sandbox | Strands Shell |
 |---|---|---|---|
 | **Cold start** | ~200ms | ~1s (network) | <1ms |
 | **Isolation** | Container namespace | MicroVM | In-process VFS |
-| **Network** | iptables / sidecar | Platform policy | URL allowlist + SSRF guard |
-| **Secrets** | Env vars (agent can read them) | Platform-specific | Injected per-request, agent never sees them |
+| **Network** | iptables / sidecar | Platform policy | On/off switch + SSRF guard |
+| **Secrets** | Env vars (agent can read them) | Platform-specific | The shell holds none, so the agent never sees one |
 | **Setup** | Docker daemon | API key + network | `pip install strands-shell` |
 | **Platforms** | Linux | Cloud-only | macOS, Linux, WASM |
 
@@ -63,7 +63,7 @@ Drop this into your MCP client config:
 }
 ```
 
-That's it and your agent gets `shell`, `read_file`, `write_file`, `list_dir`. All mediated through the Kernel.
+Your agent then gets four tools: `shell`, `read_file`, `write_file`, and `list_dir`. The Kernel mediates all four.
 
 ### Python
 
@@ -76,8 +76,6 @@ import strands_shell
 
 shell = strands_shell.Shell(
     binds=[strands_shell.Bind("/my/project", "/workspace", mode="copy")],
-    credentials=[strands_shell.Cred("https://api.example.com/", env_var="API_TOKEN")],
-    allowed_urls=["https://api.example.com/"],
 )
 
 out = shell.run("grep -rn TODO /workspace")
@@ -111,8 +109,7 @@ flowchart TB
         direction TB
         subgraph kernel ["Kernel (mediation boundary)"]
             vfs["VFS: isolated filesystem"]
-            net["Network: SSRF guard + allowlist"]
-            creds["Credentials: injected per-URL"]
+            net["Network: SSRF guard"]
             limits["Limits: timeout, output, fds"]
         end
         engine["Shell engine: parser, 25 builtins, 33 commands, Lua 5.4"]
@@ -129,10 +126,6 @@ shell = strands_shell.Shell(
         strands_shell.Bind("/host/project", "/workspace", mode="copy"),
         strands_shell.Bind("/tmp/output", "/output", mode="direct"),
     ],
-    credentials=[
-        strands_shell.Cred("https://api.example.com/", env_var="API_TOKEN"),
-    ],
-    allowed_urls=["https://api.example.com/", "https://pypi.org/"],
     timeout=30.0,
     env={"PROJECT": "demo"},
     limits=strands_shell.Limits(
@@ -142,48 +135,39 @@ shell = strands_shell.Shell(
 )
 ```
 
-> ⚠️ **`mode: "direct"` mounts are live.** The agent can read and modify host files in real time. Use only for designated output directories. Never direct-bind directories containing secrets, credentials, or configuration you don't want the agent to modify.
+> ⚠️ **`mode: "direct"` mounts are live.** The agent can read and modify host files in real time. Use only for designated output directories. Never direct-bind directories containing secrets or configuration you don't want the agent to modify.
 
 ### Inspecting configuration
 
 A constructed shell exposes a read-only snapshot of how it was configured. This
 is useful when you embed Strands Shell as a sandbox in a larger framework and
-need to build tool descriptions, surface the network allowlist, or report the
-active resource caps from a shell object you were handed.
+need to build tool descriptions or report the active resource caps from a shell
+object you were handed.
 
 ```python
 shell = strands_shell.Shell(
-    allowed_urls=["https://api.example.com/"],
-    credentials=[strands_shell.Cred("https://api.example.com/", env_var="API_TOKEN")],
+    binds=[strands_shell.Bind("/my/project", "/workspace", mode="copy")],
     timeout=30.0,
 )
 
 cfg = shell.config           # a frozen ShellConfig snapshot
-cfg.allowed_urls             # ('https://api.example.com/',)
+cfg.binds[0].destination     # '/workspace'
 cfg.timeout                  # 30.0
-cfg.credentials[0].url       # 'https://api.example.com/'
-cfg.credentials[0].env_var   # 'API_TOKEN'  (the secret value is never exposed)
 ```
 
 ```javascript
 const shell = await Shell.create({
-  allowedUrls: ['https://api.example.com/'],
-  credentials: [{ url: 'https://api.example.com/', envVar: 'API_TOKEN' }],
+  binds: [{ source: '/my/project', destination: '/workspace', mode: 'copy' }],
   timeout: 30,
 })
 
 const cfg = await shell.config()   // a deep-frozen snapshot object
-cfg.allowedUrls                    // ['https://api.example.com/']
+cfg.binds[0].destination           // '/workspace'
 cfg.timeout                        // 30
-cfg.credentials[0].envVar          // 'API_TOKEN'  (the secret value is never exposed)
 ```
 
-The snapshot reports binds, credentials, the network allowlist, environment
-variables, umask, timeout, and resource limits. Credential **secrets are never
-included** — each entry reports its URL pattern, kind, and source (a literal
-token was supplied, or the name of the environment variable it is read from),
-so you can reason about credentials without the agent or your tooling ever
-seeing the secret itself.
+The snapshot reports binds, environment variables, umask, timeout, resource
+limits, and whether the network is enabled.
 
 ### TOML
 
@@ -194,12 +178,6 @@ You can load all of this from a config file instead:
 mode = "copy"
 source = "/host/project"
 destination = "/workspace"
-
-[[cred]]
-url = "https://api.openai.com/v1/"
-methods = ["POST"]
-kind = "bearer"
-api_key_env = "OPENAI_API_KEY"
 
 [[mcp]]
 name = "my-tools"
@@ -213,7 +191,7 @@ The built-in [MCP](https://modelcontextprotocol.io/) server exposes the shell ov
 
 ```sh
 uvx strands-shell --mcp                          # bare in-memory sandbox
-uvx strands-shell --config sandbox.toml --mcp    # with mounts + credentials
+uvx strands-shell --config sandbox.toml --mcp    # with mounts
 ```
 
 If you declare `[[mcp]]` servers in your TOML config, they show up as Lua modules inside the shell. Call `require("my_tools")` and you get a table of the server's tools.
@@ -227,31 +205,31 @@ The Kernel mediates everything; it runs in the same process as your code, not in
 **Default-deny. You allowlist what the agent can reach:**
 
 - Files: only bound paths exist, everything else is hidden.
-- Network: `curl` blocks private ranges (RFC1918, link-local, loopback, IMDS) by default while letting public URLs pass through. Use `allowed_urls` to permit specific internal hosts.
-- Secrets: the Kernel injects credentials per-URL at request time, ensuring the agent never holds them. The Kernel never re-injects on redirects, even back to the same host.
+- Network: `curl` blocks private ranges (RFC1918, link-local, loopback, IMDS) unconditionally while letting public URLs pass through. This floor is deny-only; it is not the authorization decision. The shell does not decide egress at all — the effect interceptor sees command and filesystem attempts, never a network attempt. Turn outbound HTTP off entirely with `disable_network()`, or route the host process through an egress boundary you control and decide there.
+- Secrets: the shell holds none, so the agent never sees one. Credential injection belongs to the egress boundary you route the process through.
 - Syscalls: there are none; no `fork`, no `exec` because the shell is pure userspace.
 
 If you bypass any of these, report it. See [SECURITY.md](SECURITY.md).
 
-**Limits (best-effort):** timeouts, output caps, fd limits, inode limits. These catch runaway agents but won't stop someone actively trying to break out. OS-level isolation for that.
+**Limits (best-effort):** timeouts, output caps, fd limits, inode limits. They bound a runaway agent. They do not stop an attacker who tries to break out. Use OS-level isolation for that.
 
-**Multi-tenant:** a Shell instance is single-owner. If you're serving multiple agents, create one Shell per session. Construction is cheap (no containers, no VMs, just an in-memory VFS), so spinning up per-request is the intended pattern.
+**Multi-tenant:** a Shell instance is single-owner. If you serve more than one agent, create one Shell per agent. Construction is cheap — no container, no VM, only an in-memory VFS — so one Shell per request is the intended pattern.
 
 ### Secure Defaults
 
-Out of the box, the shell is an empty sandbox — no files, no network, no credentials. When you grant access, follow least privilege:
+Out of the box, the shell is an empty sandbox — no files and no reachable internal network. When you grant access, follow least privilege:
 
 - **Prefer `mode: "copy"` over `mode: "direct"` for source code.** Copy-on-create isolates the agent from your live files. Use `direct` only for output directories where the agent needs to persist results.
 - **Scope binds narrowly.** Bind `/my/project/src` rather than `/my/project` or `/`. The agent doesn't need your `.git/`, `.env`, or `node_modules/`.
-- **Allowlist URLs explicitly.** Don't use `allowed_urls: ["https://"]` — this disables SSRF protection entirely. List the specific API endpoints the agent needs.
-- **Rely on adjustable timeouts.** Commands run under an adjustable per-command timeout, defaulting to 30 seconds, which bounds runaway commands out of the box. Set `timeout` to raise or lower it for your agent loop.
-- **Use limits.** Set `max_output` to prevent agents from filling memory with unbounded command output (1MB is a good default).
+- **Authorize destinations at your egress boundary.** The SSRF floor only blocks internal ranges. The shell does not decide which public hosts the agent may reach, so decide that where the traffic leaves the host process — or call `disable_network()` and grant no egress at all.
+- **Keep the timeout.** The builder already bounds each command at 30 seconds. Set `timeout` only when a workload needs a different bound, and remember that a larger value lets one command hold the process longer.
+- **Keep the limits.** `max_output` already caps one command's output at 1 MB, and `max_file_size` at 10 MB. Lower a cap for a tighter agent loop; raise one deliberately.
 
 ## Commands
 
 25 builtins, 33 commands, and a Bourne-compatible shell with pipes, loops, functions, and subshells.
 
-The commands agents use constantly: `grep`, `find`, `cat`, `head`, `tail`, `jq` for reading and searching. `sed`, `sort`, `tr`, `cut` for transforming output. `cp`, `mv`, `rm`, `mkdir` for managing files. `curl` for HTTP (SSRF-guarded, credentials auto-injected). `lua` for scripting when shell gets awkward.
+The commands agents use constantly: `grep`, `find`, `cat`, `head`, `tail`, `jq` for reading and searching. `sed`, `sort`, `tr`, `cut` for transforming output. `cp`, `mv`, `rm`, `mkdir` for file management. `curl` for HTTP (SSRF-guarded). `lua` for a script that shell syntax makes awkward.
 
 The [full command reference](https://strandsagents.com/docs/user-guide/shell/commands/) has the inventory with implementation status, supported flags, and known gaps vs GNU coreutils.
 
@@ -272,7 +250,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports and design questions are jus
 
 ## Community
 
-[Discord](https://discord.com/invite/strands) if you want to talk about it.
+Join [Discord](https://discord.com/invite/strands) to discuss the project.
 
 ## License
 
@@ -280,4 +258,4 @@ Apache-2.0
 
 ## Security
 
-If you find a security issue, report it privately instead of opening a public issue. Bypasses of filesystem mediation, SSRF protection, or credential injection qualify. See [SECURITY.md](SECURITY.md).
+If you find a security issue, report it privately instead of opening a public issue. Bypasses of filesystem mediation, the effect-admission seam, or SSRF protection qualify. See [SECURITY.md](SECURITY.md).

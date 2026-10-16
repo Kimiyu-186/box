@@ -2,9 +2,11 @@
 
 This document provides context, patterns, and guidelines for AI coding assistants working in this repository. For human contributors, see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
+> **Reading this inside `box`?** This directory is a *vendored* copy of the upstream `strands-shell` crate at a pinned revision. It carries the Rust crate (`src/`, `tests/`, `strands-shell-macros/`) and nothing else: the `python/` wrapper, `tests/python/`, `scripts/`, and `.github/` are not vendored, so the commands and paths in the Python, WASM, and CI sections below describe the upstream repository rather than this tree. Read [`UPSTREAM.md`](./UPSTREAM.md) for the pinned revision, what is excluded, and every local change to the vendored source.
+
 ## Product Overview
 
-**Strands Shell** is a Bourne-compatible shell for AI agents that runs entirely in-process. It implements a complete operating-system environment inside a single userspace process — inspired by BusyBox and Toybox — but it never calls `fork`/`exec` or makes direct system calls. Every operation flows through a pluggable `Kernel` trait, giving callers fine-grained control over what an agent can see and do (files, network domains, credentials) without containers, microVMs, or firewalls.
+**Strands Shell** is a Bourne-compatible shell for AI agents that runs entirely in-process. It implements a complete operating-system environment inside a single userspace process — inspired by BusyBox and Toybox — but it never calls `fork`/`exec` or makes direct system calls. Every operation flows through a pluggable `Kernel` trait, giving callers fine-grained control over what an agent can see and do (files, network destinations) without containers, microVMs, or firewalls.
 
 It is a Rust crate that compiles to several targets from one source of truth:
 
@@ -17,11 +19,11 @@ It is a Rust crate that compiles to several targets from one source of truth:
 
 The crate is the single source of truth; every binding wraps the same core.
 
-- **`Kernel` trait (`src/os.rs`) is the security boundary.** All filesystem, process, and network effects go through a `Kernel` implementation. There is no `fork`/`exec` and no direct syscalls. The bundled implementation is `VfsKernel` (`src/vfs_kernel.rs`), backed by an in-process virtual filesystem (`src/vfs.rs`); callers can supply their own (S3-backed, database-backed, etc.) via `Shell::with_kernel()`.
+- **`Kernel` trait (`src/os.rs`) is the security boundary.** All filesystem, process, and network effects go through a `Kernel` implementation. There is no `fork`/`exec` and no direct syscalls. The bundled implementation is `VfsKernel` (`src/vfs_kernel.rs`), backed by an in-process virtual filesystem (`src/vfs.rs`); callers can supply their own (S3-backed, database-backed, etc.) via `Shell::builder().kernel(...)`, which applies the builder's limits to the resulting shell.
 - **In-process VFS with binds.** Directories are mounted into the VFS as *binds* — `copy` mode snapshots files into the VFS at build time; `direct` mode passes reads/writes through to the host, mediated by the kernel. Bind configuration lives in `src/vfs_config.rs`.
 - **Commands are split in two:**
   - **Builtins** in `src/builtins/` — things that mutate shell state (`cd`, `export`, `alias`, `set`, control-flow helpers, etc.). They are dispatched by name in `src/builtins/mod.rs` (`lookup()` matches the builtin name to its function).
-  - **Isolated commands** in `src/commands/` — coreutils-style programs (`cat`, `grep`, `sed`, `curl`, `jq`, …) that take a kernel + args and produce output. Each is registered with the `#[command("name")]` proc-macro from `strands-shell-macros`.
+  - **Isolated commands** in `src/commands/` — coreutils-style programs (`cat`, `grep`, `sed`, `curl`, `jq`, …) that take a mediated kernel handle (`&Mediated`) plus args and produce output. Each is registered with the `#[command("name")]` proc-macro from `strands-shell-macros`.
 - **Parser / executor:** `src/parser.rs` parses shell syntax; `src/exec.rs` evaluates it (pipelines, redirections, expansions, control flow).
 - **Bindings:** `src/python.rs` (PyO3, the `strands_shell._native` module) and `src/js.rs` (napi-rs). They are intentionally parallel in shape — keep them in sync semantically. The customer-facing Python surface (the `Shell`, `Bind`, `Cred`, `Limits` classes and typed errors) lives in the pure-Python wrapper at `python/strands_shell/__init__.py`.
 - **WASM entry:** `src/wasm_main.rs` reads commands from WASI stdin and writes to WASI stdout/stderr; each instance runs in isolated linear memory.
@@ -33,10 +35,15 @@ A new isolated command is a function annotated with the proc-macro:
 
 ```rust
 #[command("ls")]
-async fn cmd_ls(os: &dyn Kernel, args: &[String]) -> i32 {
+async fn cmd_ls(os: &Mediated, args: &[String]) -> CommandResult {
     // ...
+    Ok(0)
 }
 ```
+
+The first parameter is `&Mediated` (`src/mediate.rs`), not a bare `&dyn Kernel`: a
+command reaches the kernel only through the admission layer. The return type is
+`CommandResult` — `Result<i32, Box<dyn Error + Send + Sync>>` (`src/commands/mod.rs`).
 
 The macro (defined in `strands-shell-macros/src/lib.rs`) registers the command via `inventory` on native targets and feeds the static lookup table used on WASM. Builtins are *not* registered this way — add them to the `match` in `src/builtins/mod.rs`.
 
@@ -54,7 +61,7 @@ cargo clippy --workspace --all-targets   # lint
 cargo doc --workspace --no-deps --open   # API reference
 ```
 
-Integration tests live in `tests/`: `shell_integration.rs`, `curl_integration.rs`, `lua_integration.rs`, `mcp_integration.rs`, `vfs_unit.rs`.
+Integration tests live in `tests/`: `shell_integration.rs`, `curl_integration.rs`, `lua_integration.rs`, `mcp_integration.rs`, `vfs_unit.rs`, `config.rs`, `effect_interceptor.rs`, `kernel_effect_interception.rs`, `in_mount_symlink_admission.rs`, and `channel_writer_inheritance.rs`. Three of them cover the admission seam — `effect_interceptor.rs`, `kernel_effect_interception.rs`, and `in_mount_symlink_admission.rs`. Read those three before you change `src/mediate.rs` or `src/effect.rs`. `channel_writer_inheritance.rs` covers a different thing: a caller's channel writer must reach a builtin's output.
 
 ### Python bindings
 
@@ -118,11 +125,106 @@ Make the smallest reasonable change. Prefer simple, clean solutions over clever 
 
 Strands Shell is an **in-process mediation layer**: the `Kernel` boundary is the whole product. Treat changes to the following as security-critical and preserve their guarantees:
 
-- **`src/commands/curl.rs`** and HTTP request handling — `curl`/`http_request` must keep blocking SSRF and metadata-service access (RFC1918, link-local, loopback, IMDS/ECS-task-role) at DNS-resolution time via `SafeResolver`.
-- **`src/vfs_kernel.rs`** (incl. `SafeResolver` and bind-path mediation) — file access must stay confined to explicitly bound paths; `readonly` and `direct`/`copy` semantics must hold.
-- **Credential handling** — credentials are injected by URL prefix at request time and must not leak across redirects or to non-allowlisted hosts.
+- **`src/commands/curl.rs`** and HTTP request handling — `curl`/`http_request` must keep blocking SSRF and metadata-service access (RFC1918, link-local, loopback, IMDS/ECS-task-role) both up front in `check_url_safe` and at DNS-resolution time via `SafeResolver`.
+- **`src/mediate.rs`** — the admission layer, and the only route to a `Kernel`. It resolves each path, presents the effect, then acts on the *same* resolved identity. Admission lives here rather than in a kernel so that a caller-supplied kernel is governed identically; do not add a path that reaches the trait around it.
+- **`src/vfs_kernel.rs`** (incl. `SafeResolver` and bind-path mediation) — file access must stay confined to explicitly bound paths; `readonly` and `direct`/`copy` semantics must hold. It performs effects and authorizes nothing. A consumer depends on the `direct`/`copy` distinction: `strands-box` always builds with `bind_direct`, and `verify_direct_binds` refuses to start when a realized bind is not Direct. `bind`'s `Copy` default is correct for upstream and wrong there, because a snapshot diverges from a home the workload and a second interpreter are both editing.
+- **The effect seam** (`src/effect.rs`) — every effect is presented for admission before it happens, and admission is the only authorization authority. `Kernel`'s path methods take `Resolved`, which only `Kernel::resolve` can mint, so an unresolved path cannot reach an effect. Do not add a path-taking trait method over `&str`. The shell holds no allowlist and no credentials of its own. **The Shell raises no network attempt, deliberately.** `EffectAttempt` has four variants — `ShellRun`, `ShellSpawn`, `Filesystem`, and `FilesystemPair` — and no network variant. Egress authorization belongs to the boundary the workload is confined to, so one request yields one decision. There is also **no `HttpTransport` seam.** `src/os.rs` states the reason in place of the seam: a trait every embedding must wire up correctly can route anywhere, including around the boundary it exists to enforce. Two network controls remain in the kernel and neither authorizes anything — the embedder's blanket `network_enabled` switch (`ShellBuilder::disable_network`) and the SSRF floor, both deny-only and both unconditional.
 
-A bypass of filesystem mediation, SSRF protection, or credential injection is a **security issue**, not a normal bug. If you find or risk one, follow [SECURITY.md](./SECURITY.md) — do not open a public issue, and never weaken these controls to make a test pass.
+A bypass of filesystem mediation, the effect-admission seam, or SSRF protection is a **security issue**, not a normal bug. If you find or risk one, follow [SECURITY.md](./SECURITY.md) — do not open a public issue, and never weaken these controls to make a test pass.
+
+### One decision on the resolved command, and `shell:exec` is gone
+
+The old single `shell:exec` action is **removed, not renamed**, and two actions on the
+**resolved** command replace it. These are this crate's effect labels; the box maps `shell:run`
+to its Cedar action `shell:exec`, and `shell:spawn` keeps its name.
+
+- **`shell:run`** — the decision when the Shell implements the resolved program.
+- **`shell:spawn`** — the decision when it does not and a host binary runs instead
+  (`src/effect.rs`, `EffectAttempt::ShellSpawn`, raised through the passthrough path). A
+  `permit` naming it grants the binary the kernel rather than this Shell's VFS, so no `fs:*`
+  attempt is raised for what it does.
+
+The two are mutually exclusive: one resolved command line raises exactly one of them.
+`EffectAttempt::ShellRun` carries `command`, `program`, `args`, and `cwd`; `ShellSpawn` adds a
+required `program_path`. `command` is the canonical line rebuilt from the **expanded** words,
+not the submitted spelling — `X=rm; $X -rf x` arrives as `rm -rf x`.
+
+**A command line is judged once, after the Shell parses it, expands it, and resolves its first
+word to a program.** There is exactly one admission point: `run_pipeline`
+(`src/exec.rs:2777`), immediately after the loop that applies every alias, multicall, and
+shebang rewrite. `execute`, `execute_with_reader`, `execute_sourced`, and `capture_output` are
+**no longer admission points**, and each states that in its own doc comment. Every stage of a
+pipeline is admitted before any stage runs, so a refusal in one stage stops the pipeline.
+
+**The pre-expansion residual is CLOSED, 2026-08-12.** It was real, and the measurement was
+this. With an interceptor denying anything containing `LAUNDERED`:
+
+```sh
+W=LAUND; X=ERED; printf "${W}${X}"      # printed LAUNDERED, status 0 (2026-08-09)
+```
+
+Admission saw the submission before parameter expansion, so a variable carried text no rule
+matched. Admission now runs after expansion, so the attempt names `printf` with the assembled
+argument. `a_denied_command_substitution_does_not_run` in
+`tests/kernel_effect_interception.rs` denies the **expanded** form and is the pin.
+
+**Coverage got finer, not coarser.** The old text gate sat at a funnel chosen because
+`sh <file>`, `.`/`source`, a trap body, `find -exec`, `xargs`, and Lua's `io.popen` all reach
+the evaluator through it. Resolution is now the funnel: each of those routes resolves every
+command it runs, so each command gets its **own** decision instead of inheriting one taken over
+the whole submission.
+
+**What the old caution still buys.** A rule may still read `command`, and one effect still has
+many spellings, so a `command like` pattern is still a weak match. The decision now also
+carries `program`, which is the resolved identity a rule needs: `alias safe=rm` makes the
+spelling `safe`, and the `alias` builtin raises no decision of its own. Write a rule on
+`program` rather than on `command`.
+
+**If you re-measure anything in this area, run a no-substitution control first.** An
+earlier investigation first reported the pre-expansion leak as a command-substitution
+bypass, because every probe payload wrapped the assembled text in `$(…)`. Removing the
+substitution leaked identically, which is what found the real cause.
+
+### Command substitution: each command inside it gets its own decision
+
+**`capture_output` is no longer an admission point** (`src/exec.rs:1700`). It once held a
+separate text gate, because `$(…)` and backticks evaluate command text without passing through
+`execute_sourced` or `execute_with_reader`.
+
+**The event that gate existed to add is now automatic.** The substituted text is parsed and run
+like any other, so each command inside it reaches `run_pipeline` and raises its own resolved
+decision. The old gate judged the substitution's *unexpanded* source text, which was always a
+literal substring of the already-judged submission — so it closed no laundering hole. Post-
+resolution admission closes that too; see the previous section.
+
+**The counting property is what to keep, and the absolute number changed.** Before the old gate,
+ten substitutions in one submission produced one decision where ten through `eval`, `xargs`, or
+`source` produced eleven, so anything counting command decisions saw substitution fan-out as
+nothing. The count across all three routes is now **ten, not eleven**: the eleventh was the
+submission itself, and no decision is taken over a submission any more.
+
+Three guards in `tests/kernel_effect_interception.rs`, and each asserts a stronger property
+than it did:
+
+- `command_substitution_is_admitted_as_its_own_event` matches the **exact** admission entry
+  (`shell:run printf SUBSTITUTED`). A `contains` match passes on the outer command's own entry
+  and proves nothing, which is how two earlier drafts passed against a build with no gate at
+  all. Do not relax it to `contains`.
+- `a_denied_command_substitution_does_not_run` denies the **expanded** form, whose marker
+  appears nowhere in the submitted text. This is the test that pins the closed residual.
+- `substitution_fan_out_is_counted_like_every_other_route` asserts parity with `eval` and
+  `source` at ten each. Parity is the assertion; the absolute count is not.
+
+**A reported status must be one the capture path actually computed.** Each resolved command
+inside a substitution now reports its own status against its own permit, and the substitution
+itself reports none — `capture_admitted` returns a status that `capture_output` discards
+(`src/exec.rs:1706`). The rule stays because `run_capturing_status` is still what the outer
+status and `$?` read. Reporting an outcome is what exposed that `run_capturing`'s compound arms
+(`Group`, `Subshell`, `If`, `While`/`Until`, `For`, `Case`) all returned a hardcoded `0` — so
+`X=$(if true; then false; fi)` reported success for a failed command. Each arm now threads its
+real status out via `run_capturing_status`; if you add an arm, thread the status rather than
+returning `0`. Still wrong and left alone: `X=$(exit 42)` reports `127`, because the capture
+path has no `exit` arm and resolves it as an unknown command.
 
 ## Creating a High-Quality PR
 
@@ -153,7 +255,7 @@ PR titles must follow [Conventional Commits](https://www.conventionalcommits.org
 
 - **Don't rename the `lash` persona** (`lash`, `/bin/lash`, `USER=lash`, `/home/lash`, `LASH_UID`, `LASH_GID`) — it is the intentional emulated-POSIX identity, not the product name.
 - Don't add `fork`/`exec` or direct syscalls — all effects must go through the `Kernel`.
-- Don't weaken SSRF guards, bind-path mediation, or credential isolation to make something pass.
+- Don't weaken SSRF guards, bind-path mediation, or the effect-admission seam to make something pass.
 - Don't put `use` statements inside functions.
 - Don't let the Python and Node bindings drift apart without a stated reason.
 - Don't open a PR with a title that fails the conventional-commits check.
