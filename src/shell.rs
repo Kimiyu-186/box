@@ -692,6 +692,7 @@ pub struct ShellBuilder {
     timeout: Option<Duration>,
     network_enabled: bool,
     egress_proxy: Option<EgressProxy>,
+    egress_refusal_header: Option<String>,
     effect_interceptor: Option<Arc<dyn EffectInterceptor>>,
     kernel: Option<Arc<dyn Kernel>>,
 }
@@ -714,6 +715,7 @@ impl Default for ShellBuilder {
             timeout: Some(std::time::Duration::from_secs(30)),
             network_enabled: true,
             egress_proxy: None,
+            egress_refusal_header: None,
             effect_interceptor: None,
             kernel: None,
         }
@@ -1032,10 +1034,22 @@ impl ShellBuilder {
             self.egress_proxy = Some(EgressProxy {
                 target: target.into(),
                 ca_pem,
+                refusal_header: self.egress_refusal_header.take(),
             });
             self.network_enabled = true;
             Ok(self)
         }
+    }
+
+    /// Name the response header the egress proxy sets on a refusal it originates itself.
+    ///
+    /// State it before [`egress_proxy`](Self::egress_proxy), which reads it. Without it a refusal the
+    /// proxy synthesises inside its own tunnel is indistinguishable from the origin answering with
+    /// the same status, so a command reports a refused request as a server response and exits `0`.
+    /// With it, such a response becomes `PermissionDenied` and never reaches a command as a response.
+    pub fn egress_refusal_header(mut self, header: impl Into<String>) -> Self {
+        self.egress_refusal_header = Some(header.into());
+        self
     }
 
     /// Load additional configuration from a TOML file.

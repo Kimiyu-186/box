@@ -36,6 +36,14 @@ pub struct EgressProxy {
     pub target: String,
     /// PEM bytes of the CA the proxy signs its intercept leaves with.
     pub ca_pem: Vec<u8>,
+    /// The response header this proxy sets on a refusal it originates itself.
+    ///
+    /// The proxy forges the origin's leaf certificate, so a refusal it synthesises inside the tunnel
+    /// is otherwise indistinguishable from the origin answering with the same status — and a command
+    /// that cannot tell them apart reports a refused request as a server response. When set, a
+    /// response carrying this header is turned into `PermissionDenied` and never reaches a command
+    /// as a response, so the header itself is never rendered. `None` keeps the response as it is.
+    pub refusal_header: Option<String>,
 }
 
 /// A Kernel backed entirely by the in-memory VFS.
@@ -1491,6 +1499,24 @@ impl VfsKernel {
                 .send()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+
+            // **A refusal the proxy originated is a refusal, not a response.** Checked before the
+            // response is built, so no command can render it and no caller can read the marker: the
+            // body carries the reason the gateway recorded, and `PermissionDenied` is the kind every
+            // command already maps to a non-zero exit.
+            if let Some(proxy) = &self.egress_proxy
+                && let Some(marker) = &proxy.refusal_header
+                && resp.headers().contains_key(marker.as_str())
+            {
+                let reason = resp.text().await.unwrap_or_default();
+                let reason = reason.trim();
+                let reason = if reason.is_empty() {
+                    "the egress gateway refused this request".to_string()
+                } else {
+                    reason.lines().next().unwrap_or(reason).to_string()
+                };
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+            }
 
             // 6. Build response
             let status = resp.status().as_u16();

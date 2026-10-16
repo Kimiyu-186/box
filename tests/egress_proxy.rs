@@ -564,6 +564,122 @@ fn the_ssrf_floor_blocks_a_loopback_ip_when_proxied() {
     let _ = std::fs::remove_file(&ca);
 }
 
+/// A proxy that answers one absolute-form request with `status`, `extra` headers and `body`.
+fn proxy_answering(
+    status: &'static str,
+    extra: &'static [(&'static str, &'static str)],
+    body: &'static str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake proxy");
+    let addr = listener.local_addr().expect("the proxy has an address");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut data = Vec::new();
+            let mut buf = [0_u8; 1024];
+            // Read the head only: the client sends no body on these requests.
+            while let Ok(read) = stream.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..read]);
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let mut response = format!("HTTP/1.1 {status}\r\n");
+            for (name, value) in extra {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            response.push_str("Connection: close\r\n\r\n");
+            response.push_str(body);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The marker the box's gateway sets on a refusal it originates.
+const REFUSAL_MARKER: &str = "x-strands-box-egress";
+
+/// Run one `curl` through `proxy_url`, optionally naming the refusal marker.
+fn curl_through(proxy_url: String, ca: &PathBuf, name_marker: bool) -> (i32, String) {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut builder = Shell::builder();
+        if name_marker {
+            builder = builder.egress_refusal_header(REFUSAL_MARKER);
+        }
+        let mut shell = builder
+            .egress_proxy(proxy_url, ca)
+            .expect("the CA reads")
+            .build()
+            .expect("a routed Shell builds");
+        let out = shell.run("curl http://example.com/").await;
+        (out.status, out.stdout)
+    }))
+}
+
+/// **A refusal the gateway originated exits non-zero and is never rendered.** The gateway forges the
+/// origin's certificate, so its own refusal arrives as an ordinary status; `curl` exits `0` for any
+/// status without `-f`, which would report a refused request as a server answer. The marker makes the
+/// two distinguishable, and the response becomes a refusal rather than a body.
+#[test]
+fn a_gateway_refusal_exits_non_zero_and_is_not_rendered() {
+    let ca = write_ca("refusal", TEST_CA_PEM.as_bytes());
+    let proxy = proxy_answering(
+        "403 forbidden",
+        &[(REFUSAL_MARKER, "refused")],
+        "http:request gate: policy denied this operation [default-deny]: No permit policy matched.",
+    );
+    let (status, stdout) = curl_through(proxy, &ca, true);
+    assert_ne!(status, 0, "a refused request must not report success");
+    assert!(
+        !stdout.contains("policy denied"),
+        "the refusal is not delivered as a response body: {stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains(REFUSAL_MARKER),
+        "the marker never reaches the caller: {stdout}"
+    );
+}
+
+/// **An origin's own `403` keeps `curl`'s semantics**, so this narrows nothing: an unmarked status is
+/// the server's answer, and its body still reaches the caller at exit `0`.
+#[test]
+fn an_unmarked_403_stays_the_origins_answer() {
+    let ca = write_ca("origin403", TEST_CA_PEM.as_bytes());
+    let proxy = proxy_answering("403 forbidden", &[], "the origin said no");
+    let (status, stdout) = curl_through(proxy, &ca, true);
+    assert_eq!(status, 0, "an origin 4xx is not a refusal");
+    assert!(
+        stdout.contains("the origin said no"),
+        "the origin's body still reaches the caller: {stdout}"
+    );
+}
+
+/// **A permitted response is untouched**, so the check costs a successful request nothing.
+#[test]
+fn a_permitted_response_is_unaffected_by_the_marker_check() {
+    let ca = write_ca("permitted", TEST_CA_PEM.as_bytes());
+    let proxy = proxy_answering("200 OK", &[], "hello");
+    let (status, stdout) = curl_through(proxy, &ca, true);
+    assert_eq!(status, 0);
+    assert!(stdout.contains("hello"), "the body is delivered: {stdout}");
+}
+
+/// **An embedder that names no marker keeps the pinned behaviour**, so the rule is opt-in and a
+/// re-vendor without the box's wiring is unchanged.
+#[test]
+fn without_a_named_marker_the_response_is_unchanged() {
+    let ca = write_ca("nomarker", TEST_CA_PEM.as_bytes());
+    let proxy = proxy_answering("403 forbidden", &[(REFUSAL_MARKER, "refused")], "unchanged");
+    let (status, stdout) = curl_through(proxy, &ca, false);
+    assert_eq!(status, 0, "no named marker means no refusal detection");
+    assert!(stdout.contains("unchanged"), "{stdout}");
+}
+
 // ── Options the Strands harness `web_fetch` tool sends ──────────────
 
 /// A fake proxy that answers one connection per entry of `responses`, in order, with that raw
