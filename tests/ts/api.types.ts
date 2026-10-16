@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 // Type-level test for the public TypeScript surface (`index.d.ts`).
 //
 // This file is never executed — `tsc --noEmit` checks that the declared types

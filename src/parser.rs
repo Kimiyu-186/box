@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! Shell command parser (recursive descent).
 //!
 //! The parser preserves variable references, backticks, and quoting

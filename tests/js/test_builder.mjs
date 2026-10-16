@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 // Tests for the internal native ShellBuilder API (`native.js`).
 //
 // The customer-facing surface is the config-driven `Shell.create()` (see

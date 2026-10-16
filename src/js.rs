@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! Node.js bindings for Strands Shell shell, via napi-rs.
 //!
 //! Mirrors `src/python.rs` in shape and behavior. The differences are

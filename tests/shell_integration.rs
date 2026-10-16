@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 use strands_shell::Shell;
 
 fn rt() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {

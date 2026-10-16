@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! Python bindings for Strands Shell shell.
 //!
 //! This is the low-level native extension (`strands_shell._native`). The

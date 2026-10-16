@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! `curl` argument handling and the SSRF floor.
 //!
 //! **These tests cannot reach a live server.** The floor blocks loopback

@@ -1,3 +1,5 @@
+<!-- Modified by Amazon. Original source: https://github.com/strands-agents/shell. Local changes are recorded in crates/shell/UPSTREAM.md. -->
+
 # AGENTS.md
 
 This document provides context, patterns, and guidelines for AI coding assistants working in this repository. For human contributors, see [CONTRIBUTING.md](./CONTRIBUTING.md).

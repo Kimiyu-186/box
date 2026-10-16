@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! Functional behaviour of the `lua` builtin: does Lua run like Lua.
 //!
 //! Every case builds an allow-all `Shell` and asserts stdout, exit status, or stderr. It

@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! Builder-based API for creating and running sandboxed shells.
 //!
 //! This is the primary public interface for the crate. Start with

@@ -1,3 +1,6 @@
+// Modified by Amazon. Original source: https://github.com/strands-agents/shell
+// Local changes are recorded in crates/shell/UPSTREAM.md.
+
 //! # Strands Shell — A Virtual Shell for AI Agents
 //!
 //! Strands Shell is a Bourne-compatible shell that runs entirely in userspace. It

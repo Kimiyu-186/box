@@ -1,3 +1,5 @@
+<!-- Modified by Amazon. Original source: https://github.com/strands-agents/shell. Local changes are recorded in crates/shell/UPSTREAM.md. -->
+
 <div align="center">
   <div>
     <a href="https://strandsagents.com">
