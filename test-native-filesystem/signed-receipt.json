@@ -2,7 +2,7 @@
   "kind": "manual signed-run attestation; CI checks source freshness",
   "sources": {
     ".github/workflows/native-filesystem.yml": "cec6e97bf648b2ad7629cb28fcfbc95f37b695532adfb6d09cb477c622f02a4a",
-    "Cargo.lock": "9f1e8e4ef3a4ad8894d9ab8c5f084fbb3f49b229ceb2c0d82df71aa6dd0f0fa1",
+    "Cargo.lock": "12b84e7673596a0d057c363b66ae953d4ee2b0e53f41487b832f61b7153d7805",
     "Cargo.toml": "6c8120cd0443693539eeb9d54a9c9f877badd646062340244a14d70a5e2e0f1f",
     "crates/box/Cargo.toml": "40253bbedaca3b2c98a4809531a6b81bc33ae1d86a2a2a7d2705294500d6be28",
     "crates/box/Info-sock-alias.plist": "8349f3d6292dc29b8258dbe48fcb45c9079824303ab9da433ddc6f553dfe4439",
@@ -185,7 +185,7 @@
     "crates/policy/src/schema.rs": "23778b8d86844c98fda64c6ff57d60fd76871234d8a2f2d154bae3c6bb2af566",
     "crates/policy/src/spelling.rs": "77dfce0d07f5ba62cc468ea4ed01f691f4482810abe5dc8ff17e0dec5e9a28f5",
     "crates/shell/.gitignore": "3a145fd6f9d3be0fabacb3226b3e4f589516d49af81927b44792af180324c299",
-    "crates/shell/Cargo.toml": "81de237f401b7e873289bf121e99362b4977bead8f8ac4148347cf871575101a",
+    "crates/shell/Cargo.toml": "405594597105904117136ac4f13cf95968a5b193b274956be2229ec38f492899",
     "crates/shell/LICENSE": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
     "crates/shell/NOTICE": "d4290ed64c2edd0fce1d84e3f9dfb2881240fe534def76b8cd29ed6af683e287",
     "crates/shell/build.rs": "2b1ff2f423d4c7de4fc6caa508273c9d286352dec6b90c6b7d817e030b5acd4c",
@@ -226,7 +226,7 @@
     "crates/shell/src/commands/echo.rs": "5a419758e4c2c47e63746f1989d522a39d348b33008145c7452fc80696c9d039",
     "crates/shell/src/commands/env.rs": "1a22ce11e69cea92b2499b34a2bd5da350d35fb1377d04de8b5d31c9ce91a063",
     "crates/shell/src/commands/false.rs": "df2a0d16aa8205ee3a1a0e81fe439bb888185bc0e849f9d783e4cc6a8cad474f",
-    "crates/shell/src/commands/grep.rs": "c45ec066d77966eddc0d4b0012aba8fe736c159715414488c824c558e865c5f4",
+    "crates/shell/src/commands/grep.rs": "dac519b90aee1aa3e4d62881efe93065881c9ef8054725703a61d967b12a992b",
     "crates/shell/src/commands/head.rs": "d008955e2bc9e10632555f7a5716c487d16daf18c0bc6514bb3b66a9e26a9393",
     "crates/shell/src/commands/jq.rs": "4ca64c117b68caeca8226277ebbf476249eabb0dbd4fc4875a746d5f24f5ef77",
     "crates/shell/src/commands/ln.rs": "7783b7175e4134d5a7749fd7c61ff9f101b79abdbbf473374bf31245e19cf894",
@@ -268,7 +268,7 @@
     "crates/shell/src/vfs_config.rs": "8c09d515d08154e601fd4c3f4bebe52f3f721706733e36a6c04f1e4051bdb051",
     "crates/shell/src/vfs_kernel.rs": "9be39a3801cf481fdb43a048923f29fa7def238261fd9fe3e60827c26ec9b917",
     "crates/shell/src/wasm_main.rs": "b001b8509d3816f7a92152f7a57a456d219e106e23b7379f24096f8d2af8cec9",
-    "crates/shell/strands-shell-macros/Cargo.toml": "e2c18b9fe1d9048e65ab23720c3753b540022d92c02694ef06d294df7d1346ac",
+    "crates/shell/strands-shell-macros/Cargo.toml": "96e527010113867f177449a65e8b2c9abd84e976e1b894985fafa89109c2eef8",
     "crates/shell/strands-shell-macros/src/lib.rs": "e77fd54a1702cc4f1a7e94dac9888257a55e45670f64d57e225ae7ed5d064ca4",
     "crates/telemetry/Cargo.toml": "f2c2450bfefaa75ad600f8e52fb45f3cf3d944f87ea73419def95b4d8d8ed244",
     "crates/telemetry/src/collector.rs": "dc58c0d4a907dcb0d97b30afb7b9f4015ba7c87208a031d15215f11bbe6483d0",
@@ -315,6 +315,6 @@
   ],
   "signature_verified": true,
   "macos": "27.0.1",
-  "binary_sha256": "8b6f0e18895acbec4afd305785455cc1b29e72f9e52841a0fb3c954a6972f1d9",
-  "test_log_sha256": "15a95b8b8dc76f680d01691fdeff9ea7fc31cb5e6a830e21da659faa29d73fc3"
+  "binary_sha256": "886dee1fa7414324382b88150e497428d9ea631408e2dca14e5920d1d184a7a0",
+  "test_log_sha256": "bd4da6285f7842881b4f3921a5832a60c919753cbd96d33eb0f9da141264b33e"
 }
