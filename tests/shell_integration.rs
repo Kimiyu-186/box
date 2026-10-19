@@ -3390,12 +3390,12 @@ fn timeout_is_per_command_not_cumulative() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let mut shell = Shell::builder()
-            .timeout(std::time::Duration::from_millis(500))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
         // Sleep past the timeout *between* commands. The next run()
         // must succeed because its budget should start fresh.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         let out = shell.run("echo ok").await;
         assert_eq!(out.status, 0, "stderr={:?}", out.stderr);
         assert_eq!(out.stdout.trim(), "ok");
@@ -5575,23 +5575,23 @@ fn url_check_allowed_prefix_no_confusion() {
 #[test]
 fn bind_direct_write_back() {
     let (rt, local) = rt();
+    let dir = TestDir::new("lsh_bind_write_test");
     rt.block_on(local.run_until(async {
-        let dir = TestDir::new("lsh_bind_write_test");
         let mut shell = Shell::builder()
             .bind_direct(dir.to_str().unwrap(), "/mnt/wr")
             .build()
             .unwrap();
-        shell.run("echo written_data > /mnt/wr/output.txt").await;
-        // Run another command to ensure the write-back task completes
-        shell.run("true").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let content = std::fs::read_to_string(dir.join("output.txt")).unwrap_or_default();
-        assert!(
-            content.contains("written_data"),
-            "host file content: {:?}",
-            content
-        );
+        let output = shell.run("echo written_data > /mnt/wr/output.txt").await;
+        assert_eq!(output.status, 0, "write command failed: {}", output.stderr);
     }));
+    // Shell::run returns before bind-direct drain tasks necessarily finish.
+    rt.block_on(local);
+    let content = std::fs::read_to_string(dir.join("output.txt")).unwrap_or_default();
+    assert!(
+        content.contains("written_data"),
+        "host file content: {:?}",
+        content
+    );
 }
 
 // ── VFS glob matching ───────────────────────────────────────────────

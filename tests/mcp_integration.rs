@@ -573,16 +573,41 @@ fn mcp_read_file_exceeds_max_output_is_error() {
 
 // ── McpClient (tests mcp_client.rs via out-of-process) ──────────────
 
-fn shell_bin() -> String {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    path.push(if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    });
-    path.push("strands-shell");
-    path.to_string_lossy().to_string()
+/// Locate the `strands-shell` binary these tests spawn as an MCP server.
+///
+/// Derived from the test executable's own path rather than from the manifest directory:
+/// in a workspace the binary lands in the *workspace* target directory, so
+/// `$CARGO_MANIFEST_DIR/target/debug` names a path that does not exist. `current_exe` is
+/// `<target>/<profile>/deps/<test>`, so the binary sits two levels up — correct whether
+/// the target directory is crate-local, workspace-level, or redirected by
+/// `CARGO_TARGET_DIR`.
+///
+/// The binary requires the `cli` feature. A test that spawns it is skipped rather than
+/// failed when it is absent, so a default `cargo test` does not report a failure for a
+/// binary the default feature set does not build.
+fn shell_bin() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let candidate = profile_dir.join("strands-shell");
+    candidate
+        .exists()
+        .then(|| candidate.to_string_lossy().to_string())
+}
+
+/// Skip a binary-spawning test when the `cli` binary has not been built.
+macro_rules! shell_bin_or_skip {
+    () => {
+        match shell_bin() {
+            Some(path) => path,
+            None => {
+                eprintln!(
+                    "skipping: strands-shell binary absent \
+                     (build with `--features cli` to run this test)"
+                );
+                return;
+            }
+        }
+    };
 }
 
 #[test]
@@ -592,10 +617,12 @@ fn mcp_client_start_and_list_tools() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let client =
-            strands_shell::mcp_client::McpClient::start(&shell_bin(), &["--mcp".to_string()])
-                .await
-                .expect("failed to start MCP client");
+        let client = strands_shell::mcp_client::McpClient::start(
+            &shell_bin_or_skip!(),
+            &["--mcp".to_string()],
+        )
+        .await
+        .expect("failed to start MCP client");
 
         assert_eq!(client.tools.len(), 4);
         let names: Vec<&str> = client.tools.iter().map(|t| t.name.as_str()).collect();
@@ -618,10 +645,12 @@ fn mcp_client_call_shell() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let client =
-            strands_shell::mcp_client::McpClient::start(&shell_bin(), &["--mcp".to_string()])
-                .await
-                .unwrap();
+        let client = strands_shell::mcp_client::McpClient::start(
+            &shell_bin_or_skip!(),
+            &["--mcp".to_string()],
+        )
+        .await
+        .unwrap();
 
         let result = client
             .call_tool("shell", json!({"command": "echo hello"}))
@@ -639,10 +668,12 @@ fn mcp_client_call_write_and_read() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let client =
-            strands_shell::mcp_client::McpClient::start(&shell_bin(), &["--mcp".to_string()])
-                .await
-                .unwrap();
+        let client = strands_shell::mcp_client::McpClient::start(
+            &shell_bin_or_skip!(),
+            &["--mcp".to_string()],
+        )
+        .await
+        .unwrap();
 
         client
             .call_tool(
@@ -670,10 +701,12 @@ fn mcp_client_call_list_dir() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let client =
-            strands_shell::mcp_client::McpClient::start(&shell_bin(), &["--mcp".to_string()])
-                .await
-                .unwrap();
+        let client = strands_shell::mcp_client::McpClient::start(
+            &shell_bin_or_skip!(),
+            &["--mcp".to_string()],
+        )
+        .await
+        .unwrap();
 
         client
             .call_tool(
@@ -700,7 +733,7 @@ fn mcp_start_clients() {
     rt.block_on(async {
         let entries = vec![strands_shell::mcp_client::McpConfigEntry {
             name: "test-server".to_string(),
-            command: shell_bin(),
+            command: shell_bin_or_skip!(),
             args: vec!["--mcp".to_string()],
         }];
         let clients = strands_shell::mcp_client::start_clients(&entries)
