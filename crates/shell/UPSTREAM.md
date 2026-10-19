@@ -5,7 +5,7 @@ from one commit of the `feature/shell-patches` branch of this repository:
 
 - repository: `https://github.com/strands-agents/shell`
 - branch: `feature/shell-patches`
-- revision: `b75e3f029b10420779ffb553602c07f207f6e254`
+- revision: `a1639ea5692ee2a9f5add0a31157ae8e91c5bdd0`
 
 `feature/shell-patches` is upstream `main` plus one commit for each local change, so its
 commit list is the exact set of local changes. Do not edit this directory by
