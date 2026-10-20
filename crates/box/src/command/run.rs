@@ -188,6 +188,15 @@ async fn hosted(
         )?;
         eprintln!("{}", boundary.disclosure());
     }
+    for label in locked.record.contained_mcp.keys() {
+        let table = format!("[mcp.{label}]");
+        if let Some(reach) = hosted.approved().table(&table) {
+            eprintln!("strands-box: {table} direct filesystem grants:");
+            for grant in &reach.grants {
+                eprintln!("{}", grant.disclosure());
+            }
+        }
+    }
     let boundary = Boundary::translate(
         &agent,
         Launch {
