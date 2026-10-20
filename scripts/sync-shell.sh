@@ -23,13 +23,20 @@ if [ -n "$(git status --porcelain --ignored -- crates/shell)" ]; then
   echo "sync-shell: crates/shell has uncommitted, untracked, or ignored files" >&2
   exit 1
 fi
-# A feature/shell-patches commit carries the Box provenance notices, and a bare upstream or Box
-# commit does not.
+patches=origin/feature/shell-patches
+if ! git rev-parse --verify --quiet "$patches^{commit}" >/dev/null; then
+  echo "sync-shell: $patches does not name a commit; run: git fetch origin feature/shell-patches" >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "$revision" "$patches"; then
+  echo "sync-shell: $1 is not an ancestor of $patches" >&2
+  exit 1
+fi
 manifest=$(git show "$revision:Cargo.toml" 2>/dev/null || true)
 library=$(git show "$revision:src/lib.rs" 2>/dev/null || true)
 if ! grep -q '^name = "strands-shell"$' <<<"$manifest" ||
   ! grep -q '^// Modified by Amazon' <<<"${library%%$'\n'*}"; then
-  echo "sync-shell: $1 is not a feature/shell-patches commit with provenance notices" >&2
+  echo "sync-shell: $1 has no strands-shell Cargo.toml or no '// Modified by Amazon' first line in src/lib.rs" >&2
   exit 1
 fi
 
