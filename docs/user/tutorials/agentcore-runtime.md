@@ -2,6 +2,8 @@
 
 The [Runtime example](../../../examples/agentcore-runtime/) runs a fixed workload or Claude Code inside a box on Amazon Bedrock AgentCore Runtime.
 It deploys the same application as managed Python code and as a container image that you supply.
+For the container path, see [Bring your own container](#bring-your-own-container) and the
+[example Dockerfile](../../../examples/agentcore-runtime/app/demo/Dockerfile).
 
 > **Status.** This example passed deployment and both workloads on Runtime V2 in both deployment types.
 > Forced termination of the box's trusted process left descendants running in the tested baseline.
@@ -70,21 +72,77 @@ Example output:
 123456789012
 ```
 
-Validate the project and package both runtimes:
+Validate the project:
 
 ```sh
 agentcore validate
+```
+
+### Managed Python code
+
+Package the managed runtime:
+
+```sh
 agentcore package --runtime boxdemo_managed
-agentcore package --runtime boxdemo_container
 ```
 
 The managed package contains Python code, Python dependencies, and both executable archives.
-The container package uses the pinned Amazon Linux image and installs Python 3.12.
-It runs under operator identity `991:991`.
-
 Build Python dependencies for the selected runtime.
 Exclude build-machine `__pycache__` directories and `.pyc` files from a manually assembled managed ZIP.
 Runtime rejected incompatible Python cache files during qualification.
+
+### Bring your own container
+
+The container example packages Box and Claude Code in an image built from
+[`app/demo/Dockerfile`](../../../examples/agentcore-runtime/app/demo/Dockerfile).
+Complete [Prepare the application](#prepare-the-application) first to place the executable archives and Box manifest in its build context.
+
+The supplied Dockerfile is:
+
+```dockerfile
+FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:c07ab0773eddf9449c0994a87d8148300db98bdf8d8dad672a9dc26321c104fc
+RUN dnf install -y python3.12 python3.12-pip shadow-utils && dnf clean all \
+    && groupadd --gid 991 boxoperator \
+    && useradd --uid 991 --gid 991 --create-home boxoperator
+WORKDIR /app
+RUN python3.12 -m pip install --no-cache-dir boto3==1.42.61 aws-bedrock-token-generator==1.1.0
+COPY main.py claude_runtime.py box.tar.gz box-package.json claude.tar.gz claude-package.json /app/
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+USER 991:991
+EXPOSE 8080
+ENTRYPOINT ["python3.12", "/app/main.py"]
+```
+
+It installs Python 3.12 and runs the application as the non-root operator `991:991`.
+The application serves Runtime requests on port `8080` and launches Box for each demonstration.
+The preparation step supplies the Box and Claude archives. Do not copy AWS credentials into the image.
+
+Package this runtime through the AgentCore CLI:
+
+```sh
+agentcore package --runtime boxdemo_container
+```
+
+The project config selects `Container` for `boxdemo_container` and uses `app/demo/` as its build context.
+The [deployment step](#deploy-the-application) publishes the image and provisions its Runtime V2 resource.
+The supplied project deploys both runtimes.
+
+To build and inspect the Dockerfile directly, run these commands from `examples/agentcore-runtime/`:
+
+```sh
+docker build --platform linux/arm64 --tag box-runtime-example:local app/demo
+docker image inspect box-runtime-example:local \
+  --format '{{.Os}}/{{.Architecture}} {{.Config.User}} {{json .Config.Entrypoint}}'
+```
+
+Expected inspection output:
+
+```text
+linux/arm64 991:991 ["python3.12","/app/main.py"]
+```
+
+This local image is for inspection. Use the AgentCore packaging and deployment commands to deploy the example.
+After deployment, use the container runtime's Amazon Resource Name (ARN) with the [fixed workload verifier](#verify-the-fixed-workload) or [Claude Code](#run-claude-code).
 
 ## Deploy the application
 
@@ -105,7 +163,7 @@ agentcore deploy --target default --yes --json
 ```
 
 The application creates managed and container runtimes in `us-west-2`.
-Record each runtime's Amazon Resource Name (ARN) from the deployment result.
+Record each runtime's ARN from the deployment result.
 Each ARN identifies the target used by the verification command.
 
 The application uses public network mode, HTTP invocation, a 600-second idle limit, and a 3,600-second maximum lifetime.
