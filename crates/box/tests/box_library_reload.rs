@@ -34,7 +34,16 @@ fn main() {
         Some("--probe-live-handle") => a_handle_reloads_the_running_boxs_own_authority(),
         Some("--probe-no-handle") => a_box_that_fails_to_open_hands_out_no_handle(),
         _ => {
-            probe("--probe-live-handle");
+            // The live-handle case opens a real box, which the namespace backend serves on aarch64
+            // alone. A case that cannot construct a box measures nothing, so it skips loudly.
+            if fixture::namespace_launcher_is_usable() {
+                probe("--probe-live-handle");
+            } else {
+                eprintln!(
+                    "skipping: this host cannot run the namespace launcher, so no box opens here"
+                );
+            }
+            // Needs no box: the configuration is absent, so the run fails before one opens.
             probe("--probe-no-handle");
         }
     }
