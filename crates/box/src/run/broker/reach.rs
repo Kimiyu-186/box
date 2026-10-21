@@ -963,6 +963,7 @@ mod private_tree_mutation_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ancestor_mutation_through_a_second_spelling_is_refused() {
         let (temporary, reach, box_root) = fixture();
