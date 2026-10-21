@@ -65,6 +65,12 @@ jobs:
           rustc -vV > combined-results/toolchain.txt
           cargo -V >> combined-results/toolchain.txt
 
+      - name: Install the alias image beside the unit test binary
+        run: |
+          install -m 755 target/debug/strands-box-sock-alias target/debug/deps/strands-box-sock-alias
+          cmp target/debug/strands-box-sock-alias target/debug/deps/strands-box-sock-alias
+          sha256sum target/debug/deps/strands-box-sock-alias >> combined-results/executables.sha256
+
       - name: Run the workspace without platform filters
         id: workspace
         continue-on-error: true
@@ -112,7 +118,14 @@ jobs:
 
       - name: Enforce the workspace result
         if: always()
-        run: test "$(cat combined-results/workspace.exit)" = 0
+        run: |
+          test "$(cat combined-results/workspace.exit)" = 0
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("combined-results/workspace.log").read_text()
+          assert text, "workspace log is empty"
+          assert "skipping: no strands-box-sock-alias installed beside the test binary" not in text
+          PY
 
       - name: Upload source identity and raw results
         if: always()
