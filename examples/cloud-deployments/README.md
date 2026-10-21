@@ -16,6 +16,8 @@ For lifecycle-controlled execution, use the
 [Lambda MicroVM profile](../../docs/user/cloud-deployments.md#lambda-microvm).
 Its tested configuration requires root and the service's `ALL` capability setting.
 Treat it as a qualification configuration.
+Normal completion passed, but cancellation and timeout left task processes running.
+The guide records the explicit library grants used by the tests.
 
 Read the guide's [shared requirements](../../docs/user/cloud-deployments.md#shared-requirements)
 and [qualification results](../../docs/user/cloud-deployments.md#qualification-results) before choosing a profile.

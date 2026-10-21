@@ -3,7 +3,7 @@
 Cloud deployment profiles record the environment around Box for three Amazon Linux 2023 ARM64 deployment targets.
 A deployment profile describes the service configuration. It does not change the Box policy or sandbox grants.
 
-> **Status.** Qualification configurations as of October 21, 2026. Runtime qualification failed. Lambda passed the listed scenarios with root and `ALL` capabilities. Deployment scripts remain pending.
+> **Status.** Qualification configurations as of October 21, 2026. Runtime and Lambda qualification failed. Lambda cancellation and timeout left task processes running. Deployment scripts remain pending.
 
 These measurements apply to Box revision `913f5367f57424b3bda65dc4a05278a5664f635d`.
 The candidate archive is `box-v0.1.0-aarch64-unknown-linux-gnu.tar.gz`.
@@ -23,7 +23,7 @@ The recorded versions identify reproduction targets. They do not establish minim
 | Requirement | Required configuration | Reason or verification |
 | --- | --- | --- |
 | Architecture | Linux ARM64, reported as `aarch64`. | The binaries and system-call filters depend on the architecture. Check `uname -m`. |
-| Executables | Keep `box`, `strands-box-contain-trampoline`, and `strands-box-sock-alias` from the same build. | Box uses the helpers during setup and command execution. Preserve executable permissions. |
+| Executables | Install `box`, `strands-box-contain-trampoline`, and `strands-box-sock-alias` from the same build in one directory. Both helpers must be regular executable files. | Box finds the helpers beside its own executable. It refuses helper symlinks and files without executable permissions. |
 | C runtime | Provide `glibc`, including `libc.so.6`, `libm.so.6`, and `/lib/ld-linux-aarch64.so.1`. | The candidate requires GLIBC symbols through version `2.34`. Record `rpm -q glibc`. |
 | GCC runtime | Provide `libgcc_s.so.1` from `libgcc`. | The candidate links this library. Record `rpm -q libgcc`. The oldest compatible package remains unmeasured. |
 | Namespaces | Permit creation of user, mount, process, interprocess communication, and hostname namespaces. Permit a private network namespace for default networking. | Box needs all these operations for its default setup. A successful user-namespace probe alone is insufficient. |
@@ -97,8 +97,26 @@ Minimum privileges remain unqualified.
 | Files and capacity | Private task directories beneath `/work`. Real-agent tests used `4096` MiB. | Separate task state. Measure capacity for your workload. This memory value is not a minimum. |
 
 The qualification image includes Python 3.12 and application-specific dependencies.
-The tests exercise resumed execution, permitted operations, denied operations, and cleanup.
-They do not establish a non-root deployment or a minimum capability set.
+Successful agent execution also depends on the fixture's explicit filesystem grants and tool declarations.
+The following settings record that fixture.
+
+| Setting | Tested value | Scope |
+| --- | --- | --- |
+| Library grants | Agent and tool `filesystem.read` lists include the resolved paths for `/usr/lib` and `/usr/lib64`. | These broad grants expose the library directories to both agents and their declared tools. |
+| Selected files | Agent and tool `filesystem.read_file` lists include resolved paths for `/etc/ld.so.cache`, `/etc/passwd`, and `/etc/pki/tls/certs/ca-bundle.crt`, when present. | These entries expose the loader cache, account information, and certificate trust store. |
+| Python tool | `[tool.python]` sets `command = ["/opt/agents/python-check"]`. | The image copies the surrounding OS's Python 3.12 executable to this path. |
+| Coreutils tool | `[tool.coreutils]` sets `command = ["/usr/bin/coreutils"]`. The helper check runs `/usr/bin/coreutils --coreutils-prog=sleep 0`. | The test invokes coreutils directly. |
+| Task files | Agent grants include its own home and workspace. Tool grants include the workspace. Temporary files use `.agent-tmp` inside that workspace. | Each task has separate directories. Its Box state stays outside the writable grants. |
+
+The policy permits the declared Python and coreutils tool launches.
+These broad library grants work around dependency-discovery limitations in the tested candidate.
+They do not establish minimum filesystem access or automatic dependency discovery.
+Installing the libraries alone does not reproduce the tested grants.
+The profile also remains unqualified for non-root execution or a minimum capability set.
+
+The earlier `/usr/bin/sleep` grant omitted its coreutils interpreter.
+Adding the interpreter exposed a missing `libpcre2-8.so.0` dependency.
+Successful direct coreutils execution does not qualify that script case.
 
 <a id="qualification-results"></a>
 ## Qualification results
@@ -113,10 +131,28 @@ Script and library discovery also caused program startup failures.
 The original filesystem failures used paths inside the workload's writable private `/tmp`.
 Follow-up controls corrected that interpretation. Those failures did not demonstrate writes escaping into the surrounding OS.
 
-Lambda real-agent tests completed 14 checks each for Claude Code and Codex CLI.
-They verified helper completion, permitted network requests, policy denials, protected file contents, and absence of observed surviving task processes.
-These scenarios provide narrower evidence than the Runtime component suite.
-Their results do not establish general package qualification.
+Lambda smoke tests completed 14 checks each for Claude Code and Codex CLI.
+They verified helper completion, permitted network requests, policy denials, protected file contents, and no observed surviving task processes after normal completion.
+One preceding launch of the same image failed before application readiness.
+The identical-image retry passed. The startup failure's cause remains unresolved.
+
+The later Lambda lifecycle tests used the same Box candidate and the explicit grants above.
+Both agents resumed with the same Box, agent, and helper process identities.
+They performed new model and tool operations after resume.
+The tested concurrent workspace probes passed.
+Normal completion after resume left no observed descendants, stopped progress writes, and removed task directories.
+
+Cancellation and timeout failed for both agents.
+The test requested termination of the box's trusted process and waited ten seconds.
+Box remained alive, so the test forcibly killed it.
+Each of the four tasks retained three descendant processes: two containment launchers and one native Python helper.
+The worker observed further progress-file writes after Box exited.
+Removing the task directories afterward did not establish successful process cleanup.
+
+These failures concern stopping task processes, rather than deleting cloud resources.
+The observations describe the test checkpoint, not permanent process survival.
+The successful normal-completion cases do not qualify cancellation or timeout cleanup.
+The candidate remains unqualified on all three deployment profiles.
 
 Keep each profile's results attached to its exact candidate and service configuration.
 For Box configuration, read the [configuration reference](./config.md).
