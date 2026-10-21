@@ -170,9 +170,7 @@ pub(crate) fn direct_grants(
     }
     require_no_grant_is_wholly_refused(&grants, &refusals, context)?;
     require_nothing_sensitive_stays_reachable(&grants, &refusals, context)?;
-    if cfg!(target_os = "linux") {
-        require_read_for_every_write(&grants, context)?;
-    }
+    require_supported_grants(&grants, context)?;
     let access: Vec<_> = grants
         .iter()
         .map(|grant| effective_access(grant, &grants))
@@ -188,19 +186,23 @@ fn covers(outer: &DirectGrant, inner: &DirectGrant) -> bool {
         || outer.scope == Scope::Root && inner.resolved.starts_with(&outer.resolved)
 }
 
-fn require_read_for_every_write(
+fn require_supported_grants(
     grants: &[DirectGrant],
     context: &FilesystemContext<'_>,
 ) -> Result<(), ConfigError> {
-    for write in grants
-        .iter()
-        .filter(|grant| grant.operation == Operation::Write)
-    {
-        if !grants
+    containment::validate_grants(
+        &grants
             .iter()
-            .any(|read| read.operation == Operation::Read && covers(read, write))
+            .map(|grant| (grant.resolved.as_path(), grant.operation, grant.scope))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        if let containment::ContainmentError::WriteOnlyUnsupported { ref path, .. } = error
+            && let Some(write) = grants
+                .iter()
+                .find(|grant| grant.operation == Operation::Write && grant.resolved == *path)
         {
-            return Err(refuse(
+            return refuse(
                 context,
                 &write.authored,
                 &format!(
@@ -210,10 +212,10 @@ fn require_read_for_every_write(
                     write.kind.key(),
                     write.resolved.display()
                 ),
-            ));
+            );
         }
-    }
-    Ok(())
+        refuse(context, "filesystem", &error.to_string())
+    })
 }
 
 fn effective_access(grant: &DirectGrant, grants: &[DirectGrant]) -> &'static str {
@@ -761,8 +763,12 @@ mod tests {
                 .entries()
                 .map(|(kind, path)| entry_grant(kind, path, &context).unwrap())
                 .collect();
-            let result = require_read_for_every_write(&grants, &context);
-            assert_eq!(result.is_ok(), accepted, "{body}: {result:?}");
+            let result = require_supported_grants(&grants, &context);
+            assert_eq!(
+                result.is_ok(),
+                accepted || !cfg!(target_os = "linux"),
+                "{body}: {result:?}"
+            );
             if let Err(error) = result {
                 let error = error.to_string();
                 assert!(error.contains("Linux cannot enforce write-only"), "{error}");
