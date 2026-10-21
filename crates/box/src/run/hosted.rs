@@ -1796,10 +1796,8 @@ while :; do :; done"#
         let root = crate::record::layout::testing::box_root(operator, "codex");
         crate::test_support::with_operator_home(operator, || {
             let granted = operator.join("granted");
-            let ungranted = operator.join("ungranted");
             let workspace = operator.join("workspace");
-            std::fs::create_dir(&granted).expect("granted directory");
-            std::fs::create_dir(&ungranted).expect("ungranted directory");
+            std::fs::write(&granted, "seed").expect("granted file");
             std::fs::create_dir(&workspace).expect("workspace directory");
             let mut record = record(&root);
             let mut spec = record.agent.clone().expect("agent spec");
@@ -1821,15 +1819,18 @@ while :; do :; done"#
                 None,
             );
             launcher.prepare("alpha").expect("unchanged grant");
-            std::fs::rename(&granted, operator.join("moved")).expect("move granted directory");
-            std::os::unix::fs::symlink(&ungranted, &granted).expect("replace grant with link");
+            std::fs::rename(&granted, operator.join("moved")).expect("move granted file");
+            std::fs::create_dir(&granted).expect("replace file grant with directory");
             let refusal = launcher
                 .prepare("alpha")
                 .err()
                 .expect("changed grant refused");
             let message = refusal.to_string();
             assert!(message.contains("[mcp.alpha]"), "{message}");
-            assert!(message.contains("became a symbolic link"), "{message}");
+            assert!(
+                message.contains("changed between a file and a directory"),
+                "{message}"
+            );
         });
     }
 

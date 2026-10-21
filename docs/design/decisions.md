@@ -393,8 +393,16 @@ under a grant is now the operator's stated reach**, named on stderr by the grant
 The box defends the authority it loaded, and re-checks that by identity at every spawn, which
 `a_spawn_refuses_a_reach_whose_subtracted_authority_moved` pins.
 
-Three limits to plan around. On Linux a writable bind is also readable, so `write` without `read`
-holds on macOS only, and the disclosure names such an entry as readable too. On Linux, when the
+Three limits to plan around. Linux writable mounts also permit reads. Box therefore refuses each
+Linux write grant without explicit read coverage before any agent, tool, or local server runs.
+A matching file read or an enclosing directory read supplies that coverage. A child read cannot
+cover a parent write grant. macOS retains write-only access. The disclosure names complete and
+partial read-write access. `linux_rejects_write_only_before_any_process_runs` pins startup refusal.
+`explicit_read_write_succeeds_for_every_process_and_scope` pins explicit access and overlapping scopes.
+This accepted platform limitation avoids silently adding read permission. Landlock is the planned
+long-term approach; its implementation and qualification remain deferred.
+
+On Linux, when the
 authority directory sits more than one level below a write grant, the workload can rename the
 ancestor between them and create a fresh directory at the vacated path, which a later run whose
 `--config` names that path adopts; macOS refuses the ancestor rename, and

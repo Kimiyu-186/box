@@ -31,6 +31,8 @@ impl Fixture {
             .unwrap();
         }
         std::fs::write(data.join("nested/value"), "seed").unwrap();
+        std::fs::write(data.join("nested/sibling"), "sibling").unwrap();
+        std::fs::write(data.join("sibling"), "sibling").unwrap();
         std::fs::write(
             root.join("policy.dw"),
             "permit(principal, action, resource);",
@@ -62,13 +64,15 @@ impl Fixture {
     fn run(&self, role: &str, shape: &str, mode: &str) -> Output {
         let agent = self.root.join("bin/mode-agent").display().to_string();
         let target = self.data.join("nested/value").display().to_string();
+        let sibling = self.sibling(shape).display().to_string();
         let command = match role {
-            "agent" => vec![agent, mode.to_string(), target.clone()],
+            "agent" => vec![agent, mode.to_string(), target.clone(), sibling.clone()],
             "tool" => vec![
                 agent,
                 "tool-client".to_string(),
                 mode.to_string(),
                 target.clone(),
+                sibling.clone(),
             ],
             "server" => vec![agent, "server-client".to_string()],
             _ => unreachable!(),
@@ -80,7 +84,7 @@ impl Fixture {
                 format!("[tool.probe]\ncommand = ['mode-tool']\n[tool.probe.filesystem]\n{grants}")
             }
             "server" => format!(
-                "[mcp.probe]\ntype = 'stdio'\ncommand = ['mode-server', 'server', {mode:?}, {target:?}]\n[mcp.probe.filesystem]\n{grants}"
+                "[mcp.probe]\ntype = 'stdio'\ncommand = ['mode-server', 'server', {mode:?}, {target:?}, {sibling:?}]\n[mcp.probe.filesystem]\n{grants}"
             ),
             _ => unreachable!(),
         };
@@ -105,6 +109,14 @@ impl Fixture {
             .env("HOME", self.home.path())
             .env("PATH", search);
         bounded_output::bounded_output(command)
+    }
+
+    fn sibling(&self, shape: &str) -> PathBuf {
+        self.data.join(if shape == "file-in-read-tree" {
+            "nested/sibling"
+        } else {
+            "sibling"
+        })
     }
 }
 
@@ -150,10 +162,20 @@ fn linux_rejects_write_only_before_any_process_runs() {
 
 #[test]
 fn explicit_read_write_succeeds_for_every_process_and_scope() {
+    if !fixture::namespace_launcher_is_usable() {
+        println!("skipping: this platform has no usable containment backend");
+        return;
+    }
     for role in ["agent", "tool", "server"] {
         for shape in ["file", "directory", "nested-directory", "file-in-read-tree"] {
             let fixture = Fixture::new();
-            let output = fixture.run(role, shape, "read-write");
+            let overlapping = matches!(shape, "nested-directory" | "file-in-read-tree");
+            let mode = if overlapping {
+                "read-write-overlap"
+            } else {
+                "read-write"
+            };
+            let output = fixture.run(role, shape, mode);
             assert!(output.status.success(), "{role}/{shape}: {output:?}");
             assert!(
                 String::from_utf8_lossy(&output.stdout).contains("FILESYSTEM_PROBE_OK"),
@@ -167,12 +189,23 @@ fn explicit_read_write_succeeds_for_every_process_and_scope() {
                 std::fs::read_to_string(fixture.data.join("nested/value")).unwrap(),
                 "changed"
             );
+            if overlapping {
+                assert_eq!(
+                    std::fs::read_to_string(fixture.sibling(shape)).unwrap(),
+                    "sibling",
+                    "{role}/{shape}: a sibling outside the write grant must stay unchanged"
+                );
+            }
         }
     }
 }
 
 #[test]
 fn read_only_preserves_contents_for_every_process() {
+    if !fixture::namespace_launcher_is_usable() {
+        println!("skipping: this platform has no usable containment backend");
+        return;
+    }
     for role in ["agent", "tool", "server"] {
         let fixture = Fixture::new();
         let output = fixture.run(role, "file", "read-only");
@@ -209,6 +242,25 @@ fn macos_write_only_preserves_content_read_refusal() {
         );
         assert_eq!(
             std::fs::read_to_string(fixture.data.join("nested/value")).unwrap(),
+            "changed"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_partial_read_does_not_expose_the_rest_of_a_write_tree() {
+    for role in ["agent", "tool", "server"] {
+        let fixture = Fixture::new();
+        let output = fixture.run(role, "partial-read", "partial-read");
+        assert!(output.status.success(), "{role}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FILESYSTEM_PROBE_OK"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.data.join("nested/value")).unwrap(),
+            "changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.sibling("partial-read")).unwrap(),
             "changed"
         );
     }

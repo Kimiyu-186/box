@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-fn access(mode: &str, path: &str) {
+fn access(mode: &str, path: &str, sibling: &str) {
     if mode == "write-only" {
         assert!(std::fs::read(path).is_err(), "write-only must refuse reads");
     } else {
@@ -18,9 +18,22 @@ fn access(mode: &str, path: &str) {
         );
     } else {
         std::fs::write(path, "changed").unwrap();
-        if mode == "read-write" {
+        if matches!(mode, "read-write" | "read-write-overlap" | "partial-read") {
             assert_eq!(std::fs::read_to_string(path).unwrap(), "changed");
         }
+    }
+    if mode == "read-write-overlap" {
+        assert_eq!(std::fs::read_to_string(sibling).unwrap(), "sibling");
+        assert!(
+            std::fs::write(sibling, "changed").is_err(),
+            "write must stay inside its grant"
+        );
+    } else if mode == "partial-read" {
+        assert!(
+            std::fs::read(sibling).is_err(),
+            "read must stay inside its grant"
+        );
+        std::fs::write(sibling, "changed").unwrap();
     }
 }
 
@@ -30,7 +43,10 @@ fn main() {
     match args[0].as_str() {
         "tool-client" => {
             let output = Command::new("zsh")
-                .args(["-c", &format!("mode-tool {} {}", args[1], args[2])])
+                .args([
+                    "-c",
+                    &format!("mode-tool {} {} {}", args[1], args[2], args[3]),
+                ])
                 .output()
                 .unwrap();
             std::io::stdout().write_all(&output.stdout).unwrap();
@@ -83,7 +99,7 @@ fn main() {
             println!("FILESYSTEM_PROBE_OK");
         }
         "server" => {
-            access(&args[1], &args[2]);
+            access(&args[1], &args[2], &args[3]);
             for line in std::io::stdin().lock().lines() {
                 let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
                 let Some(id) = request.get("id") else {
@@ -101,7 +117,7 @@ fn main() {
             }
         }
         mode => {
-            access(mode, &args[1]);
+            access(mode, &args[1], &args[2]);
             println!("FILESYSTEM_PROBE_OK");
         }
     }

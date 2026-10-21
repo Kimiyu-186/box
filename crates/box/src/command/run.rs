@@ -168,10 +168,17 @@ async fn hosted(
         stored: &locked.record,
         protected_sources: &locked.sources,
     };
-    // Every tool is translated once now, so a tool that cannot run refuses the box before the agent
-    // starts, and its grants are disclosed beside the agent's.
-    for (label, spec) in &locked.record.tool {
-        let table = format!("[tool.{label}]");
+    let tools = locked
+        .record
+        .tool
+        .iter()
+        .map(|(label, spec)| (format!("[tool.{label}]"), spec));
+    let servers = locked
+        .record
+        .contained_mcp
+        .iter()
+        .map(|(label, server)| (format!("[mcp.{label}]"), &server.spec));
+    for (table, spec) in tools.chain(servers) {
         let boundary = Boundary::translate(
             spec,
             Launch {
@@ -187,15 +194,6 @@ async fn hosted(
             &site,
         )?;
         eprintln!("{}", boundary.disclosure());
-    }
-    for label in locked.record.contained_mcp.keys() {
-        let table = format!("[mcp.{label}]");
-        if let Some(reach) = hosted.approved().table(&table) {
-            eprintln!("strands-box: {table} direct filesystem grants:");
-            for grant in &reach.grants {
-                eprintln!("{}", grant.disclosure());
-            }
-        }
     }
     let boundary = Boundary::translate(
         &agent,

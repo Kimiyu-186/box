@@ -160,6 +160,9 @@ jobs:
       - name: Build strands-box and the containment trampoline
         run: cargo build -p strands-box -p strands-box-containment --release --locked --features test-support
 
+      - name: Test filesystem modes on a supported backend
+        run: cargo test -p strands-box --release --locked --all-features --test filesystem_modes -- --nocapture
+
       # On Linux the MCP cases install their fixture server into /usr/bin, because a leaf's filesystem
       # table cannot grant exec there. The runner is not root, so create each file
       # it names in advance, owned by the runner user; the case then copies over it and sets its mode.
