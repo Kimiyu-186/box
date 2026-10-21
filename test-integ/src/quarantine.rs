@@ -1,7 +1,7 @@
 //! quarantine.rs — the TEMPORARY, exact, compiled allowlist of (case, platform) cells that record an
 //! authorized `SKIP` instead of running, and the one note text that authorizes it.
 //!
-//! Why this exists: CN-W-05 and CN-W-06 author a `[tool.<name>.filesystem] exec` list, which a box
+//! Why this exists: CN-W-06 authors a `[tool.<name>.filesystem] exec` list, which a box
 //! refuses at load (docs/design/decisions.md#a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds).
 //! Linux broad exec is implemented; these fixtures still need supported grants and verified toolchain paths.
 //!
@@ -46,31 +46,20 @@ refuses at load; Linux broad exec is implemented, but the fixture needs supporte
 and verified toolchain paths";
 
 const TOOL_EXEC_RESTORE_WHEN: &str = "fixtures use supported grants with broad exec for a Linux tool leaf, \
-these entries are deleted, and the full Linux deterministic suite passes with both cases enabled";
+these entries are deleted, and the full Linux deterministic suite passes with the case enabled";
 
 /// The exact, authorized list. Edit ONLY with the authorization recorded in test-integ/QUARANTINE.md;
 /// the unit test `the_quarantine_is_exactly_the_authorized_set` pins its contents so any change is a
 /// visible diff. When it is empty, GREEN means full coverage again with no other change.
-pub const TEMPORARY_QUARANTINE: &[Quarantine] = &[
-    Quarantine {
-        id: "CN-W-05",
-        platform: "linux",
-        reason: "authors [tool.git.filesystem] exec, refused at load; the case runs only on linux, \
-so it records a SKIP there pending fixture conversion to supported grants",
-        issue: TOOL_EXEC_ISSUE,
-        owner: "box-maintainers",
-        restore_when: TOOL_EXEC_RESTORE_WHEN,
-    },
-    Quarantine {
-        id: "CN-W-06",
-        platform: "linux",
-        reason: "authors [tool.cargo.filesystem] and [tool.hello.filesystem] exec, refused at load; \
+pub const TEMPORARY_QUARANTINE: &[Quarantine] = &[Quarantine {
+    id: "CN-W-06",
+    platform: "linux",
+    reason: "authors [tool.cargo.filesystem] and [tool.hello.filesystem] exec, refused at load; \
 the case runs only on linux, so it records a SKIP there pending fixture conversion to supported grants",
-        issue: TOOL_EXEC_ISSUE,
-        owner: "box-maintainers",
-        restore_when: TOOL_EXEC_RESTORE_WHEN,
-    },
-];
+    issue: TOOL_EXEC_ISSUE,
+    owner: "box-maintainers",
+    restore_when: TOOL_EXEC_RESTORE_WHEN,
+}];
 
 /// The authorized entry for `(id, platform)`, if any. Exact string match on both.
 pub fn lookup(id: &str, platform: &str) -> Option<&'static Quarantine> {
@@ -121,7 +110,7 @@ mod tests {
             .iter()
             .map(|q| (q.id, q.platform))
             .collect();
-        assert_eq!(cells, vec![("CN-W-05", "linux"), ("CN-W-06", "linux")]);
+        assert_eq!(cells, vec![("CN-W-06", "linux")]);
         // The Linux tool-exec entries.
         for q in TEMPORARY_QUARANTINE
             .iter()
@@ -149,7 +138,7 @@ mod tests {
 
     #[test]
     fn lookup_is_exact_on_case_and_platform() {
-        assert!(lookup("CN-W-05", "linux").is_some() && lookup("CN-W-06", "linux").is_some());
+        assert!(lookup("CN-W-05", "linux").is_none() && lookup("CN-W-06", "linux").is_some());
         assert!(
             lookup("CN-W-05", "macos").is_none() && lookup("CN-W-06", "macos").is_none(),
             "the tool-exec cases are linux-only"
@@ -159,19 +148,19 @@ mod tests {
             "an unlisted case cannot skip"
         );
         assert!(
-            lookup("cn-w-05", "linux").is_none() && lookup("CN-W-05", "Linux").is_none(),
+            lookup("cn-w-06", "linux").is_none() && lookup("CN-W-06", "Linux").is_none(),
             "no case folding"
         );
-        assert_eq!(for_platform("linux").len(), 2);
+        assert_eq!(for_platform("linux").len(), 1);
         assert!(for_platform("macos").is_empty());
     }
 
     #[test]
     fn the_note_is_self_describing_and_prefixed() {
-        let text = note(lookup("CN-W-05", "linux").unwrap());
+        let text = note(lookup("CN-W-06", "linux").unwrap());
         assert!(text.starts_with(QUARANTINE_NOTE_PREFIX));
         for needle in [
-            "CN-W-05 on linux",
+            "CN-W-06 on linux",
             "broad exec",
             "owner: box-maintainers",
             "restore when:",

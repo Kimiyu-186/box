@@ -1,87 +1,35 @@
-# TEMPORARY QUARANTINE — cells that record an authorized SKIP instead of running
+# Temporary quarantine
 
-**Status: ACTIVE. These cases will be re-enabled after the fix is in place.**
+**Status: active. One Linux case remains disabled.**
 
-| case | platform | body | why | owner | evidence |
-|---|---|---|---|---|---|
-| CN-W-05 | linux | unchanged, runs only on linux | authors `[tool.git.filesystem] exec`, which a box refuses at load under [the leaf toolchain decision](../docs/design/decisions.md#a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds); Linux broad exec exists, but the fixture still needs supported helper grants | box-maintainers | recorded on a Linux run |
-| CN-W-06 | linux | unchanged, runs only on linux | authors `[tool.cargo.filesystem]` and `[tool.hello.filesystem] exec`, which a box refuses at load under [the leaf toolchain decision](../docs/design/decisions.md#a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds); Linux broad exec exists, but the fixture still needs supported helper grants | box-maintainers | recorded on a Linux run |
+| Case | Platform | Reason | Owner |
+| --- | --- | --- | --- |
+| CN-W-06 | Linux | The Cargo fixture declares unsupported tool `exec` lists and needs supported grants and verified toolchain paths. | box-maintainers |
 
-The maintainers approved this exception for the CN-W-05 and CN-W-06 linux cells. Both cases
-author a tool `exec` list that a box refuses at load under [the leaf toolchain decision](../docs/design/decisions.md#a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds), and both
-run only on linux. Linux broad exec now supports execution from readable and writable grants.
-These fixtures still need supported grants and verified toolchain paths.
-The exception remains limited to those two cells until their converted fixtures pass.
+CN-W-05 now runs the Git workflow with supported readable and writable grants.
+It checks commit-hook execution, agent execution refusal, unconfigured Git refusal, read-only files, protected configuration, and an ungranted program.
+The Cargo exception remains under the [leaf toolchain decision](../docs/design/decisions.md#a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds).
 
-## The mechanism (smallest transparent one the harness supports)
+## How the exception works
 
-- `test-integ/src/quarantine.rs` holds the **compiled, exact allowlist** `TEMPORARY_QUARANTINE` of
-  `(id, platform, reason, issue, owner, restore_when)` and the ONE authorized note text (`quarantine::note`).
-  A unit test pins the list to exactly `[("CN-W-05","linux"), ("CN-W-06","linux")]`, so any change is a visible diff.
-- **Runner** (`run_case_on` in `lib.rs`): platform declarations (`platforms: […]`) are checked first, unchanged;
-  then, if the `(id, current platform)` cell is listed, it writes a `SKIP` row with exactly the authorized note and
-  **does not run the body**. On every other platform and for every other case nothing changes.
-- **Reducer** (`verdict::Summary::build`): a `SKIP` on an applicable platform is accepted **only** for a listed cell
-  **and only** with exactly the authorized note; a listed cell that recorded `PASS`/`FAIL`/`ERROR` is an integrity
-  problem (runner and reducer disagree); an unlisted `SKIP`, a wrong or missing reason, a missing or duplicate row,
-  a malformed row, a nonzero `cargo test` exit, any other `FAIL`/`ERROR`, and the collector's platform/commit checks
-  all remain RED. Runner and reducer read the same compiled list.
-- **Report:** `verdict.json` gains `coverage_gate` (`"full"` or `"reduced: N quarantined cell(s) on this
-  platform"`) and `quarantine: [{id, platform, reason, issue, owner, restore_when, applied}]`; each SKIP row's note
-  starts with `TEMPORARY QUARANTINE: ` and names the case, platform, reason, issue, owner and restoration condition.
-  `emit-verdict` prints both. These fields are additive; the collector reads only `verdict`, `platform`,
-  `box_commit`, `counts` and `integrity`, so the collector needs no change.
+`src/quarantine.rs` holds the exact compiled list and the required skip message.
+The pinned unit test permits only `[("CN-W-06", "linux")]`.
+The runner records an authorized skip without running that case.
+Platform declarations still apply before the quarantine check.
 
-Example (linux, reduced gate):
+The reducer accepts that skip only when its message matches the compiled entry.
+A quarantined case that runs, an unlisted skip, a missing result, or another failure keeps the verdict red.
+The report records the remaining entry and `coverage_gate = "reduced: 1 quarantined cell(s) on this platform"` on Linux.
+macOS has no quarantine entries.
+A green Linux result therefore remains reduced coverage, not complete qualification.
 
-```json
-{
-  "platform": "linux", "box_commit": "…", "verdict": "GREEN",
-  "counts": { "total": 51, "pass": 41, "fail": 0, "error": 0, "skip": 10 },
-  "integrity": { "cargo_status": 0, "expected": 51, "recorded": 51, "problems": [] },
-  "coverage_gate": "reduced: 2 quarantined cell(s) on this platform",
-  "quarantine": [
-    { "id": "CN-W-05", "platform": "linux", "reason": "authors [tool.git.filesystem] exec, …", "issue": "…",
-      "owner": "box-maintainers", "restore_when": "fixtures use supported grants with broad exec for a Linux tool leaf, …", "applied": true },
-    { "id": "CN-W-06", "platform": "linux", "reason": "…", "issue": "…", "owner": "box-maintainers", "restore_when": "…", "applied": true }
-  ],
-  "results": [ …, { "id": "CN-W-05", "result": "SKIP", "note": "TEMPORARY QUARANTINE: CN-W-05 on linux: …" }, … ]
-}
-```
+## Restore the Cargo case
 
-## Semantics of GREEN while this file is non-empty
+Convert the Cargo fixture to supported helper grants and verify its toolchain paths.
+Remove its entry from `TEMPORARY_QUARANTINE` and update the pinned test and reducer tests.
+Remove the quarantine comment above its case.
+Run the full Linux deterministic suite and require the restored case to pass.
+Resolve this document only when the compiled quarantine list is empty.
 
-- **macOS GREEN = the full merge gate:** no cell is quarantined on macOS, and `coverage_gate` reads `full`.
-- **Linux GREEN = the explicitly reduced merge gate:** every applicable cell passed except CN-W-05 and CN-W-06,
-  which recorded authorized SKIPs pending fixture conversion to supported grants. It is
-  **not** full qualification.
-- Global qualification still requires PASS for every applicable cell on both platforms; the exception is only for
-  the merge gate.
-
-## How to remove the exception (re-enable)
-
-Edit `TEMPORARY_QUARANTINE` in `test-integ/src/quarantine.rs`, update the pinned test
-`the_quarantine_is_exactly_the_authorized_set` to the remaining set, and delete the
-"TEMPORARY QUARANTINE" comment block above each re-enabled `det_case!`. The file is RESOLVED (or
-deleted) only once `TEMPORARY_QUARANTINE` is empty.
-
-### Linux tool-exec cells (CN-W-05, CN-W-06)
-
-1. Convert both fixtures to supported helper grants and verify their toolchain paths.
-   Neither fixture can use a `[tool.<name>.filesystem] exec` list.
-2. Delete the `CN-W-05` and `CN-W-06` entries; update the pinned test; remove the comment blocks
-   above those two cases.
-3. Run the full deterministic suite on Linux. Both cells must execute and PASS; the linux
-   `coverage_gate` must lose these two.
-
-## Verification performed here (Linux host; native macOS runs are not covered here)
-
-- Runner: each listed cell on `PLATFORM=linux` records the authorized SKIP and never runs its body; the same cases on
-  `macos` run their bodies; an unlisted case (CN-E-01, CN-E-02, CN-C-01) on macOS runs its body; a `platforms:`
-  declaration still wins and keeps its own note.
-- Reducer: authorized linux run → GREEN with `coverage_gate` reduced and both entries `applied`; macos → `full`, and a
-  quarantine note is rejected on macos; unlisted SKIP with a quarantine-shaped note → RED; wrong/missing/foreign
-  reason → RED and `applied: false`; listed cell that ran (PASS/FAIL/ERROR) → RED; missing row, duplicate row, cargo
-  101, unreported cargo status, another case's ERROR, malformed row → RED.
-- Static/build: `cargo test --lib`, `cargo test --release --no-run` (full case set), `cargo clippy --release
-  --all-targets`, `tools/fault-inject.sh permissive` (Linux).
+The runner tests prove that restored Git runs and quarantined Cargo skips.
+The reducer tests retain refusal of incorrect skip messages, unlisted skips, missing or duplicate results, and command failures.

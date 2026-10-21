@@ -761,7 +761,7 @@ mod tests {
     }
 
     // ── TEMPORARY QUARANTINE: the reducer side (test-integ/QUARANTINE.md) ─────────────────────
-    // The quarantined cells are declared linux-only, like the real CN-W-05/CN-W-06.
+    // Cargo remains quarantined; Git runs on Linux.
     const QUARANTINE_SUITE: &[CaseSpec] = &[
         CaseSpec {
             id: "PO-1",
@@ -774,12 +774,12 @@ mod tests {
             platforms: &[],
         },
         CaseSpec {
-            id: "CN-W-05",
+            id: "CN-W-06",
             category: "containment",
             platforms: &["linux"],
         },
         CaseSpec {
-            id: "CN-W-06",
+            id: "CN-W-05",
             category: "containment",
             platforms: &["linux"],
         },
@@ -789,13 +789,13 @@ mod tests {
         crate::quarantine::note(crate::quarantine::lookup(id, "linux").expect("listed"))
     }
 
-    /// A complete linux run with both quarantined cells recorded as authorized SKIPs.
+    /// A complete linux run with the remaining quarantined cell recorded as authorized SKIPs.
     fn complete_linux_quarantined() -> Vec<Row> {
         vec![
             row("PO-1", "policy", "PASS", ""),
             row("CN-E-01", "containment", "PASS", ""),
-            row("CN-W-05", "containment", "SKIP", &qnote("CN-W-05")),
             row("CN-W-06", "containment", "SKIP", &qnote("CN-W-06")),
+            row("CN-W-05", "containment", "PASS", ""),
         ]
     }
 
@@ -820,18 +820,18 @@ mod tests {
             s.counts,
             Counts {
                 total: 4,
-                pass: 2,
+                pass: 3,
                 fail: 0,
                 error: 0,
-                skip: 2
+                skip: 1
             }
         );
         assert_eq!(
             s.coverage_gate,
-            "reduced: 2 quarantined cell(s) on this platform"
+            "reduced: 1 quarantined cell(s) on this platform"
         );
         let applied: Vec<(&str, bool)> = s.quarantine.iter().map(|q| (q.id, q.applied)).collect();
-        assert_eq!(applied, vec![("CN-W-05", true), ("CN-W-06", true)]);
+        assert_eq!(applied, vec![("CN-W-06", true)]);
         assert!(s.quarantine.iter().all(|q| q.owner == "box-maintainers"
             && q.restore_when.contains("broad exec for a Linux tool leaf")));
         let json = serde_json::to_string(&s).unwrap();
@@ -849,13 +849,13 @@ mod tests {
             row("PO-1", "policy", "PASS", ""),
             row("CN-E-01", "containment", "PASS", ""),
             row(
-                "CN-W-05",
+                "CN-W-06",
                 "containment",
                 "SKIP",
                 &format!("{SKIP_NOTE_PREFIX}macos: declared for [linux]"),
             ),
             row(
-                "CN-W-06",
+                "CN-W-05",
                 "containment",
                 "SKIP",
                 &format!("{SKIP_NOTE_PREFIX}macos: declared for [linux]"),
@@ -874,7 +874,7 @@ mod tests {
                 platforms: &[],
             },
             CaseSpec {
-                id: "CN-W-05",
+                id: "CN-W-06",
                 category: "containment",
                 platforms: &[],
             },
@@ -885,7 +885,7 @@ mod tests {
             Rows {
                 rows: vec![
                     row("PO-1", "policy", "PASS", ""),
-                    row("CN-W-05", "containment", "SKIP", &qnote("CN-W-05")),
+                    row("CN-W-06", "containment", "SKIP", &qnote("CN-W-06")),
                 ],
                 malformed: vec![],
             },
@@ -895,7 +895,7 @@ mod tests {
         assert_eq!(s.verdict, "RED");
         assert!(
             s.integrity.problems.iter().any(|p| p
-                .starts_with("CN-W-05: SKIP on macos, but the case is declared for this platform")),
+                .starts_with("CN-W-06: SKIP on macos, but the case is declared for this platform")),
             "{:?}",
             s.integrity.problems
         );
@@ -908,7 +908,7 @@ mod tests {
             "CN-E-01",
             "containment",
             "SKIP",
-            &qnote("CN-W-05").replace("CN-W-05", "CN-E-01"),
+            &qnote("CN-W-06").replace("CN-W-06", "CN-E-01"),
         );
         let s = build_on("linux", rows, Some(0));
         assert_eq!(s.verdict, "RED");
@@ -925,19 +925,19 @@ mod tests {
         for note in [
             "",
             "SKIP",
-            "TEMPORARY QUARANTINE: CN-W-05 on linux: something else",
-            &qnote("CN-W-05").replace("owner: box-maintainers", "owner: nobody"),
+            "TEMPORARY QUARANTINE: CN-W-06 on linux: something else",
+            &qnote("CN-W-06").replace("owner: box-maintainers", "owner: nobody"),
             &format!("{}{}", SKIP_NOTE_PREFIX, "linux: declared for [macos]"),
         ] {
             let mut rows = complete_linux_quarantined();
-            rows[2] = row("CN-W-05", "containment", "SKIP", note);
+            rows[2] = row("CN-W-06", "containment", "SKIP", note);
             let s = build_on("linux", rows, Some(0));
             assert_eq!(s.verdict, "RED", "note {note:?} must not be accepted");
-            assert!(s.integrity.problems.iter().any(|p| p.starts_with("CN-W-05: SKIP on linux with a note that is not the authorized TEMPORARY QUARANTINE note")), "{note:?}: {:?}", s.integrity.problems);
+            assert!(s.integrity.problems.iter().any(|p| p.starts_with("CN-W-06: SKIP on linux with a note that is not the authorized TEMPORARY QUARANTINE note")), "{note:?}: {:?}", s.integrity.problems);
             assert!(
                 !s.quarantine
                     .iter()
-                    .find(|q| q.id == "CN-W-05")
+                    .find(|q| q.id == "CN-W-06")
                     .unwrap()
                     .applied,
                 "not applied when the note is wrong"
@@ -949,7 +949,7 @@ mod tests {
     fn a_quarantined_cell_that_ran_anyway_is_red_because_runner_and_reducer_disagree() {
         for result in ["PASS", "FAIL", "ERROR"] {
             let mut rows = complete_linux_quarantined();
-            rows[2] = row("CN-W-05", "containment", result, "ran");
+            rows[2] = row("CN-W-06", "containment", result, "ran");
             let s = build_on("linux", rows, Some(0));
             assert_eq!(s.verdict, "RED", "{result}");
             assert!(
@@ -980,14 +980,14 @@ mod tests {
         );
         // Duplicate quarantined row.
         let mut rows = complete_linux_quarantined();
-        rows.push(row("CN-W-05", "containment", "SKIP", &qnote("CN-W-05")));
+        rows.push(row("CN-W-06", "containment", "SKIP", &qnote("CN-W-06")));
         let s = build_on("linux", rows, Some(0));
         assert_eq!(s.verdict, "RED");
         assert!(
             s.integrity
                 .problems
                 .iter()
-                .any(|p| p.contains("CN-W-05: 2 rows recorded (duplicate id)"))
+                .any(|p| p.contains("CN-W-06: 2 rows recorded (duplicate id)"))
         );
         // Cargo failure and unreported cargo status.
         assert_eq!(
@@ -1030,7 +1030,7 @@ mod tests {
     fn a_quarantined_cell_missing_its_row_is_still_a_missing_row() {
         let rows: Vec<Row> = complete_linux_quarantined()
             .into_iter()
-            .filter(|r| r.id != "CN-W-05")
+            .filter(|r| r.id != "CN-W-06")
             .collect();
         let s = build_on("linux", rows, Some(0));
         assert_eq!(s.verdict, "RED");
@@ -1038,14 +1038,14 @@ mod tests {
             s.integrity
                 .problems
                 .iter()
-                .any(|p| p.starts_with("CN-W-05: no row recorded")),
+                .any(|p| p.starts_with("CN-W-06: no row recorded")),
             "{:?}",
             s.integrity.problems
         );
         assert!(
             !s.quarantine
                 .iter()
-                .find(|q| q.id == "CN-W-05")
+                .find(|q| q.id == "CN-W-06")
                 .unwrap()
                 .applied
         );

@@ -2818,7 +2818,8 @@ mod tests {
 
     #[test]
     fn a_quarantined_cell_records_the_authorized_skip_and_never_runs_its_body() {
-        for id in ["CN-W-05", "CN-W-06"] {
+        for entry in quarantine::TEMPORARY_QUARANTINE {
+            let id = entry.id;
             let row = quarantine_probe(id, "linux");
             assert_eq!(row.result, "SKIP", "{id}: {}", row.note);
             assert_eq!(
@@ -2851,6 +2852,12 @@ mod tests {
     }
 
     #[test]
+    fn the_restored_git_case_runs_on_linux() {
+        let row = quarantine_probe("CN-W-05", "linux");
+        assert_run_was_attempted("CN-W-05", &row);
+    }
+
+    #[test]
     fn the_same_cases_still_run_their_bodies_on_macos() {
         for id in ["CN-W-05", "CN-W-06"] {
             let row = quarantine_probe(id, "macos");
@@ -2876,7 +2883,7 @@ mod tests {
             std::env::set_var("DET_RESULTS_DIR", dir.path());
             std::env::set_var("PLATFORM", "linux");
         }
-        run_case_on("CN-W-05", &[Platform::Macos], "probe", |_fixture| {
+        run_case_on("CN-W-06", &[Platform::Macos], "probe", |_fixture| {
             panic!("DET_ERROR: BODY_RAN")
         });
         unsafe {
