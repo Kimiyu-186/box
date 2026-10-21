@@ -168,17 +168,8 @@ async fn hosted(
         stored: &locked.record,
         protected_sources: &locked.sources,
     };
-    let tools = locked
-        .record
-        .tool
-        .iter()
-        .map(|(label, spec)| (format!("[tool.{label}]"), spec));
-    let servers = locked
-        .record
-        .contained_mcp
-        .iter()
-        .map(|(label, server)| (format!("[mcp.{label}]"), &server.spec));
-    for (table, spec) in tools.chain(servers) {
+    for (label, spec) in &locked.record.tool {
+        let table = format!("[tool.{label}]");
         let boundary = Boundary::translate(
             spec,
             Launch {
@@ -194,6 +185,19 @@ async fn hosted(
             &site,
         )?;
         eprintln!("{}", boundary.disclosure());
+    }
+    for label in locked.record.contained_mcp.keys() {
+        let table = format!("[mcp.{label}]");
+        let reach = hosted
+            .approved()
+            .table(&table)
+            .ok_or_else(|| ConfigError::Contract {
+                reason: format!("{table} has no reach judged for this run"),
+            })?;
+        eprintln!("strands-box: {table} starts on demand; approved direct filesystem grants:");
+        for grant in &reach.grants {
+            eprintln!("{}", grant.disclosure());
+        }
     }
     let boundary = Boundary::translate(
         &agent,

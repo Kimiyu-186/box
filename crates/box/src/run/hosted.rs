@@ -429,6 +429,7 @@ impl McpLeafLauncher {
         &self,
         boundary: Boundary,
     ) -> Result<crate::run::contain::supervise::StreamingLeaf, BoxError> {
+        eprintln!("{}", boundary.disclosure());
         crate::run::contain::supervise::LeafBox::spawn_streaming(
             boundary,
             &self.layout,

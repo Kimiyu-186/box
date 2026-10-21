@@ -485,10 +485,13 @@ parses a harness's own configuration file to find one.
 
 A sandbox for a stdio MCP server is not optional. A `type = "stdio"` entry carries the same grant
 fields as any other process (`workspace`, `env`, `filesystem`), Box synthesizes one
-process spec from the entry, and it runs through the one translator, so the same floors apply. The
-startup disclosure does **not**: it prints for `[agent]` and each `[tool.<name>]`, and the boundary of an MCP
-server's sandbox is built when the server starts, so an `[mcp.<name>.filesystem]` grant is kernel
-reach that no `fs:*` decision covers and no disclosure names. A server that declares no grants still
+process spec from the entry, and it runs through the one translator, so the same floors apply.
+Box approves and discloses every server's direct filesystem grants before the agent starts.
+A server's command resolves only when the agent requests that server.
+Box then prints the full boundary disclosure before launching it, including its runtime and environment.
+This preserves lazy server startup without hiding direct filesystem reach.
+`a_box_declaring_many_mcp_servers_still_runs` pins unused declarations without installed server programs.
+A server that declares no grants still
 runs contained, on the baseline every tool's and MCP server's sandbox gets. One escape exists and it is network-only: `[mcp.<name>.network] contain_egress = false` gives
 that server's sandbox direct egress instead of the gateway-routed default, for a trusted client that
 cannot honour `HTTPS_PROXY`. See

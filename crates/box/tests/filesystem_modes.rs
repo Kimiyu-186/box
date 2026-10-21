@@ -185,6 +185,19 @@ fn explicit_read_write_succeeds_for_every_process_and_scope() {
                 String::from_utf8_lossy(&output.stderr).contains("(read-write)"),
                 "{role}/{shape}: {output:?}"
             );
+            if role == "server" {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains(
+                        "[mcp.probe] starts on demand; approved direct filesystem grants:"
+                    ),
+                    "{shape}: {output:?}"
+                );
+                assert!(
+                    stderr.contains("[mcp.probe] runtime minimum, added by Core:"),
+                    "{shape}: {output:?}"
+                );
+            }
             assert_eq!(
                 std::fs::read_to_string(fixture.data.join("nested/value")).unwrap(),
                 "changed"
