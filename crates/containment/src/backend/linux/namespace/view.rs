@@ -1132,15 +1132,14 @@ fn elf_dependencies(
             if !seen.insert(identity.clone()) {
                 continue;
             }
-            // A system library needs only system libraries. Anything else is judged like a grant
-            // and walked for its own needs, under its identity so `$ORIGIN` is a real directory.
+            // A non-system library must pass the same floor as a read grant.
             if !LIBRARY_DIRECTORIES
                 .iter()
                 .any(|directory| found.starts_with(directory))
             {
                 require_loadable(&image, &found, declared_home)?;
-                pending.push(identity);
             }
+            pending.push(identity);
             dependencies.push(Dependency {
                 path: found,
                 origin: MountOrigin::Library,
@@ -2959,6 +2958,47 @@ mod tests {
         assert!(
             !entries.iter().any(|entry| entry.target == root.join("lib")),
             "the library directory itself is not bound: {entries:#?}"
+        );
+    }
+
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn an_exec_file_pulls_system_libraries_transitively() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let app = planted_image(&root, "app", &synthetic_elf(None, &["libm.so.6"], None));
+        let libm = resolve_needed(&app, &app, "libm.so.6", &[], &[])
+            .expect("the GNU runtime supplies libm");
+        let needs = image_needs(&libm).expect("read libm's dependencies");
+        assert!(
+            needs.needed.iter().any(|name| name == "libc.so.6"),
+            "the system library must require libc for this regression"
+        );
+        let libc = resolve_needed(&libm, &app, "libc.so.6", &needs.search, &[])
+            .expect("libm's libc dependency exists");
+        let config = ContainmentConfig::new()
+            .allow(&app, Operation::Exec, Scope::File)
+            .expect("execute grant");
+
+        let entries = planned(&config);
+
+        for library in [&libm, &libc] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.target == *library)
+                .unwrap_or_else(|| panic!("{} must be planned", library.display()));
+            assert_eq!(entry.origin, MountOrigin::Library);
+            assert!(entry.executable && !entry.writable, "{entry:?}");
+        }
+        assert!(
+            !entries.iter().any(|entry| {
+                entry.kind == MountKind::Bind
+                    && entry.source.as_deref().is_some_and(Path::is_dir)
+                    && LIBRARY_DIRECTORIES
+                        .iter()
+                        .any(|directory| entry.target == Path::new(directory))
+            }),
+            "dependency discovery must not grant whole library directories"
         );
     }
 
