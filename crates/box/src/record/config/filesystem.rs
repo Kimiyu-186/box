@@ -182,6 +182,7 @@ pub(crate) fn direct_grants(
 }
 
 fn covers(outer: &DirectGrant, inner: &DirectGrant) -> bool {
+    // Disclosure compares validated file/tree grants, which exclude directory-entry grants.
     outer.resolved == inner.resolved
         || outer.scope == Scope::Root && inner.resolved.starts_with(&outer.resolved)
 }

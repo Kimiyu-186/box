@@ -610,6 +610,7 @@ impl ContainmentConfig {
                 )));
             }
         }
+        // Exact read pairing keeps coverage within credential consent, while the backend checks ordinary grants.
         crate::validate_grants(
             &self
                 .paths
