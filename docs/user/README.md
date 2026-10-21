@@ -18,6 +18,8 @@ Box runs an agent, or another command, under an operator's policy, with operatin
 
 ## Tutorials
 
+- [`tutorials/agentcore-runtime.md`](./tutorials/agentcore-runtime.md): deploy a boxed workload on AgentCore Runtime as managed code or a container image, then verify permitted and refused operations.
+
 - [`tutorials/first-policy.md`](./tutorials/first-policy.md): write a policy, run it, read a denial,
   and read the decision log.
 - [`tutorials/strands-cli-telemetry.md`](./tutorials/strands-cli-telemetry.md): add the Strands
