@@ -78,7 +78,9 @@ det_case! {
             .expect("DET_ERROR: run the ungranted program outside Box");
         assert!(host.status.success(), "DET_ERROR: the host program must succeed");
         let protected_config = b.workspace().join(".strands-box/box.toml");
-        assert!(!std::fs::read(&protected_config).unwrap().is_empty());
+        let config_bytes = std::fs::read(&protected_config)
+            .expect("DET_ERROR: read the protected configuration on the host");
+        assert!(!config_bytes.is_empty(), "DET_ERROR: the protected configuration must not be empty");
         let quoted = |path: &Path| sh_quote(&path.to_string_lossy());
         std::fs::write(&hook, format!(
             "#!{}\n\
@@ -119,7 +121,7 @@ det_case! {
         assert_eq!(std::fs::read_to_string(&protected_write).unwrap(), "HOST_CONTENT\n");
         let committed = Command::new(&git).args(["log", "-1", "--format=%s"])
             .current_dir(b.workspace()).output().expect("DET_ERROR: inspect the committed repository");
-        assert!(committed.status.success());
+        assert!(committed.status.success(), "Host Git must read the committed repository: {committed:?}");
         assert_eq!(String::from_utf8(committed.stdout).unwrap().trim(), "act5-commit");
 
         let hook = sh_quote(&hook.to_string_lossy());
