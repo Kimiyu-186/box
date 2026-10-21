@@ -780,6 +780,34 @@ fn a_plain_echo_of_the_real_secret_is_redacted() {
     );
 }
 
+#[test]
+fn a_path_scoped_secret_echoed_on_a_repeated_slash_spelling_is_redacted() {
+    let host = "api.echo.test";
+    let upstream = TlsUpstream::start_with_response(host, PLAIN_ECHO_RESPONSE);
+    let port = upstream.port();
+    let pattern = DestinationPattern::parse(&format!("{host}:{port}/v1/echo")).unwrap();
+    let (store, phantom) = opaque_store_for(pattern.clone(), "sk_live_REALSECRET");
+    let controls = CapabilitySet::builder()
+        .add_credential(CredentialCapability::new(pattern, store))
+        .build();
+    let handle = start_gateway(host, &upstream, controls, FixedPolicy::allowing(&[host]));
+
+    let mut client = WorkloadClient::connect(proxy_port(&handle), host, port);
+    client.send_request(
+        "GET",
+        "/v1//echo",
+        &[("Authorization", &format!("Bearer {phantom}"))],
+        b"",
+    );
+    let response = client.read_response();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+    assert!(
+        !response.contains("sk_live_REALSECRET") && response.contains("[REDACTED]"),
+        "the echoed secret must be redacted: {response:?}"
+    );
+}
+
 // ============================================================================================
 // NEGATIVE: a denied host is refused before it is resolved, so no DNS query leaves the box
 // ============================================================================================
@@ -1033,7 +1061,7 @@ fn a_path_scoped_secret_never_rides_plain_http() {
     };
     let handle = MitmInterceptor::start(config, controls, FixedPolicy::allowing(&[host])).unwrap();
 
-    for path in ["/v1/chat", "/%76%31/chat", "/%%3761/chat"] {
+    for path in ["/v1/chat", "/%76%31/chat", "/%%3761/chat", "/v1//chat"] {
         let reply = plain_exchange(
             proxy_port(&handle),
             &format!(
@@ -1062,4 +1090,60 @@ fn a_path_scoped_secret_never_rides_plain_http() {
     let audit = format!("{:?}", handle.drain_audit_events());
     assert!(audit.contains("a secret must ride TLS"), "{audit}");
     assert!(audit.contains("not RFC 3986"), "{audit}");
+}
+
+/// A path-scoped credential matches each repeated-slash spelling of its path, as policy judges it,
+/// and the request goes out on the path the workload sent.
+#[test]
+fn a_path_scoped_secret_attaches_on_a_repeated_slash_spelling_and_the_path_is_forwarded_as_sent() {
+    let host = "api.slash.test";
+    let upstream = TlsUpstream::start(host);
+    let port = upstream.port();
+    let pattern = DestinationPattern::parse(&format!("{host}:{port}/v1/chat")).unwrap();
+    let (store, phantom) = opaque_store_for(pattern.clone(), "sk_live_REALSECRET");
+    let controls = CapabilitySet::builder()
+        .add_credential(CredentialCapability::new(pattern, store))
+        .build();
+    let emitter = StubEmitter::new();
+    let config = MitmConfig {
+        upstream_ca_pems: vec![upstream.ca_pem()],
+        dns_overrides: vec![(host.to_string(), "127.0.0.1".parse().unwrap())],
+        ..MitmConfig::default()
+    };
+    let handle = MitmInterceptor::start_with_emitter(
+        config,
+        controls,
+        FixedPolicy::allowing(&[host]),
+        Box::new(emitter.clone()),
+    )
+    .unwrap();
+    let bearer = format!("Bearer {phantom}");
+
+    let mut client = WorkloadClient::connect(proxy_port(&handle), host, port);
+    client.send_request("GET", "/v1//chat", &[("Authorization", &bearer)], b"");
+    assert_eq!(client.read_status(), 200);
+    let seen = upstream.last_request();
+    assert_eq!(
+        seen.header("authorization").as_deref(),
+        Some("Bearer sk_live_REALSECRET")
+    );
+    assert!(
+        seen.raw.starts_with("GET /v1//chat HTTP/1.1\r\n"),
+        "{:?}",
+        seen.raw
+    );
+
+    let decision = emitter
+        .records()
+        .into_iter()
+        .find(|record| record.decision == AuditDecision::Allow && record.method == "GET")
+        .expect("the request allow is journalled");
+    assert_eq!(
+        decision.path, "/v1/chat",
+        "the record holds the judged path"
+    );
+    assert!(
+        decision.reason.contains("/v1//chat"),
+        "the record names the forwarded path: {decision:?}"
+    );
 }

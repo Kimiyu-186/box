@@ -5,6 +5,8 @@ mod request;
 mod response;
 mod verdict;
 
+#[cfg(test)]
+pub(crate) use request::merge_slashes;
 pub use request::{BodyRef, HeaderMap, InterceptedRequest, Target};
 pub use response::InterceptedResponse;
 pub use verdict::{DenyReason, Mutation, MutationTarget, Verdict};

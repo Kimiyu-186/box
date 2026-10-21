@@ -36,7 +36,9 @@ impl EgressCapability for CredentialCapability {
     ) -> CapabilityOutcome {
         // Not applicable to this request → no edits. A mutation capability simply does not act
         // off-route.
-        if !self.pattern.matches(&req.target.as_destination()) {
+        let judged = req.target.judged_path();
+        let destination = req.target.judged_destination(&judged);
+        if !self.pattern.matches(&destination) {
             return CapabilityOutcome::none();
         }
 
@@ -53,7 +55,7 @@ impl EgressCapability for CredentialCapability {
         headers.push(("accept-encoding".to_string(), IDENTITY_ENCODING.to_string()));
         let url = req.target.url();
         let outbound = Outbound {
-            destination: req.target.as_destination(),
+            destination,
             method: req.method.as_deref().unwrap_or("GET"),
             url: &url,
             query: &req.target.query,
@@ -139,8 +141,9 @@ impl EgressCapability for CredentialCapability {
                  which the leak-back scrub cannot read; it is refused rather than delivered unscanned"
             ));
         }
+        let judged = cx.target.judged_path();
         let inbound = Inbound {
-            destination: cx.target.as_destination(),
+            destination: cx.target.judged_destination(&judged),
             headers: &headers,
             body: &body,
         };

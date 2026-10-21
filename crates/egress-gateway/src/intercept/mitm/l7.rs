@@ -73,6 +73,7 @@ pub(super) fn intercept_tls<C: Read + Write>(
                 port: connect.port,
                 method: &parsed.method,
                 path: &parsed.target,
+                sent_path: &parsed.target,
             },
             AuditDecision::Deny,
             &reason,
@@ -150,13 +151,8 @@ where
     } else {
         correlation
     };
-    // Canonicalize the request path ONCE, before it is judged (`workload_path`), matched for
-    // credentials (`cx`), or forwarded (`reconstruct_target`) — so the box judges, matches, and
-    // forwards the SAME bytes the origin will resolve. Percent-decodes only unreserved octets (never
-    // `%2F`, which would change segment structure) and removes dot-segments, closing the "judge one
-    // spelling, forward another" gap where `/%61dmin` or `/x/../admin` dodges a path `forbid` yet the
-    // origin routes to `/admin`. The query is left untouched — a `UrlPath` credential can live there,
-    // and it is deliberately kept out of the judged path.
+    // The canonical path is what the gateway forwards. Policy and credential matching judge it with
+    // each run of `/` merged, and the decision record names the sent path when the two differ.
     req.target.path = match canonicalize_request_path(&req.target.path) {
         Ok(path) => path,
         Err(reason) => {
@@ -167,6 +163,7 @@ where
                 RefusedRequest {
                     method: req.method.as_deref(),
                     path: &req.target.path,
+                    sent_path: &req.target.path,
                     reason: &reason,
                     diagnostic: b"request path is not a valid address",
                 },
@@ -176,15 +173,28 @@ where
         }
     };
 
-    // A secret rides only TLS: refuse on the same canonical target the credential match below sees.
-    if !intercepted && state.controls.matches_any(&req.target.as_destination()) {
+    // The sent path and the judged path, captured BEFORE any credential mutation is applied.
+    //
+    // A `UrlPath` credential splices the secret into the path, so after `evaluate_and_apply`
+    // `req.target.path` *is* the secret. Every authorization and audit input below reads these values
+    // instead, so an attempt or a durable record never carries credential material.
+    let sent_path = req.target.path.clone();
+    let workload_path = req.target.judged_path().into_owned();
+
+    // A secret rides only TLS: refuse on the same judged target the credential match below sees.
+    if !intercepted
+        && state
+            .controls
+            .matches_any(&req.target.judged_destination(&workload_path))
+    {
         refuse_request(
             state,
             connect,
             client_writer,
             RefusedRequest {
                 method: req.method.as_deref(),
-                path: &req.target.path,
+                path: &workload_path,
+                sent_path: &sent_path,
                 reason: "credential would attach on a plaintext request; refused — a secret must ride TLS",
                 diagnostic: b"credential not permitted on a plaintext request",
             },
@@ -198,13 +208,6 @@ where
         state.now_unix_secs(),
         req.target.clone(),
     );
-
-    // The path as the workload sent it, captured BEFORE any credential mutation is applied.
-    //
-    // A `UrlPath` credential splices the secret into the path, so after `evaluate_and_apply`
-    // `req.target.path` *is* the secret. Every authorization and audit input below reads this value
-    // instead, so an attempt or a durable record never carries credential material.
-    let workload_path = req.target.path.clone();
 
     match request_leg::evaluate_and_apply(&state.controls, &mut req, &cx) {
         RequestDecision::Block(reason) => {
@@ -222,6 +225,7 @@ where
                     port: connect.port,
                     method: req.method.as_deref().unwrap_or_default(),
                     path: &workload_path,
+                    sent_path: &sent_path,
                 },
                 AuditDecision::Deny,
                 &reason,
@@ -261,6 +265,7 @@ where
                 port: connect.port,
                 method: req.method.as_deref().unwrap_or_default(),
                 path: &workload_path,
+                sent_path: &sent_path,
             },
             AuditDecision::Deny,
             &reason,
@@ -300,6 +305,7 @@ where
                         port: connect.port,
                         method: &request_method,
                         path: &workload_path,
+                        sent_path: &sent_path,
                     },
                     AuditDecision::Deny,
                     &reason,
@@ -382,6 +388,7 @@ where
                     port: connect.port,
                     method: req.method.as_deref().unwrap_or_default(),
                     path: &workload_path,
+                    sent_path: &sent_path,
                 },
                 AuditDecision::Deny,
                 &reason,
@@ -405,6 +412,7 @@ where
             port: connect.port,
             method: &request_method,
             path: &workload_path,
+            sent_path: &sent_path,
         },
         AuditDecision::Allow,
         &allow_reason,
@@ -813,6 +821,7 @@ struct DecisionSubject<'a> {
     port: u16,
     method: &'a str,
     path: &'a str,
+    sent_path: &'a str,
 }
 
 /// Emit one final egress decision.
@@ -829,9 +838,18 @@ fn emit_decision(
         method: subject.method.to_string(),
         path: subject.path.to_string(),
         decision,
-        reason: reason.to_string(),
+        reason: decision_reason(reason, &subject),
         correlation,
     });
+}
+
+/// `reason`, naming the sent path when it differs from the judged path.
+fn decision_reason(reason: &str, subject: &DecisionSubject<'_>) -> String {
+    match (subject.sent_path == subject.path, reason.is_empty()) {
+        (true, _) => reason.to_string(),
+        (false, true) => format!("path sent as {}", subject.sent_path),
+        (false, false) => format!("{reason}; path sent as {}", subject.sent_path),
+    }
 }
 
 /// The RFC 3986 normal form of an origin-form request path, `/` when it is empty, or why it is refused.
@@ -848,6 +866,7 @@ fn canonicalize_request_path(path: &str) -> std::result::Result<String, String> 
 struct RefusedRequest<'a> {
     method: Option<&'a str>,
     path: &'a str,
+    sent_path: &'a str,
     reason: &'a str,
     diagnostic: &'a [u8],
 }
@@ -873,6 +892,7 @@ fn refuse_request(
             port: connect.port,
             method: refused.method.unwrap_or_default(),
             path: refused.path,
+            sent_path: refused.sent_path,
         },
         AuditDecision::Deny,
         refused.reason,
@@ -962,6 +982,7 @@ fn validate_request_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boundary::merge_slashes;
     use crate::effect::EffectPermit;
 
     /// **A gateway-originated refusal carries the marker.** The client turns the marker into a
@@ -1064,6 +1085,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_judged_path_is_idempotent_and_already_canonical() {
+        for spelling in crate::mcp::generated_spellings() {
+            for path in [spelling.clone(), format!("/{spelling}")] {
+                if let Ok(canonical) = super::canonicalize_request_path(&path) {
+                    let judged = merge_slashes(&canonical).into_owned();
+                    assert_eq!(merge_slashes(&judged), judged, "{path:?}");
+                    assert_eq!(
+                        super::canonicalize_request_path(&judged),
+                        Ok(judged.clone()),
+                        "{path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_judged_path_merges_slash_runs_and_keeps_encoded_slashes() {
+        assert_eq!(merge_slashes("/v1//admin"), "/v1/admin");
+        assert_eq!(merge_slashes("///a///b///"), "/a/b/");
+        assert_eq!(merge_slashes("/a%2F%2Fb"), "/a%2F%2Fb");
+        assert_eq!(merge_slashes("/a/b"), "/a/b");
     }
 
     #[test]

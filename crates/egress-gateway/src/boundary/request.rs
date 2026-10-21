@@ -1,5 +1,7 @@
 //! The request-leg boundary types: [`InterceptedRequest`], [`Target`], [`HeaderMap`], [`BodyRef`].
 
+use std::borrow::Cow;
+
 use zeroize::Zeroizing;
 
 /// A case-insensitive, order-preserving multimap of HTTP headers.
@@ -150,6 +152,23 @@ impl Target {
         }
     }
 
+    /// The path that policy and credential matching judge: this path with each run of `/` merged.
+    pub(crate) fn judged_path(&self) -> Cow<'_, str> {
+        merge_slashes(&self.path)
+    }
+
+    /// This target's host and port at `judged_path`, for matching a [`credentials::DestinationPattern`].
+    pub(crate) fn judged_destination<'a>(
+        &'a self,
+        judged_path: &'a str,
+    ) -> credentials::Destination<'a> {
+        credentials::Destination {
+            host: &self.host,
+            port: self.port,
+            path: judged_path,
+        }
+    }
+
     /// Reconstruct the request URL (`https://host[:port]/path[?query]`) for signing / forwarding.
     pub fn url(&self) -> String {
         let (scheme, show_port) = match self.port {
@@ -203,6 +222,21 @@ impl std::fmt::Debug for InterceptedRequest {
             .field("body_bytes", &self.body.as_bytes().len())
             .finish()
     }
+}
+
+/// `path` with each run of `/` merged to one `/`.
+pub(crate) fn merge_slashes(path: &str) -> Cow<'_, str> {
+    if !path.contains("//") {
+        return Cow::Borrowed(path);
+    }
+    let mut merged = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c == '/' && merged.ends_with('/') {
+            continue;
+        }
+        merged.push(c);
+    }
+    Cow::Owned(merged)
 }
 
 #[cfg(test)]

@@ -62,7 +62,11 @@ impl CapabilitySet {
             // each `on_request`/`on_response` has to honor by hand. A skipped control contributes no
             // CapabilityOutcome — identical to an `Abstain`. This is what makes an out-of-pattern control unable
             // to spuriously deny/mutate by construction.
-            if !control.pattern().matches(&req.target.as_destination()) {
+            let judged = req.target.judged_path();
+            if !control
+                .pattern()
+                .matches(&req.target.judged_destination(&judged))
+            {
                 continue;
             }
             outcomes.push(control.on_request(req, cx));
@@ -86,7 +90,11 @@ impl CapabilitySet {
             // out-of-pattern control's `on_response` from running at all, so e.g. a `CredentialCapability`
             // for a different destination cannot emit a leak-back scrub `SetHeader` that collides with
             // the governing control's under the shared-store wiring.
-            if !control.pattern().matches(&cx.target.as_destination()) {
+            let judged = cx.target.judged_path();
+            if !control
+                .pattern()
+                .matches(&cx.target.judged_destination(&judged))
+            {
                 continue;
             }
             outcomes.push(control.on_response(res, cx));
