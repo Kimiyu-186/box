@@ -13,6 +13,116 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-combined-workspace:
+    name: Combined workspace (Linux ARM64)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record source and host identity
+        run: |
+          mkdir -p combined-results
+          git rev-parse HEAD > combined-results/source.txt
+          git show -s --format='%H %P' HEAD >> combined-results/source.txt
+          uname -a > combined-results/host.txt
+          cat /etc/os-release >> combined-results/host.txt
+          id >> combined-results/host.txt
+          df -h >> combined-results/host.txt
+          for revision in ab359ee05735bb306156575bcc0931dfe42c96f2 282d6cc9f5537dba72d6f9114514b1dece6c290c a889d71929da2a4f5f8765f1a92f06b5438ae5b3 1736e62aa25808942a847081043b1a775de3df48 6d5ab1700f0a4a747166d43bed0332e69ce935ce; do
+            git merge-base --is-ancestor "$revision" HEAD
+          done
+          test "$(uname -m)" = aarch64
+
+      - name: Enable and verify Linux namespaces
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --mount --pid --fork --mount-proc true
+
+      - name: Build all workspace test targets
+        run: |
+          set -o pipefail
+          cargo build --workspace --locked --all-targets --all-features 2>&1 | tee combined-results/build.log
+
+      - name: Record executable hashes
+        run: |
+          sha256sum target/debug/strands-box target/debug/strands-box-sock-alias target/debug/strands-box-contain-trampoline target/debug/box-exit-probe > combined-results/executables.sha256
+          rustc -vV > combined-results/toolchain.txt
+          cargo -V >> combined-results/toolchain.txt
+
+      - name: Run the workspace without platform filters
+        id: workspace
+        continue-on-error: true
+        run: |
+          set +e
+          set -o pipefail
+          timeout --kill-after=30s 20m cargo test --workspace --locked --all-features --no-fail-fast -- --test-threads=2 --nocapture 2>&1 | tee combined-results/workspace.log
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > combined-results/workspace.exit
+          exit "$result"
+
+      - name: Run the explicit alias-read diagnostic
+        if: always() && steps.workspace.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          set +e
+          set -o pipefail
+          timeout --kill-after=10s 2m cargo test --locked -p strands-box --all-features --test box_shell linux_alias_read_protection_requirement -- --exact --ignored --nocapture 2>&1 | tee combined-results/alias-read.log
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > combined-results/alias-read.exit
+          exit "$result"
+
+      - name: Classify the alias-read measurement
+        if: always() && steps.workspace.outcome != 'skipped'
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("combined-results")
+          text = (root / "alias-read.log").read_text()
+          code = int((root / "alias-read.exit").read_text())
+          if code == 0 and "1 passed; 0 failed;" in text:
+              state = "read-refusal requirement passed"
+          elif (code == 101 and "0 passed; 1 failed;" in text
+                and "the alias contents must not be readable:" in text
+                and all(marker in text for marker in ["control=C", "LEAKED=", "READ_CHECK_COMPLETE"])):
+              state = "known read-protection gap reproduced"
+          else:
+              state = "invalid measurement: inspect setup, timeout, and selected-test count"
+          (root / "alias-read-result.json").write_text(json.dumps({"exit_code": code, "state": state}, indent=2) + "\n")
+          print(state)
+          if state.startswith("invalid"):
+              raise SystemExit(1)
+          PY
+
+      - name: Enforce the workspace result
+        if: always()
+        run: test "$(cat combined-results/workspace.exit)" = 0
+
+      - name: Upload source identity and raw results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: combined-workspace-linux-arm64
+          path: combined-results/
+          if-no-files-found: error
+          retention-days: 14
+
   detect-changes:
     name: Detect Changes
     runs-on: ubuntu-latest
@@ -86,8 +196,6 @@ jobs:
     uses: ./.github/workflows/containment-deterministic.yml
     permissions:
       contents: read
-    with:
-      ref: ${{ github.sha }}
 
   verdict:
     name: Verdict
@@ -111,11 +219,11 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [detect-changes, rust, containment, verdict, native]
+    needs: [detect-changes, rust, containment, verdict, native, linux-combined-workspace]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
         with:
-          allowed-skips: rust, containment, verdict, native
+          allowed-skips: rust, containment, verdict, native, linux-combined-workspace
           jobs: ${{ toJSON(needs) }}

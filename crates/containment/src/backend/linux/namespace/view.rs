@@ -1082,8 +1082,14 @@ struct Dependency {
 struct ImageNeeds {
     interpreter: Option<PathBuf>,
     needed: Vec<String>,
-    /// `DT_RUNPATH`, or `DT_RPATH` when the image carries no `DT_RUNPATH`.
-    search: Vec<String>,
+    runpath: Option<Vec<String>>,
+    rpath: Vec<String>,
+}
+
+/// An image's search directories and its shared RPATH ancestry.
+struct LibrarySearch {
+    directories: Vec<PathBuf>,
+    parent: Option<std::rc::Rc<LibrarySearch>>,
 }
 
 /// A ceiling on the images one closure walks.
@@ -1097,9 +1103,8 @@ fn elf_dependencies(
 ) -> Result<Vec<Dependency>, ContainmentError> {
     let mut dependencies: Vec<Dependency> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    let executable_search = image_needs(executable)?.search;
-    let mut pending: Vec<PathBuf> = vec![executable.to_path_buf()];
-    while let Some(image) = pending.pop() {
+    let mut pending = std::collections::VecDeque::from([(executable.to_path_buf(), None)]);
+    while let Some((image, inherited_rpath)) = pending.pop_front() {
         if dependencies.len() > MAXIMUM_IMAGES {
             return Err(refusal(format!(
                 "'{}' loads more than {MAXIMUM_IMAGES} images; refusing rather than walking on",
@@ -1107,6 +1112,22 @@ fn elf_dependencies(
             )));
         }
         let needs = image_needs(&image)?;
+        let rpath = if needs.runpath.is_none() && !needs.rpath.is_empty() {
+            Some(std::rc::Rc::new(LibrarySearch {
+                directories: search_directories(&image, &needs.rpath),
+                parent: inherited_rpath,
+            }))
+        } else {
+            inherited_rpath
+        };
+        let search = if let Some(paths) = &needs.runpath {
+            Some(std::rc::Rc::new(LibrarySearch {
+                directories: search_directories(&image, paths),
+                parent: None,
+            }))
+        } else {
+            rpath.clone()
+        };
         if let Some(interpreter) = needs.interpreter
             && seen.insert(interpreter.clone())
         {
@@ -1119,9 +1140,7 @@ fn elf_dependencies(
             });
         }
         for name in &needs.needed {
-            let Some(found) =
-                resolve_needed(&image, executable, name, &needs.search, &executable_search)
-            else {
+            let Some(found) = resolve_needed(name, search.as_deref()) else {
                 return Err(refusal(format!(
                     "'{}' needs the shared library '{}', which is not in its DT_RUNPATH, its \
                      DT_RPATH, or any standard system library directory; the view would be \
@@ -1135,15 +1154,14 @@ fn elf_dependencies(
             if !seen.insert(identity.clone()) {
                 continue;
             }
-            // A system library needs only system libraries. Anything else is judged like a grant
-            // and walked for its own needs, under its identity so `$ORIGIN` is a real directory.
+            // A non-system library must pass the same floor as a read grant.
             if !LIBRARY_DIRECTORIES
                 .iter()
                 .any(|directory| found.starts_with(directory))
             {
                 require_loadable(&image, &found, declared_home)?;
-                pending.push(identity);
             }
+            pending.push_back((identity, rpath.clone()));
             dependencies.push(Dependency {
                 path: found,
                 origin: MountOrigin::Library,
@@ -1176,41 +1194,30 @@ fn require_loadable(
     })
 }
 
-/// Where the loader finds `name` for `image`: a path as spelled, then the image's own search list,
-/// then the executable's, then the standard directories. `$ORIGIN` is the image's directory.
-fn resolve_needed(
-    image: &Path,
-    executable: &Path,
-    name: &str,
-    image_search: &[String],
-    executable_search: &[String],
-) -> Option<PathBuf> {
+/// Search directories with `$ORIGIN` expanded against the image that owns the entry.
+fn search_directories(image: &Path, paths: &[String]) -> Vec<PathBuf> {
+    let origin = image.parent().unwrap_or(Path::new("/"));
+    paths
+        .iter()
+        .filter_map(|entry| {
+            let directory = entry
+                .replace("${ORIGIN}", &origin.to_string_lossy())
+                .replace("$ORIGIN", &origin.to_string_lossy());
+            // `$LIB` and `$PLATFORM` depend on the host's ABI spelling, which this walk does not model.
+            (!directory.contains('$') && !directory.is_empty()).then(|| PathBuf::from(directory))
+        })
+        .collect()
+}
+
+/// Resolve a dependency through its applicable search directories, then the system directories.
+fn resolve_needed(name: &str, search: Option<&LibrarySearch>) -> Option<PathBuf> {
     if name.contains('/') {
         let spelled = PathBuf::from(name);
         return spelled.is_file().then_some(spelled);
     }
-    let directory_of = |path: &Path| path.parent().unwrap_or(Path::new("/")).to_path_buf();
-    // `$ORIGIN` names the directory of the image that carries the entry, so an executable's own
-    // entry expands against the executable however deep the walk is.
-    let expanded = |(entry, origin): (&String, &Path)| -> Option<PathBuf> {
-        let directory = entry
-            .replace("${ORIGIN}", &origin.to_string_lossy())
-            .replace("$ORIGIN", &origin.to_string_lossy());
-        // `$LIB` and `$PLATFORM` depend on the host's ABI spelling, which this walk does not model.
-        (!directory.contains('$') && !directory.is_empty()).then(|| PathBuf::from(directory))
-    };
-    let image_origin = directory_of(image);
-    let executable_origin = directory_of(executable);
-    image_search
-        .iter()
-        .map(|entry| (entry, image_origin.as_path()))
-        .chain(
-            executable_search
-                .iter()
-                .map(|entry| (entry, executable_origin.as_path())),
-        )
-        .filter_map(expanded)
-        .chain(LIBRARY_DIRECTORIES.iter().map(PathBuf::from))
+    std::iter::successors(search, |entry| entry.parent.as_deref())
+        .flat_map(|entry| entry.directories.iter().map(PathBuf::as_path))
+        .chain(LIBRARY_DIRECTORIES.iter().map(Path::new))
         .map(|directory| folded(&directory.join(name)))
         .find(|candidate| candidate.is_file())
 }
@@ -1448,17 +1455,17 @@ fn image_needs(executable: &Path) -> Result<ImageNeeds, ContainmentError> {
     };
 
     needs.needed = needed_offsets.into_iter().filter_map(string_at).collect();
-    // `DT_RUNPATH` replaces `DT_RPATH`, as it does for the loader.
-    let search = if runpath_offsets.is_empty() {
-        rpath_offsets
-    } else {
-        runpath_offsets
+    let paths_at = |offsets: Vec<u64>| -> Vec<String> {
+        offsets
+            .into_iter()
+            .filter_map(string_at)
+            .flat_map(|list| list.split(':').map(str::to_owned).collect::<Vec<String>>())
+            .collect()
     };
-    needs.search = search
-        .into_iter()
-        .filter_map(string_at)
-        .flat_map(|list| list.split(':').map(str::to_owned).collect::<Vec<String>>())
-        .collect();
+    if !runpath_offsets.is_empty() {
+        needs.runpath = Some(paths_at(runpath_offsets));
+    }
+    needs.rpath = paths_at(rpath_offsets);
 
     Ok(needs)
 }
@@ -2902,6 +2909,15 @@ mod tests {
     /// A minimal 64-bit little-endian ELF image carrying the entries the planner reads. It is not
     /// runnable; the parser reads the headers and two segments.
     fn synthetic_elf(interpreter: Option<&str>, needed: &[&str], runpath: Option<&str>) -> Vec<u8> {
+        synthetic_elf_paths(interpreter, needed, runpath, None)
+    }
+
+    fn synthetic_elf_paths(
+        interpreter: Option<&str>,
+        needed: &[&str],
+        runpath: Option<&str>,
+        rpath: Option<&str>,
+    ) -> Vec<u8> {
         let mut strtab: Vec<u8> = vec![0];
         let mut needed_offsets = Vec::new();
         for name in needed {
@@ -2910,6 +2926,12 @@ mod tests {
             strtab.push(0);
         }
         let runpath_offset = runpath.map(|list| {
+            let offset = strtab.len() as u64;
+            strtab.extend_from_slice(list.as_bytes());
+            strtab.push(0);
+            offset
+        });
+        let rpath_offset = rpath.map(|list| {
             let offset = strtab.len() as u64;
             strtab.extend_from_slice(list.as_bytes());
             strtab.push(0);
@@ -2936,6 +2958,9 @@ mod tests {
         }
         if let Some(offset) = runpath_offset {
             entry(29, offset);
+        }
+        if let Some(offset) = rpath_offset {
+            entry(15, offset);
         }
         entry(5, strtab_offset as u64);
         entry(0, 0);
@@ -3023,6 +3048,171 @@ mod tests {
         );
     }
 
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn an_executable_runpath_does_not_shadow_a_system_librarys_child() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let app = planted_image(
+            &root,
+            "app",
+            &synthetic_elf(None, &["libm.so.6"], Some("$ORIGIN/private")),
+        );
+        let shadow = planted_image(&root, "private/libc.so.6", &synthetic_elf(None, &[], None));
+        let system_libc = resolve_needed("libc.so.6", None).expect("the GNU runtime supplies libc");
+        let entries = planned(
+            &ContainmentConfig::new()
+                .allow(&app, Operation::Exec, Scope::File)
+                .expect("execute grant"),
+        );
+
+        assert!(
+            entries.iter().any(|entry| entry.target == system_libc),
+            "libm must use the system libc"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.target == shadow),
+            "the executable's RUNPATH must not expose an indirect dependency"
+        );
+    }
+
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn library_search_inheritance_matches_the_native_loader() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        std::fs::create_dir(root.join("deps")).expect("library directory");
+        for (name, source) in [
+            ("leaf.c", "int box_leaf(void) { return 42; }\n"),
+            (
+                "mid.c",
+                "extern int box_leaf(void); int box_mid(void) { return box_leaf(); }\n",
+            ),
+            (
+                "app.c",
+                "extern int box_mid(void); int main(void) { return box_mid() == 42 ? 0 : 1; }\n",
+            ),
+        ] {
+            std::fs::write(root.join(name), source).expect("fixture source");
+        }
+        let compile = |arguments: &[&str]| {
+            let output = std::process::Command::new("cc")
+                .current_dir(&root)
+                .args(arguments)
+                .output()
+                .expect("the C compiler used to build Box");
+            assert!(
+                output.status.success(),
+                "fixture compilation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        compile(&[
+            "-shared",
+            "-fPIC",
+            "leaf.c",
+            "-o",
+            "deps/libbox_search_leaf.so",
+        ]);
+        compile(&[
+            "-shared",
+            "-fPIC",
+            "mid.c",
+            "-Ldeps",
+            "-lbox_search_leaf",
+            "-o",
+            "deps/libbox_search_mid.so",
+        ]);
+        for (name, tag, should_start) in [
+            ("app-rpath", "--disable-new-dtags", true),
+            ("app-runpath", "--enable-new-dtags", false),
+        ] {
+            compile(&[
+                "app.c",
+                "-Ldeps",
+                "-lbox_search_mid",
+                "-Wl,-rpath-link,deps",
+                &format!("-Wl,{tag}"),
+                "-Wl,-rpath,$ORIGIN/deps",
+                "-o",
+                name,
+            ]);
+            let app = root.join(name);
+            let native = std::process::Command::new(&app)
+                .env_remove("LD_LIBRARY_PATH")
+                .env_remove("LD_PRELOAD")
+                .env_remove("LD_AUDIT")
+                .output()
+                .expect("run the trusted fixture");
+            assert_eq!(
+                native.status.success(),
+                should_start,
+                "{name}: {}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let config = ContainmentConfig::new()
+                .allow(&app, Operation::Exec, Scope::File)
+                .expect("execute grant");
+            let plan = MountView::plan(&config);
+            assert_eq!(
+                plan.is_ok(),
+                should_start,
+                "the mount plan must agree with the native loader for {name}: {plan:?}"
+            );
+            if !should_start {
+                assert!(
+                    String::from_utf8_lossy(&native.stderr).contains("libbox_search_leaf.so"),
+                    "the native failure must name the indirect dependency"
+                );
+                assert!(
+                    plan.unwrap_err()
+                        .to_string()
+                        .contains("libbox_search_leaf.so"),
+                    "the planner must refuse the same missing dependency"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn an_exec_file_pulls_system_libraries_transitively() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let app = planted_image(&root, "app", &synthetic_elf(None, &["libm.so.6"], None));
+        let libm = resolve_needed("libm.so.6", None).expect("the GNU runtime supplies libm");
+        let needs = image_needs(&libm).expect("read libm's dependencies");
+        assert!(
+            needs.needed.iter().any(|name| name == "libc.so.6"),
+            "the system library must require libc for this regression"
+        );
+        let libc = resolve_needed("libc.so.6", None).expect("libm's libc dependency exists");
+        let config = ContainmentConfig::new()
+            .allow(&app, Operation::Exec, Scope::File)
+            .expect("execute grant");
+
+        let entries = planned(&config);
+
+        for library in [&libm, &libc] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.target == *library)
+                .unwrap_or_else(|| panic!("{} must be planned", library.display()));
+            assert_eq!(entry.origin, MountOrigin::Library);
+            assert!(entry.executable && !entry.writable, "{entry:?}");
+        }
+        assert!(
+            !entries.iter().any(|entry| {
+                entry.kind == MountKind::Bind
+                    && entry.source.as_deref().is_some_and(Path::is_dir)
+                    && LIBRARY_DIRECTORIES
+                        .iter()
+                        .any(|directory| entry.target == Path::new(directory))
+            }),
+            "dependency discovery must not grant whole library directories"
+        );
+    }
+
     /// **A read root on a loader directory is bound executable and read-only**, and a read root
     /// anywhere else stays no-exec.
     #[test]
@@ -3090,23 +3280,21 @@ mod tests {
         );
     }
 
-    /// **An executable run-path entry expands `$ORIGIN` against the executable**, not against the
-    /// transitive image whose need is being resolved.
     #[test]
-    fn an_executable_run_path_expands_against_the_executable() {
+    fn an_executable_rpath_keeps_its_origin_in_indirect_dependencies() {
         let directory = tempfile::tempdir().expect("tempdir");
         let home = directory.path().canonicalize().expect("canonical");
         let app = planted_image(
             &home,
             "bin/app",
-            &synthetic_elf(None, &["libmid.so"], Some("$ORIGIN/../lib/nested")),
+            &synthetic_elf_paths(None, &["libmid.so"], None, Some("$ORIGIN/../lib/nested")),
         );
         planted_image(
             &home,
             "lib/nested/libmid.so",
             &synthetic_elf(None, &["libleaf.so"], None),
         );
-        planted_image(
+        let leaf = planted_image(
             &home,
             "lib/nested/libleaf.so",
             &synthetic_elf(None, &[], None),
@@ -3116,7 +3304,112 @@ mod tests {
             .expect("execute grant")
             .anchored_at(&home);
 
-        MountView::plan(&config).expect("the executable's own run path resolves the leaf");
+        let entries = planned(&config);
+        assert!(entries.iter().any(|entry| entry.target == leaf));
+    }
+
+    #[test]
+    fn an_empty_runpath_suppresses_local_and_inherited_rpath() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let app = planted_image(
+            &root,
+            "app",
+            &synthetic_elf_paths(None, &["libmid.so"], None, Some("$ORIGIN/lib")),
+        );
+        planted_image(
+            &root,
+            "lib/libmid.so",
+            &synthetic_elf_paths(None, &["libbox_leaf.so"], Some(""), Some("$ORIGIN")),
+        );
+        planted_image(&root, "lib/libbox_leaf.so", &synthetic_elf(None, &[], None));
+        let config = ContainmentConfig::new()
+            .allow(&app, Operation::Exec, Scope::File)
+            .expect("execute grant");
+
+        let error = MountView::plan(&config).expect_err("RUNPATH suppresses every RPATH here");
+        assert!(error.to_string().contains("libbox_leaf.so"), "{error}");
+    }
+
+    #[test]
+    fn an_ancestor_rpath_survives_a_descendants_runpath() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let app = planted_image(
+            &root,
+            "app",
+            &synthetic_elf_paths(None, &["libmid.so"], None, Some("$ORIGIN/parent")),
+        );
+        planted_image(
+            &root,
+            "parent/libmid.so",
+            &synthetic_elf(None, &["libleaf.so"], Some("$ORIGIN/../child")),
+        );
+        planted_image(
+            &root,
+            "child/libleaf.so",
+            &synthetic_elf(None, &["libdeep.so"], None),
+        );
+        let deep = planted_image(&root, "parent/libdeep.so", &synthetic_elf(None, &[], None));
+        let config = ContainmentConfig::new()
+            .allow(&app, Operation::Exec, Scope::File)
+            .expect("execute grant");
+
+        let entries = planned(&config);
+        assert!(entries.iter().any(|entry| entry.target == deep));
+    }
+
+    #[test]
+    fn the_first_loader_supplies_a_shared_librarys_inherited_rpath() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonical");
+        let shared = planted_image(
+            &root,
+            "shared.so",
+            &synthetic_elf(None, &["libchoice.so"], None),
+        );
+        let first = planted_image(
+            &root,
+            "first.so",
+            &synthetic_elf_paths(
+                None,
+                &[shared.to_str().unwrap()],
+                None,
+                Some("$ORIGIN/first"),
+            ),
+        );
+        let second = planted_image(
+            &root,
+            "second.so",
+            &synthetic_elf_paths(
+                None,
+                &[shared.to_str().unwrap()],
+                None,
+                Some("$ORIGIN/second"),
+            ),
+        );
+        let expected = planted_image(&root, "first/libchoice.so", &synthetic_elf(None, &[], None));
+        let unused = planted_image(
+            &root,
+            "second/libchoice.so",
+            &synthetic_elf(None, &[], None),
+        );
+        let app = planted_image(
+            &root,
+            "app",
+            &synthetic_elf(
+                None,
+                &[first.to_str().unwrap(), second.to_str().unwrap()],
+                None,
+            ),
+        );
+        let config = ContainmentConfig::new()
+            .allow(&app, Operation::Exec, Scope::File)
+            .expect("execute grant");
+
+        let entries = planned(&config);
+        assert!(entries.iter().any(|entry| entry.target == expected));
+        assert!(!entries.iter().any(|entry| entry.target == unused));
     }
 
     /// **An interpreter the floor refuses is refused by name**, because the workload authors the

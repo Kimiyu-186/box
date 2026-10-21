@@ -124,6 +124,14 @@ impl ContainmentBackend for NamespaceBackend {
 
         require_no_configured_devices(config)?;
 
+        crate::grants::require_read_for_writes(
+            &config
+                .authorizations()
+                .iter()
+                .map(|grant| (grant.resolved.as_path(), grant.operation, grant.scope))
+                .collect::<Vec<_>>(),
+        )?;
+
         // Refuse a plan that cannot be built before any irreversible step runs.
         view::MountView::plan(config)?;
 
@@ -537,6 +545,49 @@ mod tests {
         backend
             .validate_config(&acceptable())
             .expect("the default all-isolated request must validate");
+    }
+
+    #[test]
+    fn direct_and_decoded_writes_require_full_read_coverage() {
+        let backend = NamespaceBackend::with_probe_result(true);
+        let directory = tempfile::tempdir().expect("a project");
+        let project = directory
+            .path()
+            .canonicalize()
+            .expect("the project resolves");
+        let file = project.join("output");
+        std::fs::write(&file, "contents").expect("an output file");
+        for (write, scope) in [(&project, Scope::Root), (&file, Scope::File)] {
+            let config = acceptable()
+                .allow_prepared(
+                    ContainmentConfig::prepare_filesystem_path(write).expect("a prepared path"),
+                    Operation::Write,
+                    scope,
+                )
+                .expect("a write grant can precede a read grant");
+            let decoded = ContainmentConfig::from_json(&config.to_json().expect("serialize"))
+                .expect("a structurally valid configuration");
+            for candidate in [config, decoded] {
+                assert!(matches!(
+                    backend.validate_config(&candidate),
+                    Err(ContainmentError::WriteOnlyUnsupported { path, .. }) if path == *write
+                ));
+                let listed = candidate
+                    .clone()
+                    .allow(&project, Operation::Read, Scope::Dir)
+                    .expect("directory entries");
+                assert!(matches!(
+                    backend.validate_config(&listed),
+                    Err(ContainmentError::WriteOnlyUnsupported { .. })
+                ));
+                let readable = candidate
+                    .allow(&project, Operation::Read, Scope::Root)
+                    .expect("explicit content reads");
+                backend
+                    .validate_config(&readable)
+                    .expect("read-write access");
+            }
+        }
     }
 
     /// Each unrestricted reach mode is refused rather than over-enforced.
@@ -2189,6 +2240,8 @@ mod tests {
         std::fs::create_dir_all(&state).expect("box state");
         let agent_shaped = ContainmentConfig::new()
             .anchored_at(home.path())
+            .allow(&workspace, Operation::Read, Scope::Root)
+            .expect("read grant")
             .allow(&workspace, Operation::Write, Scope::Root)
             .expect("write grant");
         let leaf = agent_shaped

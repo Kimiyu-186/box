@@ -2141,6 +2141,16 @@ pub fn run_case<F: FnOnce(&BoxFixture)>(id: &str, desc: &str, body: F) {
 /// note and runs nothing; the reducer accepts that SKIP only because the compiled
 /// manifest carries the same declaration.
 pub fn run_case_on<F: FnOnce(&BoxFixture)>(id: &str, platforms: &[Platform], desc: &str, body: F) {
+    run_case_on_with_quarantine(id, platforms, desc, body, quarantine::TEMPORARY_QUARANTINE);
+}
+
+fn run_case_on_with_quarantine<F: FnOnce(&BoxFixture)>(
+    id: &str,
+    platforms: &[Platform],
+    desc: &str,
+    body: F,
+    quarantines: &[quarantine::Quarantine],
+) {
     let current = Platform::current();
     if !platforms.is_empty() && !platforms.contains(&current) {
         let dir = verdict::results_dir();
@@ -2159,7 +2169,10 @@ pub fn run_case_on<F: FnOnce(&BoxFixture)>(id: &str, platforms: &[Platform], des
     // TEMPORARY QUARANTINE (test-integ/QUARANTINE.md): an authorized (case, platform) cell records
     // an explicit SKIP with the one authorized note and runs nothing. The platform still applies to
     // the case; the reducer accepts this SKIP only because it reads the same compiled list.
-    if let Some(q) = quarantine::lookup(id, current.as_str()) {
+    if let Some(q) = quarantines
+        .iter()
+        .find(|q| q.id == id && q.platform == current.as_str())
+    {
         let dir = verdict::results_dir();
         let _ = std::fs::create_dir_all(&dir);
         let note = quarantine::note(q);
@@ -2781,6 +2794,14 @@ mod tests {
     /// Run `run_case_on` for `id` as if on `platform`, capturing the row it writes. The body panics
     /// with a DET_ERROR sentinel so a body that RAN is visible as an ERROR row carrying the sentinel.
     fn quarantine_probe(id: &str, platform: &str) -> verdict::Row {
+        quarantine_probe_with(id, platform, quarantine::TEMPORARY_QUARANTINE)
+    }
+
+    fn quarantine_probe_with(
+        id: &str,
+        platform: &str,
+        quarantines: &[quarantine::Quarantine],
+    ) -> verdict::Row {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = user_home().join(".det-harness-boxes");
         std::fs::create_dir_all(&base).expect("create the box base");
@@ -2796,9 +2817,13 @@ mod tests {
             std::env::set_var("PLATFORM", platform);
         }
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            run_case_on(id, &[], "probe", |_fixture| {
-                panic!("DET_ERROR: BODY_RAN {id}")
-            });
+            run_case_on_with_quarantine(
+                id,
+                &[],
+                "probe",
+                |_fixture| panic!("DET_ERROR: BODY_RAN {id}"),
+                quarantines,
+            );
         }));
         unsafe {
             std::env::remove_var("PLATFORM");
@@ -2818,13 +2843,11 @@ mod tests {
 
     #[test]
     fn a_quarantined_cell_records_the_authorized_skip_and_never_runs_its_body() {
-        for id in ["CN-W-05", "CN-W-06"] {
-            let row = quarantine_probe(id, "linux");
+        for entry in quarantine::TEST_QUARANTINE {
+            let id = entry.id;
+            let row = quarantine_probe_with(id, "linux", quarantine::TEST_QUARANTINE);
             assert_eq!(row.result, "SKIP", "{id}: {}", row.note);
-            assert_eq!(
-                row.note,
-                quarantine::note(quarantine::lookup(id, "linux").unwrap())
-            );
+            assert_eq!(row.note, quarantine::note(entry));
             assert!(
                 !row.note.contains("BODY_RAN"),
                 "the body must not run: {}",
@@ -2848,6 +2871,14 @@ mod tests {
             "{id}: neither the body's sentinel nor the fixture's launch attempt: {}",
             row.note
         );
+    }
+
+    #[test]
+    fn the_restored_workloads_run_on_linux() {
+        for id in ["CN-W-05", "CN-W-06"] {
+            let row = quarantine_probe(id, "linux");
+            assert_run_was_attempted(id, &row);
+        }
     }
 
     #[test]
@@ -2876,9 +2907,13 @@ mod tests {
             std::env::set_var("DET_RESULTS_DIR", dir.path());
             std::env::set_var("PLATFORM", "linux");
         }
-        run_case_on("CN-W-05", &[Platform::Macos], "probe", |_fixture| {
-            panic!("DET_ERROR: BODY_RAN")
-        });
+        run_case_on_with_quarantine(
+            "CN-Q-01",
+            &[Platform::Macos],
+            "probe",
+            |_fixture| panic!("DET_ERROR: BODY_RAN"),
+            quarantine::TEST_QUARANTINE,
+        );
         unsafe {
             std::env::remove_var("PLATFORM");
             std::env::remove_var("DET_RESULTS_DIR");
