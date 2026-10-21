@@ -30,6 +30,29 @@ fn roots(paths: impl IntoIterator<Item = PathBuf>) -> String {
         .map(|path| quoted(path)).collect::<Vec<_>>().join(", ")
 }
 
+fn stage_linker_library(gcc: &Path, name: &str, directory: &Path) {
+    let path = reported_path(gcc.to_str().unwrap(), &[&format!("-print-file-name={name}")]);
+    let bytes = std::fs::read(&path).expect("DET_ERROR: read the installed linker input");
+    let target = directory.join(name);
+    if bytes.starts_with(b"\x7fELF") {
+        std::os::unix::fs::symlink(path, target)
+            .expect("DET_ERROR: link the installed shared library");
+        return;
+    }
+    let script = String::from_utf8(bytes).expect("DET_ERROR: the linker script must be text");
+    assert!(script.starts_with("/* GNU ld script"), "DET_ERROR: unsupported linker input: {}", path.display());
+    let script = script.split_whitespace().map(|word| {
+        let path = Path::new(word);
+        if path.is_absolute() && path.is_file() {
+            std::fs::canonicalize(path).expect("DET_ERROR: resolve a linker script input")
+                .to_string_lossy().into_owned()
+        } else {
+            word.to_string()
+        }
+    }).collect::<Vec<_>>().join(" ");
+    std::fs::write(target, script).expect("DET_ERROR: write the resolved linker script");
+}
+
 det_case! {
     name: cn_w_06,
     id: "CN-W-06",
@@ -58,6 +81,9 @@ det_case! {
             std::os::unix::fs::symlink(target, helpers.join(name))
                 .expect("DET_ERROR: create the selected compiler helper alias");
         }
+        for name in ["libc.so", "libm.so"] {
+            stage_linker_library(&gcc, name, &helpers);
+        }
         let witness = read_only.join("unchanged");
         std::fs::write(&witness, "HOST_CONTENT").expect("DET_ERROR: the host can write the witness");
         let ungranted = outside.join("program");
@@ -68,8 +94,8 @@ det_case! {
         let config_bytes = std::fs::read(&protected)
             .expect("DET_ERROR: read the protected configuration on the host");
         assert!(!config_bytes.is_empty(), "DET_ERROR: the protected configuration must not be empty");
-        let flags = format!("-C linker={} -C link-arg=-B{}/ -C link-arg=-fuse-ld=bfd",
-            gcc.display(), helpers.display());
+        let flags = format!("-C linker={} -C link-arg=-B{}/ -C link-arg=-fuse-ld=bfd -C link-arg=-L{}",
+            gcc.display(), helpers.display(), helpers.display());
         let source = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\
                       fn main() { generated(); println!(\"CARGO_OUTPUT_RAN\"); }\n";
         std::fs::write(crate_root.join("src/main.rs"), source).expect("DET_ERROR: write the crate");
