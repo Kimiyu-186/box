@@ -102,8 +102,9 @@ impl BoxHandle {
     /// Canonical text is literal: a reformatted rule counts as a changed rule and starts a new
     /// budget (`Dogwood` issue 59).
     ///
-    /// Nothing here asks who is calling. The caller owns that question, which is the reason the
-    /// trigger for a reload lives outside this crate.
+    /// Nothing here asks who is calling, so whatever drives a reload owns that question. Which
+    /// component owns an authored policy source, and where a reload trigger belongs, are open
+    /// questions this type does not settle.
     pub fn reload(&self, sources: &[Policy]) -> Result<(), ReloadRefused> {
         self.policy.reload(sources).map_err(ReloadRefused)
     }
