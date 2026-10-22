@@ -90,6 +90,12 @@ Box doesn't provide seven protections:
 
 ## Programs can need access a box refuses
 
+The [platform comparison](platform-differences.md) consolidates Linux configuration differences and their consequences.
+Linux accepts write-only requests but exposes readable mounts.
+It refuses directory-list grants and absent deny paths, and silently omits metadata-only tree grants.
+Tools have broader execution access than agents.
+The [Linux enforcement explanation](linux-enforcement.md) explains these mechanisms and separates them from release qualification.
+
 A legitimate program can fail because its box refuses a file or a system service it needs, and the
 failure alone doesn't tell you which rule refused it. Some operations also succeed with wrong
 results. [macOS enforcement](macos-enforcement.md#file-timestamps-may-not-be-preserved) covers a
