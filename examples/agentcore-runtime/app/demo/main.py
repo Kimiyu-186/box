@@ -272,5 +272,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     BOX = install()
+    from manual_setup import prepare as prepare_manual
+    prepare_manual(BOX)
     CLAUDE = ClaudeRuntime(BOX)
     ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

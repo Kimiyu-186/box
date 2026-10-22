@@ -50,6 +50,27 @@ The example uses Claude Code `2.1.305` and Claude Sonnet 4.6 through Amazon Bedr
 Its execution role permits model invocation and short-term Bedrock bearer authentication.
 The box's trusted process supplies model authentication through its egress gateway.
 
+## Run both examples with one command
+
+Use the [demo runner](../../../examples/agentcore-runtime/demo.py) from `examples/agentcore-runtime/`.
+It checks your AWS account, prepares both packages, prints each command, deploys both runtimes, and runs their verification workloads.
+Docker must support Linux ARM64 images. The runner works without iTerm or a macOS terminal client.
+
+```sh
+uv run --with boto3==1.42.61 python demo.py \
+  --account 123456789012 \
+  --profile your-development-profile \
+  --box-package /absolute/path/to/box.tar.gz \
+  --box-sha256 YOUR_ARCHIVE_SHA256 \
+  --box-revision YOUR_FULL_SOURCE_REVISION \
+  --exercise
+```
+
+With `--exercise`, Claude tests shell and native file access, network refusals, and a local Model Context Protocol (MCP) server.
+Both deployment types must pass. Results are saved under `results/`, and cloud resources remain deployed.
+For an existing example stack, replace the package arguments with `--skip-deploy`.
+The following sections show the individual packaging, deployment, and verification commands.
+
 ## Package both deployment types
 
 Select your AWS profile and region:
@@ -106,7 +127,7 @@ RUN dnf install -y python3.12 python3.12-pip shadow-utils && dnf clean all \
     && useradd --uid 991 --gid 991 --create-home boxoperator
 WORKDIR /app
 RUN python3.12 -m pip install --no-cache-dir boto3==1.42.61 aws-bedrock-token-generator==1.1.0
-COPY main.py claude_runtime.py box.tar.gz box-package.json claude.tar.gz claude-package.json /app/
+COPY main.py claude_runtime.py manual_setup.py mcp_fixture.py box.toml policy.dw exercise.txt box.tar.gz box-package.json claude.tar.gz claude-package.json /app/
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 USER 991:991
 EXPOSE 8080
@@ -214,6 +235,11 @@ Repeat the command with the container runtime ARN.
 A successful run passes ten checks and records Claude's terminal output.
 Claude repairs the function and attempts all three policy-refusal commands through its Bash tool.
 
+Add `--exercise` to enable the native file tools and local MCP server.
+That run adds eight checks for native file effects and permitted and refused MCP operations.
+The verifier also checks five native-tool attempts and results in Claude's transcript, for 23 checks in total.
+The exercise prompt is included in the package.
+
 The example disables Claude's own permission prompts for its generated demonstration project.
 Box applies the configured policy to Bash operations.
 Claude has direct read access to the project and writable access to its own state and temporary files.
@@ -223,6 +249,25 @@ Read the startup disclosure when you change a grant.
 The model destination is `bedrock-runtime.us-west-2.amazonaws.com`.
 The policy permits model requests and refuses the separate `example.com` probe.
 Use the audit record to distinguish a policy refusal from an unrelated network error.
+
+## Run from a terminal inside the Runtime
+
+Both packages include a complete `box.toml` and policy.
+Application startup installs the manual workload before it accepts the first demo request.
+From an interactive terminal inside a new Runtime session, run:
+
+```sh
+cd /var/tmp/box-manual
+./box run --config box.toml
+```
+
+The local launcher supplies model authentication in memory and starts the packaged Box binary.
+Claude opens with native file tools, the Box shell, and the local MCP server configured.
+Initial Claude startup can take more than a minute in a fresh Runtime session.
+Its project, Claude history, and audit state belong to this manual workload.
+It does not attach to a Claude process started through the example's invocation API.
+Existing Runtime sessions retain their old package files. Start a new session after an update.
+The manual directory lasts only as long as that Runtime session.
 
 ## Read the audit and retain access
 

@@ -77,8 +77,18 @@ def verify(args):
         "runtime": wire, "endpoint": endpoint, "session_id": identity,
     }, indent=2, default=str) + "\n")
     claude = args.agent == "claude"
-    call({"prompt": "claude", "operation": "start", "interactive": False, "task": TASK}
-         if claude else {"prompt": "demo"})
+    payload = {"prompt": "claude", "operation": "start", "interactive": False, "task": TASK}
+    if getattr(args, "exercise", False):
+        if not claude:
+            raise ValueError("--exercise requires --agent claude")
+        task = (Path(__file__).parent / "app/demo/exercise.txt").read_text()
+        task += (
+            "\nFor native tools, pass each file_path exactly as written above, including "
+            "../operator-private.txt. All paths are relative to the current project "
+            "directory. Do not construct absolute paths or remove the project component.\n"
+        )
+        payload.update(exercise=True, task=task)
+    call(payload if claude else {"prompt": "demo"})
     deadline, cursor, output = time.monotonic() + 360, 0, bytearray()
     while time.monotonic() < deadline:
         state = call({"prompt": "claude", "operation": "poll", "cursor": cursor}
@@ -97,6 +107,13 @@ def verify(args):
         raise RuntimeError("Workload exceeded the deadline; the Runtime remains deployed")
     audit = call({"prompt": "claude", "operation": "audit"} if claude else {"prompt": "audit"})
     (evidence / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    if getattr(args, "exercise", False) and state.get("status") == "complete":
+        from native_checks import verify as verify_native
+        native = verify_native(state, output.decode("utf-8", errors="replace"))
+        (evidence / "native-tool-checks.json").write_text(json.dumps(native, indent=2) + "\n")
+        state.setdefault("checks", {}).update({"native_tool_" + key: value for key, value in native.items()})
+        state["passed"] = state.get("passed") is True and all(native.values())
+        (evidence / "result.json").write_text(json.dumps(state, indent=2) + "\n")
     print(json.dumps({"mode": mode, "passed": state.get("passed"), "checks": state.get("checks"),
                       "error": state.get("error"), "evidence": str(evidence)}, indent=2))
     return 0 if state.get("passed") is True else 1
@@ -107,4 +124,6 @@ if __name__ == "__main__":
     parser.add_argument("--arn", required=True)
     parser.add_argument("--profile")
     parser.add_argument("--agent", choices=("scripted", "claude"), default="scripted")
+    parser.add_argument("--exercise", action="store_true",
+                        help="Exercise native files, the Box shell, network refusals, and MCP")
     raise SystemExit(verify(parser.parse_args()))

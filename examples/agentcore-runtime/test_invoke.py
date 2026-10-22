@@ -27,6 +27,7 @@ class VerifierTests(unittest.TestCase):
         self.reset = False
         self.output = b"x" * 150000
         self.poll_cursors = []
+        self.starts = []
         self.args = SimpleNamespace(
             profile=None,
             arn="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test",
@@ -78,6 +79,7 @@ class VerifierTests(unittest.TestCase):
         payload = json.loads(kwargs["payload"])
         operation = payload["operation"]
         if operation == "start":
+            self.starts.append(payload)
             response = {"status": "running"}
         elif operation == "poll":
             cursor = payload["cursor"]
@@ -87,6 +89,7 @@ class VerifierTests(unittest.TestCase):
                 "status": "complete",
                 "passed": True,
                 "checks": {},
+                "directory": "/var/tmp/claude-test",
                 "output": base64.b64encode(self.output[cursor:end]).decode(),
                 "cursor": end,
                 "output_reset": self.reset,
@@ -115,6 +118,16 @@ class VerifierTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown Runtime example mode"):
             self.invoke.verify(self.args)
         self.assertEqual(self.poll_cursors, [])
+
+    def test_exercise_requires_native_attempts_even_when_server_reports_success(self):
+        self.args.exercise = True
+        with redirect_stdout(io.StringIO()):
+            result = self.invoke.verify(self.args)
+        self.assertEqual(result, 1)
+        self.assertTrue(self.starts[0]["exercise"])
+        self.assertIn("runtime_demo", self.starts[0]["task"])
+        evidence = next(self.invoke.ROOT.glob("results/*/native-tool-checks.json"))
+        self.assertFalse(any(json.loads(evidence.read_text()).values()))
 
 
 if __name__ == "__main__":

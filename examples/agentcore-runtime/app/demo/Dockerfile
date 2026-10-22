@@ -4,7 +4,7 @@ RUN dnf install -y python3.12 python3.12-pip shadow-utils && dnf clean all \
     && useradd --uid 991 --gid 991 --create-home boxoperator
 WORKDIR /app
 RUN python3.12 -m pip install --no-cache-dir boto3==1.42.61 aws-bedrock-token-generator==1.1.0
-COPY main.py claude_runtime.py box.tar.gz box-package.json claude.tar.gz claude-package.json /app/
+COPY main.py claude_runtime.py manual_setup.py mcp_fixture.py box.toml policy.dw exercise.txt box.tar.gz box-package.json claude.tar.gz claude-package.json /app/
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 USER 991:991
 EXPOSE 8080
