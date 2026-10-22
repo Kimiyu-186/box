@@ -6,6 +6,18 @@ fn main() {
         hardening_and_repeat_run();
         return;
     }
+    if std::env::args().any(|argument| argument == "--callback-error") {
+        let code = strands_box::run(
+            "/missing-callback-config.toml".into(),
+            Vec::new(),
+            strands_box::RunOptions {
+                on_ready: Some(Box::new(|| Err(std::io::Error::other("callback refused")))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(code, std::process::ExitCode::FAILURE);
+        return;
+    }
 
     let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .arg("--probe")
@@ -20,6 +32,17 @@ fn main() {
         }),
         "{stderr}"
     );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--callback-error")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("on_ready callback failed: callback refused"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("missing-callback-config.toml"), "{stderr}");
 }
 
 #[cfg(unix)]
@@ -51,7 +74,38 @@ fn hardening_and_repeat_run() {
 
     let directory = tempfile::tempdir().expect("create test directory");
     let config = directory.path().join("missing.toml");
-    let exit_code = strands_box::run(config.clone(), Vec::new());
+    let mut called = false;
+    let exit_code = strands_box::run(
+        config.clone(),
+        Vec::new(),
+        strands_box::RunOptions {
+            on_ready: Some(Box::new(|| {
+                called = true;
+                // SAFETY: getrlimit writes to initialized storage in this isolated probe.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limits) },
+                    0
+                );
+                assert_eq!((limits.rlim_cur, limits.rlim_max), (0, 0));
+                for signal in [libc::SIGINT, libc::SIGTERM] {
+                    // SAFETY: initialized sigaction storage and a null action only read the disposition.
+                    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                    assert_eq!(
+                        unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+                        0
+                    );
+                    assert_ne!(action.sa_sigaction, libc::SIG_DFL);
+                    assert_ne!(action.sa_sigaction, libc::SIG_IGN);
+                }
+                Ok(())
+            })),
+            ..Default::default()
+        },
+    );
+    assert!(
+        called,
+        "callback runs before the missing configuration is rejected"
+    );
     assert_eq!(exit_code, std::process::ExitCode::FAILURE);
 
     // SAFETY: getrlimit writes to the initialized limits value.
@@ -68,7 +122,7 @@ fn hardening_and_repeat_run() {
     }
 
     assert_eq!(
-        strands_box::run(config, Vec::new()),
+        strands_box::run(config, Vec::new(), Default::default()),
         std::process::ExitCode::FAILURE
     );
 }

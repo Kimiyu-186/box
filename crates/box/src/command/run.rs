@@ -74,7 +74,12 @@ fn write_credential_stores(
 }
 
 /// Run one contained agent from one locked configuration snapshot.
-pub(crate) async fn execute(config: &Path, argv: &[OsString]) -> Result<ExitCode, BoxError> {
+pub(crate) async fn execute(
+    config: &Path,
+    argv: &[OsString],
+    terminal: Option<std::fs::File>,
+    signals: Option<crate::run::contain::supervise::Signals>,
+) -> Result<ExitCode, BoxError> {
     let locked = prepare(config, argv)?;
     locked.announce_credential_stores()?;
     let collector = telemetry::open(&locked.root, &locked.record)?;
@@ -84,7 +89,7 @@ pub(crate) async fn execute(config: &Path, argv: &[OsString]) -> Result<ExitCode
         &name,
     ));
 
-    let outcome = hosted(locked, Arc::clone(&collector)).await;
+    let outcome = hosted(locked, Arc::clone(&collector), terminal, signals).await;
 
     // The one teardown point, so every exit above records the stop and every queued record
     // reaches its target. `drained` is the only route out of the collector's queue, and the
@@ -108,6 +113,8 @@ pub(crate) async fn execute(config: &Path, argv: &[OsString]) -> Result<ExitCode
 async fn hosted(
     locked: LockedRun,
     collector: Arc<telemetry::Collector>,
+    terminal: Option<std::fs::File>,
+    signals: Option<crate::run::contain::supervise::Signals>,
 ) -> Result<ExitCode, BoxError> {
     let sources: Vec<Policy> = locked.policy.into_iter().collect();
     let subject = policy_subject(&sources);
@@ -206,7 +213,7 @@ async fn hosted(
         &site,
     )?;
     eprintln!("{}", boundary.disclosure());
-    let contained = Contained::spawn(boundary, &locked.root, hosted).await?;
+    let contained = Contained::spawn(boundary, &locked.root, hosted, terminal, signals).await?;
     contained.wait().await
 }
 
