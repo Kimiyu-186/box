@@ -164,4 +164,3 @@ Minimum versions, minimum privileges, package installation, and combined-build q
 | Shared library | Code that a program loads from a separate file. | The loader needs readable, executable access. |
 | `/proc` | A filesystem that exposes process and kernel information. | Box mounts it within the process namespace. |
 | `mprotect` and `pkey_mprotect` | System calls that change memory access permissions. | Box refuses requested permissions that include executable access, including retained access. |
-

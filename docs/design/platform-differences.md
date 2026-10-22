@@ -80,4 +80,3 @@ These differences describe source behavior rather than an accepted Linux package
 A release needs installation and workload checks on each selected deployment configuration.
 Setup privileges and successful workloads from one environment do not qualify another.
 See [Linux startup and qualification](linux-enforcement.md#startup-failures-and-qualification) for that boundary.
-
