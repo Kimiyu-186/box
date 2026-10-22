@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
-from claude_runtime import ClaudeRuntime, policy_rows
+from claude_runtime import ClaudeRuntime, policy_rows, source_is_repaired
 
 HERE = Path(__file__).resolve().parent
 BOOT = uuid.uuid4().hex
@@ -23,7 +23,6 @@ CLAUDE = None
 PACKAGE = json.loads((HERE / "box-package.json").read_text())
 REVISION = PACKAGE["revision"]
 PACKAGE_SHA = PACKAGE["sha256"]
-FIXED_SOURCE = "def add(a, b):\n    return a + b\n"
 
 
 def digest(path):
@@ -49,28 +48,6 @@ def install():
     if digest(binary) != PACKAGE["binary_sha256"]:
         raise RuntimeError("Box binary digest mismatch")
     return binary
-
-
-def decisions(path):
-    rows = []
-    if not path.exists():
-        return rows
-    for line in path.read_text().splitlines():
-        for resource in json.loads(line).get("resourceLogs", []):
-            for scope in resource.get("scopeLogs", []):
-                for record in scope.get("logRecords", []):
-                    attrs = {x["key"]: x["value"] for x in record.get("attributes", [])}
-                    def value(key):
-                        return attrs.get(key, {}).get("stringValue")
-                    verdict = value("strands.box.policy.verdict")
-                    if verdict:
-                        rows.append({
-                            "verdict": verdict,
-                            "action": value("strands.box.policy.action"),
-                            "path": value("file.path"),
-                            "host": value("server.address"),
-                        })
-    return rows
 
 
 def run_demo():
@@ -163,17 +140,13 @@ printf 'DEMO_COMPLETE\\n'
                     raise RuntimeError("Box exceeded the demo deadline")
                 time.sleep(0.2)
         output = log.read_text()
-        records = decisions(root / "state/private/telemetry/records.jsonl")
+        audit, malformed = policy_rows(root / "state")
+        records = [{key: row[key] or None for key in ("verdict", "action", "path", "host")}
+                   for row in audit]
         source = (workspace / "app.py").read_text()
-        correct = source == FIXED_SOURCE
-        test_output = "Source differs from the expected repair"
-        if correct:
-            namespace = {}
-            exec(compile(source, "app.py", "exec"), namespace)
-            correct = all(namespace["add"](*args) == expected for args, expected in (
-                ((2, 3), 5), ((-4, 3), -1), ((0, 0), 0),
-            ))
-            test_output = "3 independent arithmetic checks passed" if correct else "Arithmetic check failed"
+        correct = source_is_repaired(source)
+        test_output = ("Source structure matches the expected repair" if correct
+                       else "Source differs from the expected repair")
         def decision(verdict, action, suffix=None):
             return any(
                 row["verdict"] == verdict and row["action"] == action
@@ -182,6 +155,7 @@ printf 'DEMO_COMPLETE\\n'
             )
         checks = {
             "non_root_operator": os.getuid() != 0,
+            "audit_readable": malformed == 0,
             "uncontained_access_control": host.returncode == 0,
             "box_completed": process.returncode == 0 and "DEMO_COMPLETE\n" in output,
             "project_read": "STEP project_read ALLOWED\n" in output

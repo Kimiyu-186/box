@@ -19,6 +19,8 @@ def reply(identity, result):
 for line in sys.stdin:
     try:
         request = json.loads(line)
+        if not isinstance(request, dict):
+            continue
         identity = request.get("id")
         method = request.get("method")
         if identity is None:

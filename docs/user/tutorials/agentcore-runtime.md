@@ -118,7 +118,7 @@ The container example packages Box and Claude Code in an image built from
 [`app/demo/Dockerfile`](../../../examples/agentcore-runtime/app/demo/Dockerfile).
 Complete [Prepare the application](#prepare-the-application) first to place the executable archives and Box manifest in its build context.
 
-The supplied Dockerfile is:
+The Dockerfile is the authoritative source. This example shows its current contents:
 
 ```dockerfile
 FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:c07ab0773eddf9449c0994a87d8148300db98bdf8d8dad672a9dc26321c104fc

@@ -24,6 +24,11 @@ def prepare(box):
         if json.loads(marker.read_text())["package_config_sha256"] != identity:
             raise RuntimeError("The manual directory belongs to another configuration")
         return DIRECTORY
+    if DIRECTORY.exists():
+        raise RuntimeError(
+            "The manual directory exists without an install marker. "
+            "Remove /var/tmp/box-manual and restart the Runtime."
+        )
     runtime = ClaudeRuntime(box)
     claude, _ = runtime.install()
     root = runtime.configure(DIRECTORY / "bin/claude", "", True, exercise=True,
