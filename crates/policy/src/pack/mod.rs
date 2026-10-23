@@ -20,9 +20,12 @@ use crate::schema::cedar_identifier;
 /// The namespace every pack's vocabulary lives under.
 pub(crate) const PACK_NAMESPACE: &str = "Tool";
 
+/// The pack file language versions this Box reads.
+const KNOWN_FORMATS: &[i64] = &[1];
+
 /// The action a command for a pack's program raises when no shell action matches it.
 pub(crate) const UNMODELED_ACTION: &str = "unmodeled";
-/// The pure action group every action of a pack belongs to: `Tool::<name>::Action::"*"`.
+/// The pure action group every action of a pack belongs to: `<namespace>::Action::"*"`.
 pub(crate) const ALL_ACTIONS: &str = "*";
 
 /// A pack file could not be loaded.
@@ -47,6 +50,7 @@ impl PackError {
 pub struct Pack {
     origin: PathBuf,
     name: String,
+    version: u32,
     program: String,
     effects: Vec<String>,
     grammar: ShellGrammar,
@@ -59,6 +63,29 @@ impl Pack {
             toml::from_str(text).map_err(|error| PackError::new(origin, error.to_string()))?;
         let refuse = |reason: String| Err(PackError::new(origin, reason));
 
+        match &file.format {
+            None => return refuse("`format` is required: write `format = 1`".to_string()),
+            Some(toml::Value::Integer(format)) if KNOWN_FORMATS.contains(format) => {}
+            Some(other) => {
+                return refuse(format!(
+                    "`format = {other}` is not a pack file format this Box reads (it reads 1)"
+                ));
+            }
+        }
+        let version = match &file.version {
+            None => {
+                return refuse(
+                    "`version` is required: write `version = 1` for a new pack".to_string(),
+                );
+            }
+            Some(toml::Value::Integer(version)) if *version >= 1 => match u32::try_from(*version) {
+                Ok(version) => version,
+                Err(_) => return refuse(format!("`version = {version}` is too large")),
+            },
+            Some(other) => {
+                return refuse(format!("`version = {other}` must be a positive integer"));
+            }
+        };
         if !is_identifier(&file.pack) {
             return refuse(format!(
                 "`pack = {:?}` must be a plain identifier (letters, digits, '_')",
@@ -101,6 +128,7 @@ impl Pack {
         Ok(Self {
             origin: origin.to_path_buf(),
             name: file.pack,
+            version,
             program: file.program,
             effects: file.effects.into_keys().collect(),
             grammar,
@@ -113,10 +141,16 @@ impl Pack {
         &self.origin
     }
 
-    /// The pack's name, which is its `Tool::<name>` namespace.
+    /// The pack's name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The major version of the pack's content.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// The program the pack's shell grammar covers.
@@ -125,9 +159,14 @@ impl Pack {
         &self.program
     }
 
-    /// The Cedar namespace of this pack's vocabulary.
-    pub(crate) fn namespace(&self) -> String {
-        format!("{PACK_NAMESPACE}::{}", self.name)
+    /// The Cedar namespace of this pack's vocabulary: `Tool::<name>`, or `Tool::<name>::v<N>` from 2.
+    #[must_use]
+    pub fn namespace(&self) -> String {
+        if self.version > 1 {
+            format!("{PACK_NAMESPACE}::{}::v{}", self.name, self.version)
+        } else {
+            format!("{PACK_NAMESPACE}::{}", self.name)
+        }
     }
 
     pub(crate) fn grammar(&self) -> &ShellGrammar {
@@ -257,7 +296,7 @@ fn field_json(value: &FieldValue) -> serde_json::Value {
 /// What a permitted pack action needs to record its `::response` once the command ends.
 #[derive(Debug, Clone)]
 pub(crate) struct PackResponse {
-    pub(crate) pack: String,
+    pub(crate) namespace: String,
     pub(crate) action: String,
     pub(crate) input: serde_json::Value,
 }
@@ -265,7 +304,7 @@ pub(crate) struct PackResponse {
 impl PackInvocation<'_> {
     pub(crate) fn response(&self) -> PackResponse {
         PackResponse {
-            pack: self.pack.name().to_string(),
+            namespace: self.pack.namespace(),
             action: self.action().to_string(),
             input: self.input(),
         }
@@ -328,13 +367,13 @@ impl PackBindings {
 
     /// The resolved program file, the name, and the pack of each binding.
     #[must_use]
-    pub fn bound_programs(&self) -> Vec<(&str, &str, &str)> {
+    pub fn bound_programs(&self) -> Vec<(&str, &str, &Pack)> {
         self.by_program
             .iter()
             .filter_map(|((path, name), index)| {
                 self.packs
                     .get(*index)
-                    .map(|pack| (path.as_str(), name.as_str(), pack.name()))
+                    .map(|pack| (path.as_str(), name.as_str(), pack.as_ref()))
             })
             .collect()
     }

@@ -8,6 +8,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackFile {
+    #[serde(default)]
+    pub(crate) format: Option<toml::Value>,
+    #[serde(default)]
+    pub(crate) version: Option<toml::Value>,
     pub(crate) pack: String,
     pub(crate) program: String,
     #[serde(default)]

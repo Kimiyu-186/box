@@ -16,6 +16,8 @@
 # (profiles, `endpoint_url`, `cli_pager`, aliases in ~/.aws/cli/alias), and the contents of a
 # `file://` parameter.
 
+format  = 1       # The pack file language. Box reads 1.
+version = 1       # The major version of this pack.
 pack    = "aws"
 program = "aws"
 

@@ -115,7 +115,12 @@ async fn hosted(
     let operator = crate::record::config::policy_operator()?;
     let bindings = locked.record.pack_bindings(&locked.packs);
     for (path, name, pack) in bindings.bound_programs() {
-        eprintln!("strands-box: tool pack {pack:?} binds {path} called as {name:?}");
+        eprintln!(
+            "strands-box: tool pack {:?} version {} ({}) binds {path} called as {name:?}",
+            pack.name(),
+            pack.version(),
+            pack.namespace()
+        );
     }
     let policy =
         match HostedBox::prepare_policy_with_packs(&locked.root, &operator, sources, bindings) {

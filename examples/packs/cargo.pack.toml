@@ -7,6 +7,8 @@
 # `.cargo/config.toml` are invisible to the parser (L1). A config-file alias can redefine
 # `t` to mean `publish`: see cargo.corpus.md.
 
+format  = 1       # The pack file language. Box reads 1.
+version = 1       # The major version of this pack.
 pack    = "cargo"
 program = "cargo"
 

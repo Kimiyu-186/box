@@ -1,6 +1,8 @@
 # Draft pack for git (checked against git 2.50 behaviour).
 # Keys beyond design.md section 3 are marked "EXT-n"; crates/policy/src/pack/grammar.rs reads them.
 
+format  = 1       # The pack file language. Box reads 1.
+version = 1       # The major version of this pack.
 pack    = "git"
 program = "git"
 

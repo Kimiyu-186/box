@@ -54,8 +54,10 @@ impl ActionIdentity {
             Self::McpTool { namespace, tool } => {
                 Event::builder_for(&[namespace, "Action"], tool, kind)
             }
-            Self::PackAction { pack, action } => {
-                Event::builder_for(&[crate::pack::PACK_NAMESPACE, pack, "Action"], action, kind)
+            Self::PackAction { namespace, action } => {
+                let mut path = namespace.split("::").collect::<Vec<_>>();
+                path.push("Action");
+                Event::builder_for(&path, action, kind)
             }
         }
     }

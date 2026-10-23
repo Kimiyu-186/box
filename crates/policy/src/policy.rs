@@ -189,7 +189,7 @@ impl PolicyEngine {
         invocation: &crate::pack::PackInvocation<'_>,
     ) -> Decision {
         let identity = crate::schema::ActionIdentity::PackAction {
-            pack: invocation.pack.name().to_string(),
+            namespace: invocation.pack.namespace(),
             action: invocation.action().to_string(),
         };
         let input = invocation.input();
@@ -205,9 +205,8 @@ impl PolicyEngine {
             .authority
             .decide(governed, principal, &request, &identity)
             .naming(format!(
-                "{}::{}::Action::{}",
-                crate::pack::PACK_NAMESPACE,
-                invocation.pack.name(),
+                "{}::Action::{}",
+                invocation.pack.namespace(),
                 invocation.action()
             ));
         if let Some(observer) = &self.observer {
@@ -228,7 +227,7 @@ impl PolicyEngine {
         status: i32,
     ) -> Result<(), PolicyError> {
         let identity = crate::schema::ActionIdentity::PackAction {
-            pack: response.pack.clone(),
+            namespace: response.namespace.clone(),
             action: response.action.clone(),
         };
         self.authority

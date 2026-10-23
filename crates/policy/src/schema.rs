@@ -129,7 +129,7 @@ pub(crate) enum ActionIdentity {
     },
     #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
     PackAction {
-        pack: String,
+        namespace: String,
         action: String,
     },
 }
@@ -159,8 +159,8 @@ impl ActionIdentity {
     pub(crate) fn cedar_uid(&self) -> Result<EntityUid, PolicyError> {
         match self {
             Self::Fixed { id } => fixed_action_uid(id),
-            Self::PackAction { pack, action } => {
-                let action_type = format!("{}::{pack}::Action", crate::pack::PACK_NAMESPACE)
+            Self::PackAction { namespace, action } => {
+                let action_type = format!("{namespace}::Action")
                     .parse::<EntityTypeName>()
                     .map_err(|error| PolicyError::Schema(error.to_string()))?;
                 Ok(EntityUid::from_type_name_and_id(
@@ -190,9 +190,8 @@ impl ActionIdentity {
                 "{namespace}::Action::\"{}\"",
                 EntityId::new(tool).escaped()
             )),
-            Self::PackAction { pack, action } => Cow::Owned(format!(
-                "{}::{pack}::Action::\"{}\"",
-                crate::pack::PACK_NAMESPACE,
+            Self::PackAction { namespace, action } => Cow::Owned(format!(
+                "{namespace}::Action::\"{}\"",
                 EntityId::new(action).escaped()
             )),
         }

@@ -31,10 +31,12 @@ command = ["git"]
 
 When Box starts, it does three things with each pack:
 
-1. **Checks the file.** Any key it does not know, any effect that is used but not declared, and any
-   usage line it cannot read stops Box from starting. Each error names the pack and the table.
+1. **Checks the file.** A missing or unknown `format`, a missing or invalid `version`, any key it
+   does not know, any effect that is used but not declared, and any usage line it cannot read stops
+   Box from starting. Each error names the pack file, and the table when there is one.
 2. **Generates a schema.** Every action becomes `Tool::<pack>::Action::"<action>"`, and every effect
-   becomes `Tool::<pack>::Effect::"<effect>"`. Your policy is checked against that schema, so a rule
+   becomes `Tool::<pack>::Effect::"<effect>"`. From version 2 of a pack, the namespace is
+   `Tool::<pack>::v<N>` (see [Versions](#versions)). Your policy is checked against that schema, so a rule
    that names an action or effect the pack does not have stops Box from starting.
 3. **Binds the pack to a program.** Box finds the `[tool]` table whose program has the pack's
    `program` name, and remembers the real file it resolves to. If no `[tool]` runs that program,
@@ -70,6 +72,8 @@ after it explain the parts that need more than a comment.
 ```toml
 # ── Identity ────────────────────────────────────────────────────────────────
 
+format  = 1         # Required. The version of the pack file language. Box reads 1.
+version = 1         # Required. The major version of this pack's content. See "Versions".
 pack    = "git"     # Required. The namespace: rules say Tool::git::... Letters, digits, '_'.
 program = "git"     # Required. The program name the grammar covers. A name, never a path.
 
@@ -154,6 +158,35 @@ patterns matches.
 The effects of one command are the action's own `adds`, plus every `adds` from the options and
 operands present on the line, minus every `removes`. **A `removes` always wins**, wherever it sits
 on the line, so `git push -f --dry-run` has no `force_push` effect.
+
+## Versions
+
+A pack carries two version numbers, and they answer different questions.
+
+`format` is the version of the pack file language: the keys on this page and what they mean. Box
+owns it. Every pack today says `format = 1`, and Box refuses to start with a pack whose `format` is
+missing or is a number it does not read.
+
+`version` is the major version of the pack's own content: its actions, effects, and grammar. The
+pack's author owns it. It is a whole number, 1 or more.
+
+The version is part of the namespace, the way Go puts a major version in a module path. Version 1
+has no suffix. Version 2 and later add `v<N>`:
+
+| `version` | A rule names |
+|---|---|
+| `1` | `Tool::git::Action::"push"`, `Tool::git::Effect::"force_push"` |
+| `2` | `Tool::git::v2::Action::"push"`, `Tool::git::v2::Effect::"force_push"` |
+
+So a policy is written against one major version. If you install version 2 of a pack and your
+policy still says `Tool::git::Action::"push"`, the policy names an action the schema does not have,
+and Box refuses to start. You never get a policy that silently means something else. `box.toml` does
+not change: `tool_packs` still lists paths.
+
+An author bumps `version` when a command line the old version recognized now gives a different
+action or different effects. A rule written against the old meaning could then allow what it
+meant to deny. Recognizing a line that used to be `unmodeled` is not a bump, as long as its
+effects are right, because no rule could have allowed that line by name before.
 
 ## The usage line
 
