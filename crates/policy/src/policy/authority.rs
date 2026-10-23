@@ -152,7 +152,8 @@ impl Authority {
                     inert @ (PolicyError::Spelling(_)
                     | PolicyError::SharedRuleId(_)
                     | PolicyError::ReservedAction(_)
-                    | PolicyError::InertTemporalPermit(_)),
+                    | PolicyError::InertTemporalPermit(_)
+                    | PolicyError::UnsupportedClause(_)),
                 ) => {
                     return Err(inert.into());
                 }
@@ -544,7 +545,8 @@ impl ProposalState {
                         inert @ (PolicyError::Spelling(_)
                         | PolicyError::SharedRuleId(_)
                         | PolicyError::ReservedAction(_)
-                        | PolicyError::InertTemporalPermit(_)),
+                        | PolicyError::InertTemporalPermit(_)
+                        | PolicyError::UnsupportedClause(_)),
                     ) => {
                         return Err(inert);
                     }
