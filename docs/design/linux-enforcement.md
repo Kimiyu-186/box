@@ -1,6 +1,6 @@
 # Operating system enforcement on Linux
 
-Box uses Linux namespaces to give each workload a restricted filesystem and process view.
+Box uses Linux [namespaces](#terms) to give each workload a restricted filesystem and process view.
 A system call filter limits the operations that the workload can request from the kernel.
 
 The [platform comparison](platform-differences.md) states configuration differences and startup results.
@@ -35,10 +35,8 @@ Policy decides requests that reach those components.
 The workload's own file operations use its filesystem grants and produce no individual policy decision.
 See [the two enforcement paths](containment.md#two-kinds-of-enforcement).
 
-The implementation uses namespaces and a static system call filter.
-It does not use Landlock or route direct Linux file operations through the policy engine.
-Landlock is a Linux mechanism for additional process access restrictions.
-Those capabilities remain deferred.
+The [Linux boundary uses namespaces rather than Landlock](decisions.md#the-linux-boundary-is-namespaces-not-landlock), a mechanism for additional process access restrictions.
+Direct Linux file operations use filesystem grants rather than individual policy decisions.
 Linux refuses `[experimental-features] native-filesystem-policy = true` during configuration validation.
 See the [platform comparison](platform-differences.md#behavior-and-configuration) for the macOS build requirement and mediated alternatives.
 
@@ -56,9 +54,13 @@ The `workspace` field selects the initial directory but grants no access to its 
 
 `write` and `write_file` expose readable, writable mounts on Linux.
 Linux does not enforce write-only content access through these mounts.
-Startup currently accepts an otherwise valid write-only request.
-Only directory writes receive the additional disclosure text `readable too: a writable bind reads`.
-That text does not yet describe exact-file writes.
+Box refuses a Linux write grant unless an explicit `read` or `read_file` grant covers its entire scope.
+This check applies to the agent, tools, and local Model Context Protocol (MCP) servers before they start.
+Execute grants do not satisfy the read requirement.
+
+Startup output identifies each content grant's access mode.
+Matching `read` and `write` grants display `read-write`, including exact-file grants.
+A read tree with a writable child displays `read-only except read-write at overlapping write grants`.
 
 The comparison explains [overlap and exact-file scope](platform-differences.md#access-modes-and-overlap).
 
@@ -68,8 +70,7 @@ For an existing denied file, Linux can substitute an empty file.
 A read can then succeed with empty output while writes fail.
 
 Linux refuses `list`, because the mount view cannot expose directory names without file contents.
-An agent's metadata-only directory grant currently contributes no mount and causes no startup error.
-This silent omission remains an unresolved behavior.
+An agent's metadata-only directory grant contributes no mount and causes no startup error.
 Other grants can still expose that directory.
 
 <a id="programs-and-shared-libraries"></a>
@@ -77,25 +78,26 @@ Other grants can still expose that directory.
 ## Programs and shared libraries
 
 The agent can execute its command and paths under its `exec` grants.
-An ordinary read grant does not make programs executable.
-Selected loader directories are an exception: Linux mounts those directories readable and executable so their shared libraries can load.
+A shared library contains code that another program loads.
+A read grant does not make programs executable, except in the loader directories listed below.
+Linux mounts those directories readable and executable so their shared libraries can load.
 This also permits execution of programs in those directories.
+
 On ARM64, the recognized paths are `/lib64`, `/usr/lib64`, `/lib/aarch64-linux-gnu`, `/usr/lib/aarch64-linux-gnu`, `/lib`, and `/usr/lib`.
 Box compares their resolved directory identities with the granted directory.
 
-A [shared library](#terms) contains code that another program loads.
+ELF means Executable and Linkable Format, the Linux binary format.
 For an exact ELF binary grant, Box discovers its executable-format interpreter and declared library dependencies.
 It also follows the dependencies of discovered system libraries.
 System libraries are libraries within the recognized loader directories listed above.
-ELF means Executable and Linkable Format, the Linux binary format.
+
 This discovery does not inspect script interpreter lines.
 Box handles the declared command's script interpreter chain separately.
 An additional script reached through an execution grant can need explicit interpreter and library access.
 A directory `exec` grant does not enumerate every program's dependencies.
-Later library loads can therefore need additional grants.
-The implementation does not establish a complete workload dependency set.
+Libraries loaded later can need additional grants.
 
-A tool or local Model Context Protocol (MCP) server runs in its own sandbox.
+A tool or local MCP server runs in its own sandbox.
 On Linux, its readable and writable file or directory grants also permit execution.
 This lets a tool run helpers and load code that it builds.
 Automatic temporary mounts, refused paths, and protected files retain their separate restrictions.
@@ -106,7 +108,7 @@ See [the tool execution decision](decisions.md#a-leaf-runs-its-whole-toolchain-a
 
 Seccomp checks system call numbers and selected arguments.
 It does not resolve pathnames or replace filesystem grants.
-The filters refuse operations outside their permit set and restrict selected permitted operations.
+The filters refuse operations outside their permit set.
 
 The filter rejects simultaneous writable and executable memory mappings.
 It also refuses `mprotect` and `pkey_mprotect` requests whose requested permissions include executable access.
@@ -117,7 +119,7 @@ Tool execution from writable files does not remove these memory restrictions.
 
 ## Network access
 
-The normal Linux sandbox has a private network namespace without external routes.
+With gateway networking enabled, the Linux sandbox has a private network namespace without external routes.
 Box creates a loopback endpoint inside that namespace.
 A relay carries its connections to the egress gateway in the trusted process.
 The relay transfers bytes.
@@ -132,8 +134,6 @@ The agent refuses a network table.
 
 This exception does not enable every socket family.
 The Linux filter permits UNIX and IPv4 sockets but refuses IPv6 sockets.
-The lower-level configuration also refuses requested inbound listen ports in the gateway mode.
-Do not interpret direct network access as unrestricted Linux networking.
 
 <a id="startup-failures-and-qualification"></a>
 
@@ -150,7 +150,7 @@ The error alone does not identify the responsible restriction.
 
 Each deployment needs its own image, kernel, identity, setup privileges, workload grants, and execution evidence.
 A local Linux result does not establish a cloud platform's allowed setup operations.
-Minimum versions, minimum privileges, package installation, and combined-build qualification remain outside this explanation.
+Minimum versions, minimum privileges, package installation, and testing the assembled Box build remain outside this explanation.
 
 <a id="terms"></a>
 

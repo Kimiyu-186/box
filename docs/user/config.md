@@ -192,13 +192,38 @@ their place.
 | List | What each entry grants |
 |---|---|
 | `read` | Read the path. A directory entry covers everything below it. |
-| `write` | Write the path. On macOS, add `read` to permit reads. Linux currently exposes readable, writable mounts. |
+| `write` | Write the path. On macOS, add `read` to permit reads. Linux requires explicit read access across the entire write scope. |
 | `read_file` | Read one exact file. The entry names a file. |
-| `write_file` | Write one exact file. Linux currently exposes readable, writable content. The entry names an existing file. |
+| `write_file` | Write one exact file. Linux requires explicit read access to that file. The entry names an existing file. |
 | `list` | List the directory without content access on macOS. Linux refuses this list. |
-| `metadata` | Inspect file properties below a directory without content access on macOS. Linux currently omits this grant without an error. **`[agent.filesystem]` only.** |
+| `metadata` | Inspect file properties below a directory without content access on macOS. Linux omits this grant without an error. **`[agent.filesystem]` only.** |
 | `exec` | Run the path. A file entry names an executable; a directory entry covers the binaries below it. **`[agent.filesystem]` only.** |
 | `deny` | Refuse the path, even when another list grants it. Linux requires the target to exist. |
+
+### Direct access by operating system
+
+The read and write lists state separate permissions. These rules also apply to local servers
+under `[mcp.<name>.filesystem]`.
+
+| Requested access | Settings | macOS | Linux |
+|---|---|---|---|
+| Read-only | `read` or `read_file` | Supported | Supported |
+| Write-only | `write` or `write_file`, without covering read access | Supported | Startup refuses the configuration before any workload runs |
+| Read-write | Explicit read and write grants | Supported | Supported |
+| Read directory with writable child | Parent in `read`, child in `write` or `write_file` | Supported | Supported |
+| Write directory with only a readable child | Parent in `write`, child in `read` or `read_file` | Supported | Startup refuses the uncovered write-only scope |
+
+Linux writable mounts also allow reads. Box requires an explicit read grant that covers each
+entire write grant. An exact-file read covers only that file. A directory read covers that
+directory and its descendants. Execute grants do not satisfy this requirement.
+
+For Linux read-write access, put a directory in both `read` and `write`. For one file, use
+`read_file` and `write_file`. To retain read-only access, remove the write grant.
+
+Startup output states `read-only`, `write-only`, or `read-write` for each content-access grant.
+For partial overlaps, the parent entry also identifies the overlapping grants that allow both.
+Denials and protected paths still restrict access. Duplicate or nested grants of the same
+operation still cause startup refusal.
 
 The example uses four lists. `read` covers the CLI's install tree and `strands-home`, `read_file`
 names the preload file and Homebrew's OpenSSL settings, `write` covers `strands-home`, and `list`
