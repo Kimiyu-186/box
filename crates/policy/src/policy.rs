@@ -180,9 +180,9 @@ impl PolicyEngine {
         self.packs.coverage(program_path, name)
     }
 
-    /// The pack refinement of one permitted `shell:spawn`: only a `forbid` or a fault refuses it.
+    /// Decide one spawn of a pack-bound program as its pack action, default-deny like any action.
     #[cfg_attr(not(feature = "shell-adapter"), allow(dead_code))]
-    pub(crate) fn refine_pack_action(
+    pub(crate) fn decide_pack_action(
         &self,
         governed: &GovernedBox,
         principal: &Principal,
@@ -201,26 +201,15 @@ impl PolicyEngine {
             uri: None,
             arguments: Some(&input),
         };
-        let decision = match self
+        let decision = self
             .authority
             .decide(governed, principal, &request, &identity)
-        {
-            Decision::Deny {
-                reason: crate::DenyReason::NoMatch,
-                ..
-            } => Decision::Allow {
-                rule: crate::RuleId::default_deny(),
-                attribution: Vec::new(),
-                resource: String::new(),
-            },
-            other => other,
-        };
-        let decision = decision.naming(format!(
-            "{}::{}::Action::{}",
-            crate::pack::PACK_NAMESPACE,
-            invocation.pack.name(),
-            invocation.action()
-        ));
+            .naming(format!(
+                "{}::{}::Action::{}",
+                crate::pack::PACK_NAMESPACE,
+                invocation.pack.name(),
+                invocation.action()
+            ));
         if let Some(observer) = &self.observer {
             observer.observed(
                 identity.observer_action().as_ref(),

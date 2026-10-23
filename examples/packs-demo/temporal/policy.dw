@@ -1,14 +1,13 @@
-// The Strands Shell may run its builtins, and may start git and cargo.
+// The Strands Shell may run its builtins. The packs bind git and cargo, so each is decided only by
+// its own Tool:: action, and the forbids below narrow these permits.
 @id("shell_builtins")
 permit (principal, action == Box::Action::"shell:exec", resource);
 
-@id("spawn_git")
-permit (principal, action == Box::Action::"shell:spawn", resource)
-when { context.input.program == "git" };
+@id("all_git")
+permit (principal, action in Tool::git::Action::"*", resource);
 
-@id("spawn_cargo")
-permit (principal, action == Box::Action::"shell:spawn", resource)
-when { context.input.program == "cargo" };
+@id("all_cargo")
+permit (principal, action in Tool::cargo::Action::"*", resource);
 
 // The shell reads the demo tree, so it can enter the repository.
 @id("demo_read")

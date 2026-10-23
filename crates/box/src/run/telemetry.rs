@@ -296,17 +296,6 @@ impl ObservationCapture {
         self.finish().pop()
     }
 
-    /// The deciding verdict, where a permitting pack refinement defers to the `shell:spawn`
-    /// permit beneath it and a refusing one stands.
-    pub(crate) fn deciding(self) -> Option<ObservedDecision> {
-        let mut observed = self.finish();
-        let last = observed.pop()?;
-        if last.action.starts_with("Tool::") && last.decision.is_allow() {
-            return observed.pop().or(Some(last));
-        }
-        Some(last)
-    }
-
     fn finish(mut self) -> Vec<ObservedDecision> {
         POLICY_OBSERVATIONS.with(|observations| {
             let current = std::mem::replace(

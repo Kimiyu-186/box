@@ -1,10 +1,10 @@
-// The Strands Shell may run its builtins, and may start aws.
+// The Strands Shell may run its builtins. The pack binds aws, so aws is decided only by its
+// Tool::aws action.
 @id("shell_builtins")
 permit (principal, action == Box::Action::"shell:exec", resource);
 
-@id("spawn_aws")
-permit (principal, action == Box::Action::"shell:spawn", resource)
-when { context.input.program == "aws" };
+@id("all_aws")
+permit (principal, action in Tool::aws::Action::"*", resource);
 
 @id("demo_read")
 permit (principal, action == Box::Action::"fs:read", resource)

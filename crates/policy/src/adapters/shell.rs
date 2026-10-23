@@ -225,6 +225,32 @@ impl EffectInterceptor for ShellPolicyInterceptor {
             }
             _ => None,
         };
+        let pack_spawn = match effect {
+            EffectAttempt::ShellSpawn {
+                program,
+                program_path,
+                args,
+                cwd,
+                ..
+            } => self
+                .policy
+                .pack_coverage(
+                    program_path,
+                    Path::new(program)
+                        .file_name()
+                        .map_or(*program, |name| name.to_str().unwrap_or(program)),
+                )
+                .map(|coverage| match coverage {
+                    crate::pack::PackCoverage::Parsed(pack) => {
+                        (pack, pack.grammar().parse(args, Path::new(cwd)))
+                    }
+                    crate::pack::PackCoverage::Unmodeled(pack) => {
+                        (pack, crate::pack::Parsed::Unmodeled)
+                    }
+                }),
+            _ => None,
+        };
+        let mut pack_response = None;
         let decision = match effect {
             // One resolved command. The Shell has already parsed, expanded, and resolved
             // it, so `program` is what will run rather than what was typed.
@@ -246,7 +272,32 @@ impl EffectInterceptor for ShellPolicyInterceptor {
                     cwd,
                 },
             ),
-            // A host binary, raised through the passthrough path and judged as `shell:spawn`.
+            // A host binary a pack binds, judged only as its pack action.
+            EffectAttempt::ShellSpawn {
+                program,
+                program_path,
+                args,
+                cwd,
+                ..
+            } if pack_spawn.is_some() => {
+                let (pack, parsed) = pack_spawn.as_ref().expect("guarded by the arm");
+                let invocation = crate::pack::PackInvocation {
+                    pack,
+                    parsed,
+                    program,
+                    program_path: reported_program_path.as_deref().unwrap_or(program_path),
+                    args,
+                    cwd,
+                };
+                let decision =
+                    self.policy
+                        .decide_pack_action(&self.governed, &self.principal, &invocation);
+                if decision.is_allow() {
+                    pack_response = Some(invocation.response());
+                }
+                decision
+            }
+            // Any other host binary, raised through the passthrough path and judged as `shell:spawn`.
             EffectAttempt::ShellSpawn {
                 command,
                 program,
@@ -371,59 +422,6 @@ impl EffectInterceptor for ShellPolicyInterceptor {
                     "policy does not support this Shell effect",
                 ));
             }
-        };
-
-        // A permitted spawn of a program a pack binds is decided a second time, as the pack action.
-        let mut pack_response = None;
-        let decision = match (effect, decision) {
-            (
-                EffectAttempt::ShellSpawn {
-                    program,
-                    program_path,
-                    args,
-                    cwd,
-                    ..
-                },
-                allowed @ Decision::Allow { .. },
-            ) => match self.policy.pack_coverage(
-                program_path,
-                Path::new(program)
-                    .file_name()
-                    .map_or(*program, |name| name.to_str().unwrap_or(program)),
-            ) {
-                Some(coverage) => {
-                    let (pack, parsed) = match coverage {
-                        crate::pack::PackCoverage::Parsed(pack) => {
-                            (pack, pack.grammar().parse(args, Path::new(cwd)))
-                        }
-                        crate::pack::PackCoverage::Unmodeled(pack) => {
-                            (pack, crate::pack::Parsed::Unmodeled)
-                        }
-                    };
-                    let invocation = crate::pack::PackInvocation {
-                        pack,
-                        parsed: &parsed,
-                        program,
-                        program_path: reported_program_path.as_deref().unwrap_or(program_path),
-                        args,
-                        cwd,
-                    };
-                    let refined = self.policy.refine_pack_action(
-                        &self.governed,
-                        &self.principal,
-                        &invocation,
-                    );
-                    match refined {
-                        Decision::Allow { .. } => {
-                            pack_response = Some(invocation.response());
-                            allowed
-                        }
-                        denied => denied,
-                    }
-                }
-                None => allowed,
-            },
-            (_, decision) => decision,
         };
 
         match decision {

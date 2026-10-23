@@ -454,8 +454,8 @@ impl EffectInterceptor for ReachFloor {
             // it first would let an unreachable path skip the decision — so a rule counting
             let capture = ObservationCapture::begin();
             let intercepted = self.inner.intercept(effect).await;
-            let determined = capture.deciding();
-            // A pack refinement names its own action, not `shell:spawn`.
+            let determined = capture.last();
+            // A pack-bound spawn is decided as its pack action, not `shell:spawn`.
             let subject = subject.map(|mut subject| {
                 if let Some(observed) = &determined
                     && observed.action.starts_with("Tool::")

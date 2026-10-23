@@ -1,16 +1,23 @@
 #!/bin/bash
 # Run the git pack demo in a real box, with the full pack in examples/packs/git.pack.toml.
 #
-#   demo.sh force      # no_force_push: every force spelling is refused; -n -f and a plain push run
-#   demo.sh upstream   # a forbid on remote == "upstream": pushes to upstream are refused
-#   demo.sh forbid     # forbid Tool::git::Action::"push": status runs, push is refused
-#   demo.sh allow      # no pack rule: the push reaches the bare remote
-#   demo.sh nopack     # the push forbid stays but box.toml installs no pack: the box refuses to start
-#   demo.sh unmodeled  # forbid Tool::git::Action::"unmodeled": `git log -1` (the -<n> form) is refused
-#   demo.sh symlink    # the box shell refuses `ln -s /usr/bin/git`, because the target is outside its
-#                      # binds. A link a leaf could plant (demo.sh plants bin/g) is the git file under a
-#                      # name no [tool] declares, so it decides as unmodeled and is refused
-#   demo.sh baseline   # no pack and no pack rule: every command decides as it does without packs
+# A git the pack binds is decided only by its Tool::git action, so every pack mode needs a permit on
+# Tool::git actions. Each mode below except unmodeled and symlink permits Tool::git::Action::"*".
+#
+#   demo.sh force         # no_force_push: every force spelling is refused; -n -f and a plain push run
+#   demo.sh upstream      # a forbid on remote == "upstream": pushes to upstream are refused
+#   demo.sh forbid        # forbid Tool::git::Action::"push": status runs, push is refused
+#   demo.sh allow         # permit "*" and no forbid: the push reaches the bare remote
+#   demo.sh nopack        # the push forbid stays but box.toml installs no pack: the box refuses to start
+#   demo.sh unmodeled     # permit only status, log, and push: `git log -1` (the -<n> form) and the
+#                         # config alias `git ci` decide as unmodeled, and no permit names them, so
+#                         # both are refused with no forbid rule
+#   demo.sh unmodeled-all # the same commands under a permit on "*", which includes unmodeled: all run
+#   demo.sh symlink       # the box shell refuses `ln -s /usr/bin/git`, because the target is outside
+#                         # its binds. A link a leaf could plant (demo.sh plants bin/g) is the git file
+#                         # under a name no [tool] declares, so it decides as unmodeled, and only status
+#                         # is permitted, so it is refused
+#   demo.sh baseline      # no pack and no pack rule: git decides as shell:spawn, as it does without packs
 #
 # BOX names the strands-box binary (default: target/release/strands-box beside this repo).
 # DEMO names the scratch directory (default: /tmp/packs-demo-git). Both are recreated per run.
@@ -41,13 +48,20 @@ git remote add origin "$DEMO/work/remote.git"
 git remote add upstream "$DEMO/work/upstream.git"
 git push -q -u origin main
 $G commit -q --allow-empty -m "second commit"
+# A config alias the pack cannot see through, so `git ci` decides as unmodeled.
+git config alias.ci "commit --allow-empty -m alias"
+git config user.name demo && git config user.email demo@example.com
 # A link a tool leaf with a write grant on the workspace could make; the box shell cannot.
 [ "$MODE" = symlink ] && mkdir bin && ln -s /usr/bin/git bin/g
 cd "$DEMO" || exit 1
 
+ALL='@id("all_git")
+permit (principal, action in Tool::git::Action::"*", resource);
+
+'
 case "$MODE" in
   force)
-    RULES='@id("no_force_push")
+    RULES=$ALL'@id("no_force_push")
 @description("Force pushes are not allowed.")
 forbid (principal, action == Tool::git::Action::"push", resource)
 when { context.input.effects.contains(Tool::git::Effect::"force_push") };'
@@ -60,7 +74,7 @@ run "cd .. && git -C repo push -f origin main"
 run "git push -n -f origin main"
 run "git push"' ;;
   upstream)
-    RULES='@id("no_upstream")
+    RULES=$ALL'@id("no_upstream")
 @description("Nothing is pushed to upstream.")
 forbid (principal, action == Tool::git::Action::"push", resource)
 when { context.input has remote && context.input.remote == "upstream" };'
@@ -68,33 +82,35 @@ when { context.input has remote && context.input.remote == "upstream" };'
 run "cd .. && git -C repo push upstream"
 run "git push origin main"' ;;
   forbid|nopack)
-    RULES='@id("no_push")
+    RULES=$ALL'@id("no_push")
 @description("Pushes are not allowed in this box.")
 forbid (principal, action == Tool::git::Action::"push", resource);'
     SCRIPT='run "git status --short --branch"
 run "git push origin main"' ;;
-  unmodeled)
-    RULES='@id("no_unmodeled_git")
-forbid (principal, action == Tool::git::Action::"unmodeled", resource);'
+  unmodeled|unmodeled-all)
+    RULES='@id("some_git")
+permit (principal, action in [Tool::git::Action::"status", Tool::git::Action::"log", Tool::git::Action::"push"], resource);'
+    [ "$MODE" = unmodeled-all ] && RULES=$ALL
     SCRIPT='run "git status --short --branch"
+run "git log -n 1 --oneline"
 run "git log -1 --oneline"
-run "git log -n 1 --oneline"' ;;
+run "git ci"' ;;
   symlink)
-    RULES='@id("spawn_git_file")
-permit (principal, action == Box::Action::"shell:spawn", resource)
-when { context.input.program_path == "/usr/bin/git" };
+    RULES='@id("git_status")
+permit (principal, action == Tool::git::Action::"status", resource);
 
 @id("link_in_workspace")
 permit (principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
-when { context.input.path like "*packs-demo-git/work/repo/*g" || context.input.path == "/usr/bin/git" };
-
-@id("no_unmodeled_git")
-forbid (principal, action == Tool::git::Action::"unmodeled", resource);'
+when { context.input.path like "*packs-demo-git/work/repo/*g" || context.input.path == "/usr/bin/git" };'
     SCRIPT='run "ln -s /usr/bin/git g"
 run "git status --short --branch"
 run "./bin/g status --short --branch"
 run "$PWD/bin/g status --short --branch"' ;;
-  allow|baseline)
+  allow)
+    RULES=$ALL
+    SCRIPT='run "git status --short --branch"
+run "git push origin main"' ;;
+  baseline)
     RULES=''
     SCRIPT='run "git status --short --branch"
 run "git push origin main"' ;;

@@ -1,4 +1,5 @@
-// The Strands Shell may run its builtins, and may start git.
+// The Strands Shell may run its builtins. spawn_git starts git only when no pack binds it (the
+// nopack and baseline modes): a git the pack binds is decided only by its Tool::git action.
 @id("shell_builtins")
 permit (principal, action == Box::Action::"shell:exec", resource);
 

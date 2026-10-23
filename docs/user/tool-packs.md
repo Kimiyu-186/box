@@ -40,16 +40,26 @@ When Box starts, it does three things with each pack:
    `program` name, and remembers the real file it resolves to. If no `[tool]` runs that program,
    Box refuses to start, because the pack's rules would never apply.
 
-When the agent runs a command, Box first decides `shell:spawn` as it always does. If that permits
-the command and the program is bound to a pack, Box parses the command line with the pack's grammar
-and decides the resulting action too. A pack action can only add a denial. It can never permit
-something that `shell:spawn` denied.
+When the agent runs a command, Box makes one decision about it. If the program is bound to a pack,
+Box parses the command line with the pack's grammar and decides only the resulting
+`Tool::<pack>::Action::"<action>"`. Every other program is decided by `shell:spawn`, as before. A
+`shell:spawn` rule does not apply to a program a pack binds.
 
-A command line the grammar cannot read becomes `Tool::<pack>::Action::"unmodeled"`. Nothing denies
-it unless you write a rule that does:
+A pack action is an action like any other. It needs a permit, and with no permit it is denied. A
+forbid still wins over a permit. `Tool::<pack>::Action::"*"` is a group that holds every action of
+the pack, `unmodeled` included, so this one rule lets the agent run any git command:
 
 ```dw
-forbid (principal, action == Tool::git::Action::"unmodeled", resource);
+permit (principal, action in Tool::git::Action::"*", resource);
+```
+
+A command line the grammar cannot read becomes `Tool::<pack>::Action::"unmodeled"`. So does the
+bound file run under a name that no `[tool]` declares, such as a link to it. It is denied unless a
+permit covers it. To allow only the commands the pack models, permit them by name and leave
+`unmodeled` out:
+
+```dw
+permit (principal, action in [Tool::git::Action::"status", Tool::git::Action::"log"], resource);
 ```
 
 ## The file, annotated
@@ -223,7 +233,7 @@ The grammar never guesses. Any of these makes the whole command `unmodeled`:
 - `--` before the command words.
 
 This is why an out-of-date pack fails toward `unmodeled`. It does not report a dangerous command as a
-safe one.
+safe one, and `unmodeled` runs only when a permit covers it.
 
 ## Check a pack by hand
 

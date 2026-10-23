@@ -1,10 +1,11 @@
-// The Strands Shell may run its builtins, and may start cargo and rustc.
+// The Strands Shell may run its builtins. The pack binds cargo, so cargo is decided only by its
+// Tool::cargo action. rustc is the same file under a name the pack does not bind, so shell:spawn
+// decides it.
 @id("shell_builtins")
 permit (principal, action == Box::Action::"shell:exec", resource);
 
-@id("spawn_cargo")
-permit (principal, action == Box::Action::"shell:spawn", resource)
-when { context.input.program == "cargo" };
+@id("all_cargo")
+permit (principal, action in Tool::cargo::Action::"*", resource);
 
 @id("spawn_rustc")
 permit (principal, action == Box::Action::"shell:spawn", resource)
