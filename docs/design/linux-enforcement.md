@@ -111,9 +111,9 @@ It does not resolve pathnames or replace filesystem grants.
 The filters refuse operations outside their permit set.
 
 The filter rejects simultaneous writable and executable memory mappings.
-It also refuses `mprotect` and `pkey_mprotect` requests whose requested permissions include executable access.
-These system calls change memory access permissions.
-The restriction includes requests that retain executable access.
+The `mprotect` and `pkey_mprotect` system calls change memory access permissions.
+The filter refuses `mprotect` requests whose permissions include executable access, including requests that retain that access.
+It refuses every `pkey_mprotect` request.
 A runtime that compiles code during execution can fail under these restrictions.
 Tool execution from writable files does not remove these memory restrictions.
 
@@ -133,7 +133,7 @@ Filesystem and process restrictions still apply.
 The agent refuses a network table.
 
 This exception does not enable every socket family.
-The Linux filter permits UNIX and IPv4 sockets but refuses IPv6 sockets.
+The Linux filter permits UNIX and IPv4 sockets and refuses all other families, including IPv6.
 
 <a id="startup-failures-and-qualification"></a>
 
@@ -163,4 +163,4 @@ Minimum versions, minimum privileges, package installation, and testing the asse
 | Seccomp | A Linux mechanism that filters system calls. | Box uses static filters before workload execution. |
 | Shared library | Code that a program loads from a separate file. | The loader needs readable, executable access. |
 | `/proc` | A filesystem that exposes process and kernel information. | Box mounts it within the process namespace. |
-| `mprotect` and `pkey_mprotect` | System calls that change memory access permissions. | Box refuses requested permissions that include executable access, including retained access. |
+| `mprotect` and `pkey_mprotect` | System calls that change memory access permissions. | Box refuses executable access through `mprotect` and every `pkey_mprotect` request. |
