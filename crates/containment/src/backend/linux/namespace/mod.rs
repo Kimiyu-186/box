@@ -2282,14 +2282,17 @@ mod tests {
         );
     }
 
-    /// A refusal beneath a metadata-only directory establishes, and its contents stay out of reach.
+    /// Refused files and trees preserve their metadata-only ancestor's restrictions.
     #[test]
     fn a_refusal_beneath_a_metadata_only_directory_establishes() {
         if !the_host_can_build_a_view() {
             println!("skipping: this host cannot build a namespace mount view");
             return;
         }
-        let directory = tempfile::tempdir().expect("tempdir");
+        let directory = tempfile::Builder::new()
+            .prefix("metadata-refusal-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under the writable sandbox scaffold");
         let project = directory
             .path()
             .canonicalize()
@@ -2298,11 +2301,33 @@ mod tests {
         std::fs::create_dir_all(&refused).expect("the refused tree");
         let secret = refused.join("record");
         std::fs::write(&secret, b"record").expect("write the refused file");
+        let refused_file = project.join("files/record");
+        let refused_root_file = project.join("files/nested/record");
+        std::fs::create_dir_all(refused_root_file.parent().unwrap()).expect("refused file parents");
+        std::fs::write(&refused_file, b"file record").expect("refused file");
+        std::fs::write(&refused_root_file, b"root file record").expect("root-scoped refused file");
+        let opened = std::fs::File::open(&refused_file).expect("open protected refusal");
+        let sibling = project.join("planted");
+        let nested_sibling = project.join("box/planted");
+        let scratch = std::path::Path::new("/tmp").join(format!(
+            "{}-scratch",
+            project.file_name().unwrap().to_string_lossy()
+        ));
         let config = ContainmentConfig::new()
             .allow(&project, Operation::Metadata, Scope::Dir)
             .expect("metadata grant")
+            .protect_write(&refused_file, &opened)
+            .expect("write protection also covered by the refusal")
             .refuse(&refused, Scope::Root)
-            .expect("the refusal");
+            .expect("the refused tree")
+            .refuse(&secret, Scope::File)
+            .expect("the covered refusal")
+            .refuse(&refused_file, Scope::File)
+            .expect("the refused file")
+            .refuse(&refused_file, Scope::File)
+            .expect("the repeated file refusal")
+            .refuse(&refused_root_file, Scope::Root)
+            .expect("the root-scoped refused file");
 
         // SAFETY: the child applies containment and exits; it never returns into
         // test-harness code.
@@ -2319,6 +2344,24 @@ mod tests {
                 22
             } else if std::fs::write(refused.join("planted"), b"planted").is_ok() {
                 23
+            } else if !std::fs::write(&sibling, b"planted")
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EROFS))
+            {
+                24
+            } else if !std::fs::write(&nested_sibling, b"planted")
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EROFS))
+            {
+                25
+            } else if std::fs::write(&scratch, b"scratch").is_err()
+                || std::fs::read(&scratch).ok().as_deref() != Some(b"scratch")
+            {
+                26
+            } else if [&refused_file, &refused_root_file].iter().any(|path| {
+                std::fs::read(path).ok().as_deref() != Some(b"")
+                    || !std::fs::write(path, b"changed")
+                        .is_err_and(|error| error.raw_os_error() == Some(libc::EROFS))
+            }) {
+                27
             } else {
                 0
             };
@@ -2333,9 +2376,20 @@ mod tests {
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,
-            "20=apply failed, 22=REFUSED FILE READABLE, 23=REFUSED TREE WRITABLE"
+            "20=apply failed, 22=REFUSED FILE READABLE, 23=REFUSED TREE WRITABLE, \
+             24=metadata parent not read-only, 25=nested parent not read-only, \
+             26=unrelated sandbox scratch unavailable, 27=refused file not empty and read-only"
         );
         assert!(!refused.join("planted").exists());
+        assert!(!sibling.exists());
+        assert!(!nested_sibling.exists());
+        assert!(!scratch.exists());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"record");
+        assert_eq!(std::fs::read(&refused_file).unwrap(), b"file record");
+        assert_eq!(
+            std::fs::read(&refused_root_file).unwrap(),
+            b"root file record"
+        );
     }
 
     /// The macOS discovery and runtime-service fields leave Linux mounts and filters unchanged.
