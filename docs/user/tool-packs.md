@@ -222,6 +222,7 @@ Each action gets its own input type, generated from its table:
 | `cwd` | `String` | The working directory |
 | `args` | `Set<String>` | Every word after the program |
 | `effects` | `Set<Effect>` | The effects, as worked out above |
+| `credential_reads` | `Set<String>`, optional | Each credential store the matching `[tool.<name>.filesystem]` lists name, such as `~/.aws`, as on `shell:spawn` |
 | a switch | `Bool` | `true` when present |
 | an option with `value = "many"` or `repeated = true` | `Set<String>` | Every value given |
 | any other option | `String`, optional | The value given |
@@ -246,7 +247,8 @@ when { context.input.effects.contains(Tool::cargo::Effect::"update_lockfile") };
 ```
 
 After each action runs, Box records `Tool::<pack>::Action::"<action>"::response` with the exit
-status in `output.status`, so a temporal rule can require that an earlier command succeeded:
+status in `output.status`, so a temporal rule can require that an earlier command succeeded. A
+program a pack binds is recorded in history under its pack action only, and not as `shell:spawn`:
 
 ```dw
 forbid (principal, action == Tool::git::Action::"push", resource)

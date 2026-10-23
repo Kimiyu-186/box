@@ -33,7 +33,14 @@ pub(crate) enum Parsed {
 }
 
 /// The input field names every pack action carries.
-pub(crate) const BASE_FIELDS: [&str; 5] = ["program", "program_path", "cwd", "args", "effects"];
+pub(crate) const BASE_FIELDS: [&str; 6] = [
+    "program",
+    "program_path",
+    "cwd",
+    "args",
+    "effects",
+    "credential_reads",
+];
 
 #[derive(Debug, Clone, Default)]
 struct EffectRules {

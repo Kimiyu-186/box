@@ -210,7 +210,7 @@ impl Pack {
             let _ = writeln!(schema, "  entity Effect enum [{values}];");
         }
         let base = "program: String, program_path: String, cwd: String, args: Set<String>, \
-                    effects: Set<Effect>";
+                    effects: Set<Effect>, credential_reads?: Set<String>";
         let _ = writeln!(schema, "  type Output = {{ status: Long }};");
         let _ = writeln!(schema, "  action {ALL_ACTIONS:?};");
         let typed = self.grammar.action_fields();
@@ -244,6 +244,7 @@ pub(crate) struct PackInvocation<'a> {
     pub(crate) program_path: &'a str,
     pub(crate) args: &'a [String],
     pub(crate) cwd: &'a str,
+    pub(crate) credential_reads: &'a [String],
 }
 
 impl PackInvocation<'_> {
@@ -276,6 +277,14 @@ impl PackInvocation<'_> {
                 .map(|effect| serde_json::json!({ "__entity": { "type": effect_type, "id": effect } }))
                 .collect::<Vec<_>>(),
         });
+        if !self.credential_reads.is_empty()
+            && let Some(object) = input.as_object_mut()
+        {
+            object.insert(
+                crate::schema::attr::CREDENTIAL_READS.to_string(),
+                serde_json::json!(self.credential_reads),
+            );
+        }
         if let (Some(fields), Some(object)) = (fields, input.as_object_mut()) {
             for (name, value) in fields {
                 object.insert(name.clone(), field_json(value));

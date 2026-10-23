@@ -288,6 +288,7 @@ impl EffectInterceptor for ShellPolicyInterceptor {
                     program_path: reported_program_path.as_deref().unwrap_or(program_path),
                     args,
                     cwd,
+                    credential_reads,
                 };
                 let decision =
                     self.policy
@@ -462,7 +463,7 @@ enum Admitted {
         credential_reads: Vec<String>,
         args: Vec<String>,
         cwd: String,
-        /// The pack action this spawn also completes, if a pack binds its program.
+        /// The pack action this spawn completes in place of `shell:spawn`, if a pack binds its program.
         pack: Option<crate::pack::PackResponse>,
     },
     /// One filesystem effect. A two-path operation is recorded against its *target* —
@@ -622,34 +623,31 @@ impl PolicyEffectPermit {
                 },
             ),
             Admitted::Spawn {
+                pack: Some(pack), ..
+            } => self
+                .policy
+                .record_pack_response(pack, reported_status.unwrap_or(-1)),
+            Admitted::Spawn {
                 command,
                 program,
                 program_path,
                 credential_reads,
                 args,
                 cwd,
-                pack,
-            } => self
-                .policy
-                .record(
-                    &self.governed,
-                    &self.principal,
-                    &Outcome::ShellSpawn {
-                        command,
-                        program,
-                        program_path,
-                        credential_reads,
-                        args,
-                        cwd,
-                        status: reported_status.unwrap_or(-1),
-                    },
-                )
-                .and_then(|()| match pack {
-                    Some(pack) => self
-                        .policy
-                        .record_pack_response(pack, reported_status.unwrap_or(-1)),
-                    None => Ok(()),
-                }),
+                pack: None,
+            } => self.policy.record(
+                &self.governed,
+                &self.principal,
+                &Outcome::ShellSpawn {
+                    command,
+                    program,
+                    program_path,
+                    credential_reads,
+                    args,
+                    cwd,
+                    status: reported_status.unwrap_or(-1),
+                },
+            ),
             // **The REPORTED spelling, so both events agree.** The request event carries
             // `~/<relative>` and the resolution event is built from this one — and the engine keeps
             // them in two separate bags, so a value written to one and not the other leaves a
