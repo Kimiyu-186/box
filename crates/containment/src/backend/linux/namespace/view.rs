@@ -423,10 +423,30 @@ impl MountView {
             }
         }
 
-        protected_parents.retain(|parent| {
-            !entries.iter().any(|entry| {
-                entry.origin == MountOrigin::Refusal && parent.starts_with(&entry.target)
+        // A fresh grant hides every descendant. Extra denial or protection mountpoints would
+        // reveal names beneath a metadata-only grant; the empty filesystem already denies access.
+        let empty_roots: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.origin == MountOrigin::Grant
+                    && entry.kind == MountKind::Fresh { fstype: "tmpfs" }
+                    && !entry.writable
             })
+            .map(|entry| entry.target.clone())
+            .collect();
+        entries.retain(|entry| {
+            !matches!(
+                entry.origin,
+                MountOrigin::Refusal | MountOrigin::Protection { .. }
+            ) || !empty_roots
+                .iter()
+                .any(|root| entry.target != *root && entry.target.starts_with(root))
+        });
+        protected_parents.retain(|parent| {
+            !empty_roots.iter().any(|root| parent.starts_with(root))
+                && !entries.iter().any(|entry| {
+                    entry.origin == MountOrigin::Refusal && parent.starts_with(&entry.target)
+                })
         });
 
         Ok(Self {
@@ -556,17 +576,6 @@ impl MountView {
             MountKind::Fresh { fstype } => {
                 std::fs::create_dir_all(&target)
                     .map_err(|e| refusal(format!("creating '{}': {e}", target.display())))?;
-                let refused_descendants: Vec<_> = self
-                    .entries
-                    .iter()
-                    .filter(|candidate| {
-                        entry.origin == MountOrigin::Grant
-                            && !entry.writable
-                            && candidate.origin == MountOrigin::Refusal
-                            && candidate.target != entry.target
-                            && candidate.target.starts_with(&entry.target)
-                    })
-                    .collect();
                 // `nosuid` and `nodev` on every fresh filesystem: a setuid bit or a device node the
                 // workload created would be authority the plan never granted.
                 let mut fresh_flags = if fstype == "proc" {
@@ -577,7 +586,7 @@ impl MountView {
                 // **`writable` was ignored here until 2026-08-19, and every fresh mount was
                 // writable.** That was harmless while the only fresh mounts were ones meant to be
                 // writable — the root while the launcher builds it, `/proc`, and `/tmp`.
-                if !entry.writable && refused_descendants.is_empty() {
+                if !entry.writable {
                     fresh_flags |= libc::MS_RDONLY;
                 }
                 mount_syscall(
@@ -593,51 +602,6 @@ impl MountView {
                         target.display()
                     ))
                 })?;
-                if !refused_descendants.is_empty() {
-                    let mut prepared = BTreeSet::new();
-                    for refused in refused_descendants {
-                        if !prepared.insert(&refused.target) {
-                            continue;
-                        }
-                        let relative = refused.target.strip_prefix(&entry.target).unwrap();
-                        if relative
-                            .components()
-                            .any(|component| matches!(component, std::path::Component::ParentDir))
-                        {
-                            return Err(refusal(format!(
-                                "refusal mountpoint '{}' contains a '..' component",
-                                refused.target.display()
-                            )));
-                        }
-                        let mountpoint = target.join(relative);
-                        match refused.kind {
-                            MountKind::Fresh { .. } => std::fs::create_dir_all(&mountpoint),
-                            MountKind::EmptyFile => mountpoint
-                                .parent()
-                                .map_or(Ok(()), std::fs::create_dir_all)
-                                .and_then(|()| {
-                                    std::fs::OpenOptions::new()
-                                        .create_new(true)
-                                        .write(true)
-                                        .open(&mountpoint)
-                                        .map(|_| ())
-                                }),
-                            MountKind::Bind => {
-                                return Err(refusal(format!(
-                                    "refusal mountpoint '{}' cannot bind host contents",
-                                    refused.target.display()
-                                )));
-                            }
-                        }
-                        .map_err(|error| {
-                            refusal(format!(
-                                "preparing refusal mountpoint '{}': {error}",
-                                mountpoint.display()
-                            ))
-                        })?;
-                    }
-                    remount_protected(&target)?;
-                }
             }
             MountKind::EmptyFile => {
                 let source = root.join(EMPTY_FILE_NAME);
@@ -2283,7 +2247,7 @@ mod tests {
         assert!(!entry.writable);
     }
 
-    /// A refusal preserves the metadata-only ancestor's read-only filesystem.
+    /// A refusal leaves its metadata-only ancestor empty and read-only.
     #[test]
     fn a_refusal_keeps_its_metadata_only_ancestor_read_only() {
         let ancestor = tempfile::tempdir().expect("ancestor");
@@ -2300,9 +2264,12 @@ mod tests {
         assert_eq!(parent.origin, MountOrigin::Grant);
         assert_eq!(parent.kind, MountKind::Fresh { fstype: "tmpfs" });
         assert!(!parent.writable);
-        let entry = entry_for(&entries, &refused);
-        assert_eq!(entry.origin, MountOrigin::Refusal);
-        assert!(!entry.writable);
+        assert!(
+            entries.iter().all(|entry| {
+                entry.target == ancestor.path() || !entry.target.starts_with(ancestor.path())
+            }),
+            "a descendant mountpoint would expose names below the metadata grant: {entries:?}"
+        );
     }
 
     /// A read-write grant is writable — the box's home depends on this.
