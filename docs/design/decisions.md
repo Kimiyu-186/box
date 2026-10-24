@@ -68,6 +68,16 @@ constrains what the program does.
 
 ## The box
 
+<a id="linux-evaluation-requires-explicit-consent"></a>
+### Linux evaluation requires explicit consent
+
+Linux evaluation requires the operator to set `EXPERIMENTAL_LINUX_SUPPORT=TRUE` before using the command line or library.
+Help and version checks remain available without consent.
+Linux archives belong to `-linux-preview.N` prereleases; stable releases continue to distribute macOS alone.
+A stable Linux download would imply readiness that the current qualification does not establish, so it is excluded.
+Operators and test automation must opt in, and the flag does not grant filesystem access or establish security acceptance.
+Removing these controls requires a later readiness decision.
+
 <a id="native-filesystem-policy-requires-explicit-selection"></a>
 ### Native filesystem policy requires explicit selection
 
