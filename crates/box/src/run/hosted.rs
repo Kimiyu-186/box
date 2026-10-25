@@ -88,7 +88,8 @@ pub(crate) struct SelectedTool {
 /// caller's `exec` entries.
 ///
 /// The prefix is compared expanded, because the translator runs the expanded arguments. Among
-/// prefixes of one length, a command with the file name of `called` wins.
+/// prefixes of one length, a command with the file name of `called` wins. `called` is the path the
+/// caller used, and `program` is the file it resolves to.
 pub(crate) fn select_tool(
     record: &Record,
     attachment: &Attachment,
