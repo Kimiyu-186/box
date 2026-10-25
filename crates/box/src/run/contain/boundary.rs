@@ -53,6 +53,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) egress: EgressMode,
     /// The filesystem reach the run judged for this table, or `None` to judge the lists now.
     pub(crate) approved: Option<&'a DirectReach>,
+    /// PROTOTYPE(content-inspection): whether this leaf reaches the GPU.
+    pub(crate) gpu: bool,
 }
 
 /// The filesystem reach of `[agent]`, every `[tool.<name>]`, and every local `[mcp.<name>]`,
@@ -406,6 +408,10 @@ impl Boundary {
         if launch.runtime_reach == RuntimeReach::Leaf {
             containment = containment.allow_runtime_services();
         }
+        // PROTOTYPE(content-inspection): an opted-in leaf reaches the GPU.
+        if launch.gpu && launch.runtime_reach == RuntimeReach::Leaf {
+            containment = containment.allow_gpu();
+        }
         // A judged reach is acted on only while every granted path keeps the identity it was judged
         // with; an MCP server's table is judged here.
         let judged;
@@ -659,6 +665,7 @@ impl Boundary {
             command_listed,
             broad_exec,
             native_egress: launch.egress == EgressMode::Native,
+            gpu: launch.gpu && launch.runtime_reach == RuntimeReach::Leaf,
             native_filesystem_policy: spec
                 .native_filesystem_policy
                 .unwrap_or(stored.experimental_features.native_filesystem_policy),
@@ -790,6 +797,7 @@ struct DisclosureInputs<'a> {
     command_listed: bool,
     broad_exec: bool,
     native_egress: bool,
+    gpu: bool,
     native_filesystem_policy: bool,
 }
 
@@ -848,6 +856,18 @@ fn disclosure(inputs: &DisclosureInputs<'_>) -> String {
             "strands-box: {table} native egress: connects to the network directly{arguments} with \
              no egress gateway, no net:connect or http:request decision, and no credential injection"
         ));
+    }
+    // PROTOTYPE(content-inspection): disclose the GPU grant.
+    if inputs.gpu {
+        if cfg!(target_os = "macos") {
+            lines.push(format!(
+                "strands-box: {table} gpu  Metal (AGX, IOSurface, MTLCompilerService)"
+            ));
+        } else {
+            lines.push(format!(
+                "strands-box: {table} gpu: not implemented on Linux in this prototype"
+            ));
+        }
     }
     lines.push(format!(
         "strands-box: {table} HOME={} PATH={}",
@@ -1466,6 +1486,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &self.attachment,
@@ -1500,6 +1521,7 @@ mod tests {
                         argument_zero: None,
                         egress,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &self.attachment,
@@ -1553,6 +1575,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &self.attachment,
@@ -1636,6 +1659,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -1693,6 +1717,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: approved.table("[tool.t]"),
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -1782,6 +1807,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: approved.table("[tool.t]"),
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -1857,6 +1883,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: approved.table("[tool.t]"),
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -2390,6 +2417,7 @@ mod tests {
                     argument_zero: Some(&spelled),
                     egress: EgressMode::Gateway,
                     approved: None,
+                    gpu: false,
                 },
                 &Site {
                     attachment: &fixture.attachment,
@@ -3097,6 +3125,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -3319,6 +3348,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &example.fixture.attachment,
@@ -3363,6 +3393,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,
@@ -3409,6 +3440,7 @@ mod tests {
                         argument_zero: None,
                         egress: EgressMode::Gateway,
                         approved: None,
+                        gpu: false,
                     },
                     &Site {
                         attachment: &fixture.attachment,

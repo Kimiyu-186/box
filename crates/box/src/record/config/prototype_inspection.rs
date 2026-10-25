@@ -37,6 +37,9 @@ pub(crate) struct ContentInspection {
     /// Mode B: what the leaf's own syscalls reach.
     #[serde(default, skip_serializing_if = "Filesystem::is_empty")]
     pub(crate) filesystem: Filesystem,
+    /// Mode B: whether the leaf reaches the GPU (Metal on macOS).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) gpu: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -66,6 +69,9 @@ impl InspectionConfig {
                     .validate("[inspection.content]")?;
             }
             _ => {}
+        }
+        if content.gpu && content.command.is_none() {
+            return Err(refuse("`gpu` applies only with `command`"));
         }
         if content.timeout_ms == 0 {
             return Err(refuse("`timeout_ms` must be positive"));

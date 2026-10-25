@@ -277,6 +277,7 @@ fn tool_spawner(
                     argument_zero: Some(&spawn.invoked),
                     egress: EgressMode::for_spec(&selected.spec),
                     approved: Some(reach),
+                    gpu: false,
                 },
                 &site,
             )
@@ -419,6 +420,7 @@ impl McpLeafLauncher {
                 runtime_reach: RuntimeReach::Leaf,
                 egress,
                 approved: Some(reach),
+                gpu: false,
             },
             &site,
         )
@@ -435,6 +437,7 @@ impl McpLeafLauncher {
             &self.layout,
             #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))]
             self.registration.clone(),
+            false,
         )
         .await
     }
@@ -779,7 +782,9 @@ impl HostedBox {
     }
 
     // PROTOTYPE(content-inspection): the content inspector, when the record declares one.
-    pub(crate) fn inspector(&self) -> Option<&Arc<super::prototype_inspection::PrototypeInspector>> {
+    pub(crate) fn inspector(
+        &self,
+    ) -> Option<&Arc<super::prototype_inspection::PrototypeInspector>> {
         self.inspector.as_ref()
     }
 
@@ -1442,6 +1447,7 @@ while :; do :; done"#
                     argument_zero: None,
                     egress: EgressMode::Gateway,
                     approved: None,
+                    gpu: false,
                 },
                 &Site {
                     attachment: hosted.attachment(),
@@ -1537,6 +1543,7 @@ while :; do :; done"#
                     argument_zero: None,
                     egress: EgressMode::Gateway,
                     approved: None,
+                    gpu: false,
                 },
                 &Site {
                     attachment: hosted.attachment(),

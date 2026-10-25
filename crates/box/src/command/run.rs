@@ -188,6 +188,7 @@ async fn hosted(
                 argument_zero: None,
                 egress: EgressMode::for_spec(spec),
                 approved: hosted.approved().table(&table),
+                gpu: false,
             },
             &site,
         )?;
@@ -209,7 +210,11 @@ async fn hosted(
     // PROTOTYPE(content-inspection): start the inspector leaf once, before the agent, in mode B.
     if let (Some(inspector), Some(spec)) = (
         hosted.inspector(),
-        locked.record.inspection.as_ref().and_then(|i| i.leaf_spec()),
+        locked
+            .record
+            .inspection
+            .as_ref()
+            .and_then(|i| i.leaf_spec()),
     ) {
         let table = "[inspection.content]";
         let boundary = Boundary::translate(
@@ -223,6 +228,12 @@ async fn hosted(
                 argument_zero: None,
                 egress: EgressMode::for_spec(&spec),
                 approved: hosted.approved().table(table),
+                // PROTOTYPE(content-inspection): `[inspection.content] gpu`.
+                gpu: locked
+                    .record
+                    .inspection
+                    .as_ref()
+                    .is_some_and(|inspection| inspection.content.gpu),
             },
             &site,
         )?;
@@ -232,6 +243,7 @@ async fn hosted(
             &locked.root,
             #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))]
             hosted.native_registration(),
+            true,
         )
         .await?;
         let parts = leaf.into_parts().ok_or_else(|| ConfigError::Contract {
@@ -253,6 +265,7 @@ async fn hosted(
             argument_zero: None,
             egress: EgressMode::Gateway,
             approved: hosted.approved().table("[agent]"),
+            gpu: false,
         },
         &site,
     )?;

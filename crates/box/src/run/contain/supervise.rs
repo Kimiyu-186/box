@@ -775,6 +775,8 @@ impl LeafBox {
         #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))] registration: Option<
             crate::run::macos_enforcement::Registration,
         >,
+        // PROTOTYPE(content-inspection): copy the leaf's stderr to the box's own stderr.
+        forward_stderr: bool,
     ) -> Result<StreamingLeaf, BoxError> {
         // stderr is piped, not nulled: a containment setup failure must carry the trampoline's own
         // message as `detail`, the same reason the buffered `run` path reports. On success the
@@ -837,7 +839,11 @@ impl LeafBox {
         // the child exits — `kill_on_drop` closes the pipe, so the copy reaches EOF and returns.
         if let Some(mut stderr) = stderr {
             tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                if forward_stderr {
+                    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+                } else {
+                    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                }
             });
         }
 

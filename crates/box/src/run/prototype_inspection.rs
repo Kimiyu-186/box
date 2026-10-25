@@ -18,7 +18,11 @@ use crate::record::config::prototype_inspection::InspectionConfig;
 const REDACTED_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
 
 // PROTOTYPE(content-inspection): one queued stdio request and the channel its reply goes to.
-type Pending = (String, String, std::sync::mpsc::Sender<Result<String, String>>);
+type Pending = (
+    String,
+    String,
+    std::sync::mpsc::Sender<Result<String, String>>,
+);
 
 // PROTOTYPE(content-inspection): where requests go.
 enum Transport {
@@ -123,8 +127,8 @@ impl PrototypeInspector {
         match self.transport.get() {
             None => Err("the inspector is not started".to_string()),
             Some(Transport::Socket(path)) => {
-                let stream =
-                    UnixStream::connect(path).map_err(|e| format!("connect {}: {e}", path.display()))?;
+                let stream = UnixStream::connect(path)
+                    .map_err(|e| format!("connect {}: {e}", path.display()))?;
                 stream
                     .set_read_timeout(Some(self.timeout))
                     .and_then(|()| stream.set_write_timeout(Some(self.timeout)))

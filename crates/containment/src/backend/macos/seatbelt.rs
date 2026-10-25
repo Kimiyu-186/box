@@ -75,6 +75,13 @@ const IDENTITY_LOOKUP: &str = "{{IDENTITY_LOOKUP}}";
 /// Not a cell: the leaf-only additive overlay (broad exec). Empty for the agent box.
 const LEAF_OVERLAY: &str = "{{LEAF_OVERLAY}}";
 
+// PROTOTYPE(content-inspection): the Metal (AGX) rules for a GPU-granted leaf.
+const GPU_RULES: &str = "\
+(allow iokit-open-user-client (iokit-user-client-class \"AGXDeviceUserClient\" \"IOSurfaceRootUserClient\"))
+(allow sysctl-read (sysctl-name \"hw.memsize\"))
+(allow mach-lookup (xpc-service-name \"com.apple.MTLCompilerService\"))
+";
+
 /// The `mDNSResponder` socket that `getaddrinfo` connects to.
 const SYSTEM_RESOLVER: &str = "/private/var/run/mDNSResponder";
 
@@ -890,6 +897,10 @@ pub(crate) fn render_profile_with_streams(
             }
         }
         cells.entry(LEAF_OVERLAY).or_default().push_str(&overlay);
+    }
+    // PROTOTYPE(content-inspection): the Metal rules an opted-in leaf needs to reach the GPU.
+    if config.gpu() {
+        cells.entry(LEAF_OVERLAY).or_default().push_str(GPU_RULES);
     }
 
     let replacements: Vec<(&str, String)> = [

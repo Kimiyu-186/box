@@ -15,7 +15,8 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 REPO="$(cd "$HERE/../../.." && pwd -P)"
 BOX="$REPO/target/debug/strands-box"
 INSPECTOR_DIR="$REPO/.agents/pocs/content-inspector"
-WORK="$(mktemp -d /var/tmp/ci-e2e.XXXXXX)"
+# PROTOTYPE(content-inspection): canonical, because macOS reaches /var through a /private symlink.
+WORK="$(cd "$(mktemp -d /var/tmp/ci-e2e.XXXXXX)" && pwd -P)"
 SOCK="$WORK/inspector.sock"
 URL="https://httpbin.org/post"
 export EXPERIMENTAL_LINUX_SUPPORT=TRUE
@@ -47,6 +48,17 @@ else
   LEAF_PY_FLAGS=(-I -c "import sys, runpy, site; site.addsitedir('$SITE'); sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
   LEAF_ENV=""
   [ "$BACKEND" = decider ] && PY_READS+=("$(readlink -f "$HOME/.cache/huggingface")")
+  # PROTOTYPE(content-inspection): on macOS the leaf starts in the agent workspace, where getcwd()
+  # needs a read (torch calls os.path.abspath at import), and Homebrew python loads its dylibs
+  # (openssl, xz, zstd, mpdecimal) through /opt/homebrew/opt symlinks outside the interpreter prefix.
+  if [ "$(uname)" = Darwin ]; then
+    case "$PY_PREFIX" in /opt/homebrew/*) PY_READS=(/opt/homebrew/Cellar /opt/homebrew/opt "${PY_READS[@]:1}") ;; esac
+    PY_READS+=("$WORK/ws")
+    # The Linux leaf gets a fresh /tmp; a Seatbelt leaf needs its own writable TMPDIR (torch cache).
+    LEAF_TMP="$WORK/leaf-tmp"
+    LEAF_ENV=", TMPDIR = \"$LEAF_TMP\""
+    PY_READS+=("$LEAF_TMP")
+  fi
 fi
 
 (cd "$REPO" && cargo build -q -p strands-box -p strands-box-containment --all-features >/dev/null 2>&1) || { echo "cargo build failed"; exit 1; }
@@ -63,6 +75,8 @@ write_config() { # $1 = policy file, $2 = config path, $3 = state dir
     echo "command = [\"/usr/bin/curl\"]"
     echo "workspace = \"$WORK/ws\""
     echo "env = { PATH = \"/usr/bin:/bin\", HOME = \"$WORK/home\" }"
+    # PROTOTYPE(content-inspection): macOS curl (LibreSSL) opens openssl.cnf at startup.
+    [ "$(uname)" = Darwin ] && { echo "[agent.filesystem]"; echo "read_file = [\"/private/etc/ssl/openssl.cnf\"]"; }
     echo
     echo "[inspection.content]"
     echo "provider = \"local\""
@@ -72,8 +86,11 @@ write_config() { # $1 = policy file, $2 = config path, $3 = state dir
     else
       echo "command = $(toml_list "$LEAF_PY" "${LEAF_PY_FLAGS[@]}" "$SCRIPT" --stdio "${INSPECTOR_ARGS[@]}")"
       echo "env = { PATH = \"/usr/bin:/bin\", HF_HUB_OFFLINE = \"1\", HOME = \"$(readlink -f "$HOME")\"$LEAF_ENV }"
+      # PROTOTYPE(content-inspection): MPS needs the leaf's GPU grant; GPU=0 leaves it out.
+      [ "${DEVICE:-cpu}" = mps ] && [ "${GPU:-1}" = 1 ] && echo "gpu = true"
       echo "[inspection.content.filesystem]"
       echo "read = $(toml_list "${PY_READS[@]}" "$(dirname "$SCRIPT")")"
+      [ -n "${LEAF_TMP:-}" ] && echo "write = $(toml_list "$LEAF_TMP")"
     fi
   } > "$2"
 }
@@ -88,7 +105,7 @@ if [ "$MODE" = socket ]; then
 fi
 trap '[ -n "$INSPECTOR_PID" ] && kill "$INSPECTOR_PID" 2>/dev/null' EXIT
 
-mkdir -p "$WORK/home" "$WORK/ws"
+mkdir -p "$WORK/home" "$WORK/ws" ${LEAF_TMP:+"$LEAF_TMP"}
 run_case() { # $1 = name, $2 = policy, $3 = body, $4 = expected status
   local name="$1" state="$WORK/state-$1" config="$WORK/box-$1.toml" out
   write_config "$HERE/$2" "$config" "$state"

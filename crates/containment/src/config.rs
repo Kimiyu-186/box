@@ -54,6 +54,9 @@ pub struct ContainmentConfig {
     /// `(deny network*)` still stands and AF_INET/AF_UNIX are unaffected).
     #[serde(default)]
     runtime_services: bool,
+    // PROTOTYPE(content-inspection): whether a leaf reaches the GPU (Metal) on macOS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gpu: bool,
 }
 
 /// One credential-store floor exception, tied to its matching path grant.
@@ -92,6 +95,7 @@ impl ContainmentConfig {
             discovery_denies: Vec::new(),
             broad_exec: false,
             runtime_services: false,
+            gpu: false,
         }
     }
 
@@ -148,6 +152,18 @@ impl ContainmentConfig {
     pub fn allow_runtime_services(mut self) -> Self {
         self.runtime_services = true;
         self
+    }
+
+    /// PROTOTYPE(content-inspection): let a leaf reach the GPU through Metal. macOS renders it; Linux ignores it.
+    #[must_use]
+    pub fn allow_gpu(mut self) -> Self {
+        self.gpu = true;
+        self
+    }
+
+    // PROTOTYPE(content-inspection): whether the leaf renders the Metal rules.
+    pub(crate) fn gpu(&self) -> bool {
+        self.gpu
     }
 
     /// Whether the runtime-services grant was made.
