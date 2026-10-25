@@ -512,6 +512,9 @@ pub(crate) struct HostedBox {
     /// already available.
     _record: PublishedRecord,
 
+    // PROTOTYPE(content-inspection): the content inspector, when the record declares one.
+    inspector: Option<Arc<super::prototype_inspection::PrototypeInspector>>,
+
     /// The box lock. Dropped LAST, so no second run starts before teardown ends.
     _owned: Lock,
 }
@@ -605,7 +608,12 @@ impl HostedBox {
                         .map(|(_, name)| (name.clone(), McpServerKind::Http)),
                 ),
         ));
-        let egress_policy = EgressPolicyInterceptor::into_handle_with_discovery(
+        // PROTOTYPE(content-inspection): the inspector the egress gate consults.
+        let inspector = record
+            .inspection
+            .as_ref()
+            .map(super::prototype_inspection::PrototypeInspector::from_config);
+        let egress_policy = EgressPolicyInterceptor::into_handle_with_inspection(
             Arc::clone(&policy),
             Principal::agent(),
             GovernedBox::assigned(root.name()),
@@ -616,6 +624,9 @@ impl HostedBox {
                 let coordinator = Arc::clone(&coordinator);
                 Arc::new(move || coordinator.report_finished(DiscoveryDoor::Egress))
             },
+            inspector
+                .clone()
+                .map(|inspector| inspector as Arc<dyn policy::ContentInspector>),
         );
         let proxy = MitmInterceptor::start_with_emitter_and_opened_ca(
             MitmConfig {
@@ -749,6 +760,7 @@ impl HostedBox {
             attachment,
             approved,
             _record: published,
+            inspector,
             _owned: owned,
         })
     }
@@ -764,6 +776,11 @@ impl HostedBox {
             });
         }
         Self::prepare_policy(root, &policy::Operator::unanchored(), sources)
+    }
+
+    // PROTOTYPE(content-inspection): the content inspector, when the record declares one.
+    pub(crate) fn inspector(&self) -> Option<&Arc<super::prototype_inspection::PrototypeInspector>> {
+        self.inspector.as_ref()
     }
 
     /// What this run's boundary reads.
@@ -887,6 +904,7 @@ mod tests {
             mcp,
             contained_mcp: Default::default(),
             telemetry: Default::default(),
+            inspection: None,
         }
     }
 
@@ -1862,6 +1880,7 @@ while :; do :; done"#
             mcp: Vec::new(),
             contained_mcp: Default::default(),
             telemetry: Default::default(),
+            inspection: None,
         }
     }
 

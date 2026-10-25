@@ -57,6 +57,8 @@ pub struct PolicyEngine {
     authority: Authority,
     effective: EffectivePolicy,
     observer: Option<Arc<dyn crate::observe::DecisionObserver>>,
+    // PROTOTYPE(content-inspection): labels requested by the loaded policy.
+    inspection: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -84,11 +86,13 @@ impl PolicyEngine {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
+        let inspection = inspection_labels(&sources);
 
         Ok(Self {
             authority: Authority::open_complete(sources, mcp_schemas, history)?,
             effective,
             observer: None,
+            inspection: std::sync::Mutex::new(inspection),
         })
     }
 
@@ -102,10 +106,12 @@ impl PolicyEngine {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
+        let inspection = inspection_labels(&sources);
         Ok(Self {
             authority: Authority::open_staged(operator, sources, history)?,
             effective,
             observer: None,
+            inspection: std::sync::Mutex::new(inspection),
         })
     }
 
@@ -120,10 +126,12 @@ impl PolicyEngine {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
+        let inspection = inspection_labels(&sources);
         Ok(Self {
             authority: Authority::open_staged_file(operator, sources, history, label)?,
             effective,
             observer: None,
+            inspection: std::sync::Mutex::new(inspection),
         })
     }
 
@@ -138,10 +146,12 @@ impl PolicyEngine {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
+        let inspection = inspection_labels(&sources);
         Ok(Self {
             authority: Authority::open_with_faults(sources, history, faults)?,
             effective,
             observer: None,
+            inspection: std::sync::Mutex::new(inspection),
         })
     }
 
@@ -231,7 +241,12 @@ impl PolicyEngine {
     /// request: the contained agent must never reach a reload, and the only thing that keeps
     /// it out is where the trigger lives.
     pub fn reload(&self, sources: &[Policy]) -> Result<(), PolicyStagingError> {
-        self.authority.reload(sources)
+        self.authority.reload(sources)?;
+        // PROTOTYPE(content-inspection): follow the reloaded sources.
+        if let Ok(mut guard) = self.inspection.lock() {
+            *guard = inspection_labels(sources);
+        }
+        Ok(())
     }
 
     /// Decide whether `principal` may perform `request`.
@@ -251,6 +266,29 @@ impl PolicyEngine {
             .authority
             .decide(governed, principal, request, &identity);
         self.conclude(&identity, request, decision)
+    }
+
+    /// PROTOTYPE(content-inspection): decide with inspector labels visible to `Inspection::Content`.
+    #[must_use]
+    pub fn decide_with_inspection(
+        &self,
+        governed: &GovernedBox,
+        principal: &Principal,
+        request: &Request<'_>,
+        labels: &[String],
+    ) -> Decision {
+        crate::prototype_inspection::with_labels(labels, || {
+            self.decide(governed, principal, request)
+        })
+    }
+
+    /// PROTOTYPE(content-inspection): the labels the loaded policy asks the inspector about, if any.
+    #[must_use]
+    pub fn uses_inspection(&self) -> Option<std::collections::BTreeSet<String>> {
+        self.inspection
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Name the request's resource on the verdict, then report it once.
@@ -364,6 +402,12 @@ impl PolicyEngine {
 }
 
 /// The text the engine loads, shared by [`PolicyEngine::open`] and [`PolicyEngine::validate`].
+// PROTOTYPE(content-inspection): the `Inspection::Content` labels the sources request.
+fn inspection_labels(sources: &[Policy]) -> Option<std::collections::BTreeSet<String>> {
+    let service = crate::dogwood::service_schema().ok()?;
+    crate::prototype_inspection::requested_labels(&authored(sources), &service)
+}
+
 fn authored(sources: &[Policy]) -> String {
     sources
         .iter()
@@ -460,6 +504,7 @@ mod tests {
                 policy_id: effective_policy_id(&sources),
             },
             observer: None,
+            inspection: std::sync::Mutex::new(None),
         }
     }
 

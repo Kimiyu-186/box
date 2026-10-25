@@ -205,6 +205,12 @@ where
     // `req.target.path` *is* the secret. Every authorization and audit input below reads this value
     // instead, so an attempt or a durable record never carries credential material.
     let workload_path = req.target.path.clone();
+    // PROTOTYPE(content-inspection): the headers as the workload sent them, for content inspection.
+    let workload_headers: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
 
     match request_leg::evaluate_and_apply(&state.controls, &mut req, &cx) {
         RequestDecision::Block(reason) => {
@@ -341,6 +347,8 @@ where
         method: &request_method,
         path: &workload_path,
         body_bytes: forwarded_body.len(),
+        headers: &workload_headers,
+        body: &forwarded_body,
         intercepted,
         mcp: mcp_target.as_ref().map(|(server, target)| {
             let server = *server;

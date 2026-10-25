@@ -33,6 +33,8 @@ pub struct EgressPolicyInterceptor {
     /// Reports the egress door finished to the box's discovery coordinator
     /// (docs/design/decisions.md#the-box-coordinates-discovery-completion).
     on_remote_finished: Arc<dyn Fn() + Send + Sync>,
+    // PROTOTYPE(content-inspection): the content inspector, when the box configures one.
+    inspector: Option<Arc<dyn crate::ContentInspector>>,
 }
 
 impl EgressPolicyInterceptor {
@@ -63,6 +65,27 @@ impl EgressPolicyInterceptor {
         catalogs: Arc<ToolCatalogs>,
         on_remote_finished: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<dyn EgressEffectInterceptor> {
+        Self::into_handle_with_inspection(
+            policy,
+            principal,
+            governed,
+            remote_servers,
+            catalogs,
+            on_remote_finished,
+            None,
+        )
+    }
+
+    /// PROTOTYPE(content-inspection): [`Self::into_handle_with_discovery`] plus a content inspector.
+    pub fn into_handle_with_inspection(
+        policy: Arc<PolicyEngine>,
+        principal: Principal,
+        governed: GovernedBox,
+        remote_servers: Vec<(String, String)>,
+        catalogs: Arc<ToolCatalogs>,
+        on_remote_finished: Arc<dyn Fn() + Send + Sync>,
+        inspector: Option<Arc<dyn crate::ContentInspector>>,
+    ) -> Arc<dyn EgressEffectInterceptor> {
         let mcp_hosts: BTreeSet<String> = remote_servers
             .iter()
             .map(|(host, _)| host.clone())
@@ -74,7 +97,60 @@ impl EgressPolicyInterceptor {
             mcp_hosts,
             catalogs,
             on_remote_finished,
+            inspector,
         })
+    }
+
+    // PROTOTYPE(content-inspection): the inspector labels for one request, or the reason to deny it.
+    #[allow(clippy::too_many_arguments)]
+    fn inspect(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        intercepted: bool,
+    ) -> Result<Option<Vec<String>>, String> {
+        let Some(requested) = self.policy.uses_inspection() else {
+            return Ok(None);
+        };
+        let scheme = if intercepted { "https" } else { "http" };
+        let default_port = if intercepted { 443 } else { 80 };
+        let url = if port == default_port {
+            format!("{scheme}://{host}{path}")
+        } else {
+            format!("{scheme}://{host}:{port}{path}")
+        };
+        let Some(inspector) = &self.inspector else {
+            eprintln!("inspection: {method} {url} refused: the policy uses Inspection::Content and no inspector is configured");
+            return Err("content inspection: no inspector is configured".to_string());
+        };
+        if body.len() > crate::MAXIMUM_INSPECTED_BODY {
+            eprintln!("inspection: {method} {url} refused: body of {} bytes is over the limit", body.len());
+            return Err("content inspection: body is over the inspection limit".to_string());
+        }
+        let request = crate::InspectionRequest {
+            labels: requested.into_iter().collect(),
+            method,
+            url: url.clone(),
+            headers,
+            body,
+        };
+        match inspector.inspect(&request) {
+            Ok(verdict) => {
+                eprintln!(
+                    "inspection: {method} {url} labels={:?} backend={} latency={}ms",
+                    verdict.labels, verdict.backend, verdict.latency_ms
+                );
+                Ok(Some(verdict.labels))
+            }
+            Err(error) => {
+                eprintln!("inspection: {method} {url} refused: inspector failed: {error}");
+                Err(format!("content inspection failed: {error}"))
+            }
+        }
     }
 
     /// Refuse a call to a tracked server unless its accepted `tools/list` names `tool` exactly.
@@ -213,23 +289,39 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
                 method,
                 path,
                 body_bytes,
+                headers,
+                body,
                 intercepted,
                 mcp,
             } => {
+                // PROTOTYPE(content-inspection): classify outside the engine lock, before deciding.
+                let labels =
+                    match self.inspect(host, *port, method, path, headers, body, *intercepted) {
+                        Ok(labels) => labels,
+                        Err(reason) => {
+                            return Err(permission_denied(format!("http:request gate: {reason}")));
+                        }
+                    };
+                let request = Request::Http {
+                    host,
+                    port: *port,
+                    method,
+                    path,
+                    body_bytes: *body_bytes,
+                    intercepted: *intercepted,
+                };
                 // The `http:request` gate. `decide` records to history, so it is called exactly
                 // once here; the `mcp:call` gate below is the second recorded decision.
-                match self.policy.decide(
-                    &self.governed,
-                    &self.principal,
-                    &Request::Http {
-                        host,
-                        port: *port,
-                        method,
-                        path,
-                        body_bytes: *body_bytes,
-                        intercepted: *intercepted,
-                    },
-                ) {
+                let decided = match &labels {
+                    Some(labels) => self.policy.decide_with_inspection(
+                        &self.governed,
+                        &self.principal,
+                        &request,
+                        labels,
+                    ),
+                    None => self.policy.decide(&self.governed, &self.principal, &request),
+                };
+                match decided {
                     // Unreachable: an `Http` request never carries `PolicyPending`, so this arm never
                     // fires.
                     Decision::Deny {
@@ -747,6 +839,8 @@ mod tests {
             method: "POST",
             path: "/mcp",
             body_bytes: 32,
+            headers: &[],
+            body: &[],
             intercepted: false,
             mcp: Some(McpFrame::List { server, method }),
         }
@@ -764,6 +858,8 @@ mod tests {
             method: "POST",
             path: "/mcp",
             body_bytes: 64,
+            headers: &[],
+            body: &[],
             intercepted: false,
             mcp: Some(McpFrame::ToolCall {
                 server,
@@ -1376,6 +1472,8 @@ mod tests {
                 method: "POST",
                 path: "/v1/messages",
                 body_bytes: 42,
+                headers: &[],
+                body: &[],
                 intercepted: true,
                 mcp: None,
             })
@@ -1406,6 +1504,8 @@ mod tests {
             method: "GET",
             path: "/",
             body_bytes: 0,
+            headers: &[],
+            body: &[],
             intercepted: true,
             mcp: None,
         };
@@ -1497,6 +1597,8 @@ mod tests {
             method: "GET",
             path: "/",
             body_bytes: 0,
+            headers: &[],
+            body: &[],
             intercepted: true,
             mcp: None,
         };
@@ -1565,6 +1667,8 @@ mod tests {
             method: "GET",
             path: "/",
             body_bytes: 0,
+            headers: &[],
+            body: &[],
             intercepted: true,
             mcp: None,
         };
@@ -1655,6 +1759,8 @@ mod tests {
         );
 
         let request = |port, body_bytes| EgressEffectAttempt::HttpRequest {
+        headers: &[],
+        body: &[],
             host: "api.github.com",
             port,
             method: "POST",
@@ -1691,6 +1797,8 @@ mod tests {
             method: "POST",
             path: "/v1/messages",
             body_bytes: 0,
+            headers: &[],
+            body: &[],
             intercepted,
             mcp: None,
         };

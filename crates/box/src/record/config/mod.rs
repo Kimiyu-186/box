@@ -26,6 +26,8 @@ pub(crate) mod env;
 pub(crate) mod filesystem;
 pub(crate) mod mcp;
 pub(crate) mod process;
+// PROTOTYPE(content-inspection): `[inspection.content]`.
+pub(crate) mod prototype_inspection;
 pub(crate) mod telemetry;
 
 use std::collections::BTreeMap;
@@ -467,6 +469,7 @@ impl RunContract {
                 mcp: mcp_servers,
                 contained_mcp,
                 telemetry: telemetry::checked(&self.file.telemetry, root.root())?,
+                inspection: self.file.inspection.clone(),
             },
             policy,
             sources,
@@ -559,6 +562,10 @@ pub(crate) struct Record {
     /// The telemetry targets this box declares, verbatim.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) telemetry: BTreeMap<String, telemetry::TelemetryEntry>,
+
+    /// PROTOTYPE(content-inspection): the outbound content inspector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inspection: Option<prototype_inspection::InspectionConfig>,
 }
 
 /// The ordinary record format; native enforcement uses version 22. Version 21 adds `network` to each
@@ -1109,6 +1116,10 @@ struct ConfigFile {
     /// Where this box's decision records and its agent's own spans go.
     #[serde(default)]
     telemetry: BTreeMap<String, telemetry::TelemetryEntry>,
+
+    /// PROTOTYPE(content-inspection): the outbound content inspector.
+    #[serde(default)]
+    inspection: Option<prototype_inspection::InspectionConfig>,
 }
 
 impl ConfigFile {
@@ -1175,6 +1186,10 @@ impl ConfigFile {
                 &format!("[mcp.{name}]"),
                 self.experimental_features.native_filesystem_policy,
             )?;
+        }
+        // PROTOTYPE(content-inspection): validate `[inspection.content]`.
+        if let Some(inspection) = &self.inspection {
+            inspection.validate()?;
         }
         validate_egress(&self.egress)
     }
@@ -1279,6 +1294,7 @@ mod tests {
             mcp: Vec::new(),
             contained_mcp: BTreeMap::new(),
             telemetry: std::collections::BTreeMap::new(),
+            inspection: None,
         }
     }
 

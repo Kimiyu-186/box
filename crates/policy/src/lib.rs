@@ -14,6 +14,8 @@ mod observe;
 mod outcome;
 mod path;
 mod policy;
+// PROTOTYPE(content-inspection): the inspection provider.
+mod prototype_inspection;
 mod request;
 #[cfg(test)]
 mod rerun;
@@ -28,6 +30,10 @@ pub use adapters::script::{
 };
 #[cfg(feature = "shell-adapter")]
 pub use adapters::shell::ShellPolicyInterceptor;
+// PROTOTYPE(content-inspection): the inspector seam.
+pub use prototype_inspection::{
+    ContentInspector, InspectionRequest, InspectionVerdict, MAXIMUM_INSPECTED_BODY,
+};
 pub use catalog::{
     CatalogRefusal, CatalogStage, CompleteCatalog, DiscoveryFailure, ListPage, MAXIMUM_LIST_BYTES,
     MAXIMUM_LIST_PAGES, McpServerKind, ServerDiscovery, ToolCatalogs,

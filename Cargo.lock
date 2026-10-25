@@ -974,8 +974,6 @@ dependencies = [
 [[package]]
 name = "dogwood-local-engine"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d82f08653e0090010cfa076bcec582d3aa31e1dc3f0574e4e929c63253878b"
 dependencies = [
  "dogwood-language",
  "getrandom 0.3.4",

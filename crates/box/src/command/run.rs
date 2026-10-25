@@ -206,6 +206,39 @@ async fn hosted(
             eprintln!("{}", grant.disclosure());
         }
     }
+    // PROTOTYPE(content-inspection): start the inspector leaf once, before the agent, in mode B.
+    if let (Some(inspector), Some(spec)) = (
+        hosted.inspector(),
+        locked.record.inspection.as_ref().and_then(|i| i.leaf_spec()),
+    ) {
+        let table = "[inspection.content]";
+        let boundary = Boundary::translate(
+            &spec,
+            Launch {
+                table,
+                trailing: &[],
+                fallback_workspace: &locked.workspace,
+                shebang_interpreters: ShebangInterpreters::Granted,
+                runtime_reach: RuntimeReach::Leaf,
+                argument_zero: None,
+                egress: EgressMode::for_spec(&spec),
+                approved: hosted.approved().table(table),
+            },
+            &site,
+        )?;
+        eprintln!("{}", boundary.disclosure());
+        let leaf = crate::run::contain::supervise::LeafBox::spawn_streaming(
+            boundary,
+            &locked.root,
+            #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))]
+            hosted.native_registration(),
+        )
+        .await?;
+        let parts = leaf.into_parts().ok_or_else(|| ConfigError::Contract {
+            reason: "the inspector leaf exposed no stdio".to_string(),
+        })?;
+        inspector.adopt_leaf(parts);
+    }
     let boundary = Boundary::translate(
         &agent,
         Launch {
@@ -351,6 +384,7 @@ mod tests {
             mcp: Vec::new(),
             contained_mcp: BTreeMap::new(),
             telemetry: BTreeMap::new(),
+            inspection: None,
         }
     }
 

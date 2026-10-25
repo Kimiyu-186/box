@@ -82,6 +82,8 @@ impl AttemptSnapshot {
                 method,
                 path,
                 body_bytes,
+                headers: _,
+                body: _,
                 intercepted: _,
                 mcp: _,
             } => Self::HttpRequest {
@@ -1096,6 +1098,8 @@ fn attempt_schema_never_carries_body_or_header_content() {
         method: "POST",
         path: "/v1",
         body_bytes: 42,
+        headers: &[],
+        body: &[],
         intercepted: true,
         mcp: None,
     };
@@ -1115,6 +1119,8 @@ fn attempt_schema_never_carries_body_or_header_content() {
             method: "POST",
             path: "/mcp",
             body_bytes: 64,
+            headers: &[],
+            body: &[],
             intercepted: false,
             mcp: Some(McpFrame::ToolCall {
                 server: "prod",

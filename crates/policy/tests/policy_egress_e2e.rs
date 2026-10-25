@@ -202,6 +202,8 @@ fn request_attempt(port: u16, body_bytes: usize) -> EffectAttempt<'static> {
         method: "POST",
         path: "/v1/messages",
         body_bytes,
+        headers: &[],
+        body: &[],
         intercepted: true,
         mcp: None,
     }
@@ -231,6 +233,8 @@ fn mcp_request_attempt(
         method: "POST",
         path: "/mcp",
         body_bytes: 64,
+        headers: &[],
+        body: &[],
         intercepted: false,
         mcp: Some(McpFrame::ToolCall {
             server,
@@ -488,6 +492,8 @@ fn request_to_host(host: &'static str) -> EffectAttempt<'static> {
         method: "GET",
         path: "/",
         body_bytes: 0,
+        headers: &[],
+        body: &[],
         intercepted: true,
         mcp: None,
     }

@@ -24,4 +24,6 @@ pub(crate) mod lock;
 pub(crate) mod macos_enforcement;
 #[cfg(target_os = "linux")]
 pub(crate) mod netns_relay;
+// PROTOTYPE(content-inspection): the content-inspector client.
+pub(crate) mod prototype_inspection;
 pub(crate) mod telemetry;

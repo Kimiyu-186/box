@@ -43,3 +43,7 @@ exclude = [
 #   https://doc.rust-lang.org/cargo/reference/profiles.html#debug
 [profile.release]
 # debug = "limited"
+
+# PROTOTYPE(content-inspection): the published engine never installs a provider resolver.
+[patch.crates-io]
+dogwood-local-engine = { path = "vendor/prototype-dogwood-local-engine" }

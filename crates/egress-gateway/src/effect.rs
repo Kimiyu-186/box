@@ -119,6 +119,10 @@ pub enum EffectAttempt<'a> {
         path: &'a str,
         /// The request body length, without exposing body content.
         body_bytes: usize,
+        /// PROTOTYPE(content-inspection): the workload's headers, before credential injection.
+        headers: &'a [(String, String)],
+        /// PROTOTYPE(content-inspection): the request body as it will be forwarded.
+        body: &'a [u8],
         /// Whether the plaintext was seen through TLS interception. A CONNECT/TLS route terminates
         /// TLS to inspect the request, so it is `true`; a plain-HTTP route was never encrypted, so it
         /// is `false`. Feeds the policy's `intercepted` input, so a rule can distinguish the two.

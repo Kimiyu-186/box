@@ -138,7 +138,13 @@ fn opened_file_path(file: &File) -> PathBuf {
 }
 
 fn durable_config() -> DurableConfig {
-    DurableConfig::new(SNAPSHOT_INTERVAL).with_max_future_skew(Duration::MAX)
+    // PROTOTYPE(content-inspection): every engine carries the inspection provider and its resolver.
+    DurableConfig::new(SNAPSHOT_INTERVAL)
+        .with_max_future_skew(Duration::MAX)
+        .with_providers(
+            crate::prototype_inspection::declarations(),
+            crate::prototype_inspection::resolver(),
+        )
 }
 
 fn rule_ids(engine: &DurableTemporalEngine) -> HashMap<PolicyToken, RuleId> {
@@ -155,9 +161,11 @@ pub fn event_schema_source() -> &'static str {
     EVENTS_DWSCHEMA
 }
 
-fn service_schema() -> Result<ServiceSchema, PolicyError> {
+pub(crate) fn service_schema() -> Result<ServiceSchema, PolicyError> {
+    // PROTOTYPE(content-inspection): declare the inspection provider.
     ServiceSchema::builder()
         .event_schema_str(EVENTS_DWSCHEMA)
+        .providers(crate::prototype_inspection::declarations())
         .build()
         .map_err(|error| PolicyError::Schema(format!("dogwood event schema: {error}")))
 }
@@ -524,11 +532,7 @@ pub(crate) fn parse_policy_source(source: &str) -> Result<Vec<String>, PolicyErr
     let parsed = dogwood_language::ParsedPolicySet::parse(source, &service)
         .map_err(|error| PolicyError::Parse(format!("dogwood parse: {error}")))?;
 
-    if parsed.policies().any(|policy| policy.uses_providers()) {
-        return Err(PolicyError::Parse(
-            "dogwood: information providers are not enabled in this build".to_string(),
-        ));
-    }
+    // PROTOTYPE(content-inspection): providers are allowed.
 
     Ok(parsed
         .policies()
@@ -571,11 +575,7 @@ fn validate_and_expand(
     // ship none, and an erroring provider is documented upstream as undefined
     // behaviour, so a policy that uses one is refused at load rather than trusted
     // to fail closed.
-    if parsed.policies().any(|policy| policy.uses_providers()) {
-        return Err(PolicyError::Parse(
-            "dogwood: information providers are not enabled in this build".to_string(),
-        ));
-    }
+    // PROTOTYPE(content-inspection): providers are allowed.
     let canonical_policies = parsed
         .policies()
         .map(|policy| policy.expanded_source())

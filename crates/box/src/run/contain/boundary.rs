@@ -80,7 +80,7 @@ impl ApprovedReach {
             .contained_mcp
             .iter()
             .map(|(label, server)| (format!("[mcp.{label}]"), &server.spec));
-        let tables = agent
+        let mut tables = agent
             .chain(tools)
             .chain(servers)
             .map(|(table, spec)| {
@@ -88,6 +88,12 @@ impl ApprovedReach {
                     .map(|reach| (table, reach))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        // PROTOTYPE(content-inspection): the inspector leaf's lists, in mode B.
+        if let Some(spec) = stored.inspection.as_ref().and_then(|i| i.leaf_spec()) {
+            let table = "[inspection.content]".to_string();
+            let reach = judge_filesystem(&spec, &table, stored, protected_sources)?;
+            tables.insert(table, reach);
+        }
         Ok(Self { tables })
     }
 
@@ -1367,6 +1373,7 @@ mod tests {
                 mcp,
                 contained_mcp: Default::default(),
                 telemetry: Default::default(),
+                inspection: None,
             };
             let attachment = Attachment {
                 proxy_port: 41080,

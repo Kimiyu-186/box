@@ -1053,6 +1053,8 @@ mod tests {
                 method: "GET",
                 path: "/",
                 body_bytes: 0,
+                headers: &[],
+                body: &[],
                 intercepted: true,
                 mcp: None,
             })
@@ -1140,6 +1142,8 @@ mod tests {
                 method: "GET",
                 path: "/v1/messages",
                 body_bytes: 0,
+                headers: &[],
+                body: &[],
                 intercepted: true,
                 mcp: None,
             })
@@ -1218,6 +1222,8 @@ mod tests {
             method,
             path,
             body_bytes: 0,
+            headers: &[],
+            body: &[],
             intercepted: true,
             mcp: None,
         };
@@ -1427,6 +1433,8 @@ mod tests {
             method: "POST",
             path: "/mcp",
             body_bytes: arguments.len(),
+            headers: &[],
+            body: &[],
             intercepted: false,
             mcp: Some(McpFrame::ToolCall {
                 server: "demo",
