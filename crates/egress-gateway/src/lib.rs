@@ -20,14 +20,17 @@ pub use boundary::{
 };
 pub use capability::{
     CapabilityContext, CapabilityFault, CapabilityOutcome, CapabilitySet, CapabilitySetBuilder,
-    CredentialCapability,
+    CredentialCapability, is_bindable_host, normalize_host,
 };
 pub use effect::{
     EffectAttempt, EffectInterceptor, EffectOutcome, EffectPermit, McpFrame, McpListReply,
 };
 pub use error::{PROXY_ORIGIN_HEADER, PROXY_ORIGIN_VALUE, ProxyError, Result};
 pub use intercept::Interceptor;
-pub use mcp::{McpTarget, McpTargetIdentity, canonicalize_mcp_frame, mcp_denial_response};
+pub use mcp::{
+    McpTarget, McpTargetIdentity, canonicalize_mcp_frame, mcp_denial_response,
+    refuse_duplicate_mcp_keys,
+};
 pub use seams::{Emitter, StubEmitter};
 
 #[cfg(feature = "tls-intercept")]

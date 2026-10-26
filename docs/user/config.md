@@ -200,6 +200,31 @@ their place.
 | `exec` | Run the path. A file entry names an executable; a directory entry covers the binaries below it. **`[agent.filesystem]` only.** |
 | `deny` | Refuse the path, even when another list grants it. |
 
+### Direct access by operating system
+
+The read and write lists state separate permissions. These rules also apply to local servers
+under `[mcp.<name>.filesystem]`.
+
+| Requested access | Settings | macOS | Linux |
+|---|---|---|---|
+| Read-only | `read` or `read_file` | Supported | Supported |
+| Write-only | `write` or `write_file`, without covering read access | Supported | Startup refuses the configuration before any workload runs |
+| Read-write | Explicit read and write grants | Supported | Supported |
+| Read directory with writable child | Parent in `read`, child in `write` or `write_file` | Supported | Supported |
+| Write directory with only a readable child | Parent in `write`, child in `read` or `read_file` | Supported | Startup refuses the uncovered write-only scope |
+
+Linux writable mounts also allow reads. Box requires an explicit read grant that covers each
+entire write grant. An exact-file read covers only that file. A directory read covers that
+directory and its descendants. Execute grants do not satisfy this requirement.
+
+For Linux read-write access, put a directory in both `read` and `write`. For one file, use
+`read_file` and `write_file`. To retain read-only access, remove the write grant.
+
+Startup output states `read-only`, `write-only`, or `read-write` for each content-access grant.
+For partial overlaps, the parent entry also identifies the overlapping grants that allow both.
+Denials and protected paths still restrict access. Duplicate or nested grants of the same
+operation still cause startup refusal.
+
 The example uses four lists. `read` covers the CLI's install tree and `strands-home`, `read_file`
 names the preload file and Homebrew's OpenSSL settings, `write` covers `strands-home`, and `list`
 names the project. `strands-home` is in both `read` and `write`, because `write` grants write only.
@@ -242,7 +267,7 @@ happen after the box directory is created and before the workload starts.
 | A `..` component | ``` `filesystem.read` path "<entry>" carries `..`; name the path it means``` |
 | The same path twice in one list | ``` `filesystem.read` path <path> is duplicated``` |
 | A path that does not exist | `<path> is not there: No such file or directory (os error 2). A grant on a path that does not exist grants nothing and says so nowhere` |
-| A symbolic link | `<path> is a symbolic link. A grant carries the identity the kernel checks, so a link renders a rule that matches nothing; name what it points at` |
+| A symbolic link | `<path> is a symbolic link to <target>. A grant carries the identity the kernel checks, so a link renders a rule that matches nothing; name <target> instead` |
 | A spelling the kernel resolves elsewhere | `<path> is not the path the kernel checks, which is <path>. A grant carries the identity it acts on, so name that path instead` |
 | A directory in `read_file` or `write_file` | ``<path> is a directory; `read_file` names one file, and a tree belongs in `read` `` |
 | A file in `list` | ``<path> is a file, and `list` enumerates a directory tree`` |
