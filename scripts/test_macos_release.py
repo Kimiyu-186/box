@@ -145,6 +145,24 @@ class MacOSReleaseTests(unittest.TestCase):
 
 
 class WorkflowGateTests(unittest.TestCase):
+    def test_release_source_cannot_select_the_verification_harness(self):
+        import re
+        import shlex
+        from test_release_source import WORKFLOW, workflow_command
+
+        workflow = WORKFLOW.read_text()
+        job = workflow.split("\n  verify-macos:\n", 1)[1].split("\n  inspect:\n", 1)[0]
+        checkouts = re.findall(r"^\s+ref:\s*(.+)$", job, re.MULTILINE)
+        self.assertEqual(checkouts, ["${{ github.sha }}"])
+        command = workflow_command("Verify installation and signed native enforcement")
+        lines = command.replace("\\\n", "").splitlines()
+        cargo = next(line.strip() for line in lines if line.lstrip().startswith("cargo "))
+        arguments = shlex.split(cargo.split("2>&1 | tee", 1)[0])
+        self.assertEqual(arguments, [
+            "cargo", "test", "--manifest-path", "test-native-filesystem/Cargo.toml",
+            "--locked", "--", "--test-threads=1",
+        ])
+
     def test_signing_source_guard_refuses_forks_branches_and_unmerged_sources(self):
         from test_release_source import workflow_command
         import os

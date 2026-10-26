@@ -65,15 +65,19 @@ It checks that the profile authorizes the signing certificate.
 It also checks the hardened-runtime flag, signing timestamp, and unchanged signed helper bytes.
 Each request uses unique S3 object keys.
 
-A separate job extracts the final archive without AWS credentials.
 The signing and verification jobs cannot read or write GitHub Actions caches.
+A separate job extracts the final archive without AWS credentials.
+Its verification tools and native tests come from the commit that contains the running workflow.
+The selected release source supplies the package, but cannot replace the tests that approve it.
 It verifies the extracted application and runs its `box --version` entry point.
 It then runs the complete native test package against that same `box` path.
+An older source must pass the workflow commit's current tests before publication.
 Any signing, verification, or native-test failure blocks publication.
 
 Inspect the `macos-signing-evidence` and `macos-package-verification` workflow artifacts.
-Keep the source SHA, signing task IDs, package hashes, verification output, and native-test log with release evidence.
-The SHA identifies the source commit; the package hash identifies the exact distributed bytes.
+Keep both source and verification SHAs, signing task IDs, package hashes, verification output, and native-test log with release evidence.
+The source SHA identifies the product source; the verification SHA identifies the workflow and test source.
+The package hash identifies the exact distributed bytes.
 
 ## Publish
 

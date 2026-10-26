@@ -459,16 +459,10 @@ jobs:
       CD_SIGNER_TEAM_ID: ${{ needs.sign-macos.outputs.team_id }}
       CD_SIGNER_PROFILE_NAME: ${{ needs.sign-macos.outputs.profile_name }}
     steps:
-      - name: Checkout the selected source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.scan.outputs.release_sha }}
-          persist-credentials: false
-      - name: Checkout trusted verification tools
+      - name: Checkout trusted verification source
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          path: release-tools
           persist-credentials: false
       - name: Download the signed package
         uses: actions/download-artifact@v8
@@ -479,6 +473,8 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           NEW_TAG: ${{ needs.scan.outputs.new_tag }}
+          SOURCE_SHA: ${{ needs.scan.outputs.release_sha }}
+          VERIFICATION_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
@@ -487,8 +483,10 @@ jobs:
           package="$RUNNER_TEMP/installed-box"
           mkdir "$package"
           tar -C "$package" -xzf "signed/box-${NEW_TAG}-aarch64-apple-darwin.tar.gz"
-          python3 release-tools/scripts/macos-release.py verify \
+          python3 scripts/macos-release.py verify \
             --app "$package/Box.app" --evidence "$RUNNER_TEMP/package-verification"
+          printf '{"source_sha":"%s","verification_sha":"%s"}\n' \
+            "$SOURCE_SHA" "$VERIFICATION_SHA" > "$RUNNER_TEMP/package-verification/source.json"
           "$package/box" --version | grep -F "$VERSION"
           export STRANDS_BOX_SIGNED_TEST_BINARY="$package/box"
           cargo test --manifest-path test-native-filesystem/Cargo.toml --locked \
