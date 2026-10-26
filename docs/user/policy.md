@@ -125,9 +125,9 @@ discovers. [The action vocabulary](policy/actions.md) lists the fields of each o
 
 ## Common rules
 
-Six rules an operator writes often. Each one is a working rule. Copy it beside the permits from
+Seven rules an operator writes often. Each one is a working rule. Copy it beside the permits from
 [your first policy](tutorials/first-policy.md), replace `~/project` with your project directory, and
-run the box. Two of them say what else `box.toml` needs. The first five are `forbid` rules. The last
+run the box. Two of them say what else `box.toml` needs. The first six are `forbid` rules. The last
 is a pair of `permit` rules that replace two from the tutorial.
 
 ### A budget over time
@@ -293,6 +293,71 @@ strands-shell: effect denied: policy denied this operation on '/usr/bin/git' [po
 - The condition is keyed on `::response`, the event the box records when `cargo test` finishes,
   with the exit status as `output.status`. A `::request` event exists for a refused attempt too, so
   a rule keyed on it would pass after a refused `cargo test`.
+
+<a id="forbid-one-url-path-on-a-host"></a>
+
+### Forbid one URL path on a host
+
+Every request under `/v1/` on `api.example.com` is permitted, except the endpoints under
+`/v1/admin`.
+
+`context.input.path` is the exact path the gateway forwards. The gateway puts the path in canonical
+form first: it decodes the percent-escapes of unreserved characters, keeps `%2F` encoded with
+uppercase hex digits, and removes `.` and `..` segments. `/v1/./admin`, `/v1/%61dmin`, and
+`/v1/users/../admin` all reach policy as `/v1/admin`, and `/v1/admin%2fexport` reaches it as
+`/v1/admin%2Fexport`.
+
+The gateway keeps repeated slashes and `%2F`, and the server receives them. Servers disagree about
+such a path: some serve `/v1//admin` as `/v1/admin`, and others, such as S3, treat `a//b` and `a/b`
+as two different keys. A `forbid` on `/v1/admin` beside a permit on `/v1/*` therefore leaves
+`/v1//admin` and `/v1/admin%2Fexport` permitted. Add a second `forbid` that refuses both forms
+on that host:
+
+```text
+@id("api_connect")
+permit (principal, action == Box::Action::"net:connect", resource)
+when { context.input.host == "api.example.com" };
+
+@id("api_v1")
+permit (principal, action == Box::Action::"http:request", resource)
+when { context.input.host == "api.example.com" && context.input.path like "/v1/*" };
+
+@id("no_admin")
+forbid (principal, action == Box::Action::"http:request", resource)
+when {
+  context.input.host == "api.example.com" &&
+  (context.input.path == "/v1/admin" || context.input.path like "/v1/admin/*")
+};
+
+@id("no_ambiguous_slash")
+forbid (principal, action == Box::Action::"http:request", resource)
+when {
+  context.input.host == "api.example.com" &&
+  (context.input.path like "*//*" || context.input.path like "*%2F*")
+};
+```
+
+| Request | Decision | Rule |
+|---|---|---|
+| `/v1/users` | Permitted | `api_v1` |
+| `/v1/administrator` | Permitted | `api_v1` |
+| `/v1/users?next=//login` | Permitted | `api_v1` |
+| `/v1/admin`, `/v1/./admin`, `/v1/%61dmin`, `/v1/users/../admin` | Refused | `no_admin` |
+| `/v1/admin/export` | Refused | `no_admin` |
+| `/v1//admin`, `/v1///admin/export` | Refused | `no_ambiguous_slash` |
+| `/v1/users//42`, `/v1/admin%2Fexport`, `/v1/admin%2fexport` | Refused | `no_ambiguous_slash` |
+
+`context.input.path` holds no query, so the `//` in `?next=//login` is outside the path.
+
+```text
+http:request gate: policy denied this operation on 'api.example.com:443/v1//admin' [policy: no_ambiguous_slash].
+```
+
+- `no_ambiguous_slash` refuses every path on the host that holds `//` or `%2F`, including paths the
+  server treats as distinct resources. Scope it to the hosts whose paths your rules forbid.
+- Write the forbid on the path and its children, as `no_admin` does. A pattern on the end of the
+  path, such as `context.input.path like "*/admin"`, refuses `/v1//admin` and also
+  `/v1/users/admin`, and it permits `/v1/admin/` and `/v1/admin/export`.
 
 ### Bind a credential to one host and one method
 
@@ -495,6 +560,25 @@ when { context.input.path like "~/project/" };
 ```text
 policy compares an inert literal: rule @id("project_read") compares context.input.path with the pattern "~/project/", and a directory is spelled without a trailing slash; write "~/project"
 ```
+
+A host reaches policy in lowercase and without a trailing dot:
+
+```text
+@id("block_host")
+forbid (principal, action == Box::Action::"net:connect", resource)
+when { context.input.host == "API.Example.com" };
+```
+
+```text
+policy compares an inert literal: rule @id("block_host") compares context.input.host with "API.Example.com", and a host is spelled in lowercase and without a trailing dot; write "api.example.com"
+```
+
+Two other host spellings each get their own refusal:
+
+- **A host that carries a port**, such as `api.example.com:443`. Write the name alone, and compare
+  `context.input.port` for the port.
+- **An internationalized domain**, such as `bücher.example`. The gateway sees the punycode form, so
+  write `xn--bcher-kva.example`.
 
 Two spellings load with a warning. The first compares `program` with a path. `program` holds the
 name the first word resolved to; a binary of the surrounding OS is a `shell:spawn`, and its resolved

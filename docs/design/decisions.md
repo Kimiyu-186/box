@@ -68,6 +68,16 @@ constrains what the program does.
 
 ## The box
 
+<a id="linux-evaluation-requires-explicit-consent"></a>
+### Linux evaluation requires explicit consent
+
+Linux evaluation requires the operator to set `EXPERIMENTAL_LINUX_SUPPORT=TRUE` before using the command line or library.
+Help and version checks remain available without consent.
+Linux archives belong to `-linux-preview.N` prereleases; stable releases continue to distribute macOS alone.
+A stable Linux download would imply readiness that the current qualification does not establish, so it is excluded.
+Operators and test automation must opt in, and the flag does not grant filesystem access or establish security acceptance.
+Removing these controls requires a later readiness decision.
+
 <a id="native-filesystem-policy-requires-explicit-selection"></a>
 ### Native filesystem policy requires explicit selection
 
@@ -303,19 +313,17 @@ broker, so it cannot send a second request as the agent. Its network traffic
 still goes through the egress gateway, which judges that traffic as the agent.
 
 <a id="box-derives-a-read-closure-and-refuses-to-derive-an-exec-closure"></a>
-### Box derives a read closure and refuses to derive an exec closure
+### Box bounds derived reads from writable dependency chains and derives no exec closure
 
-A read root is established by a path shape and bounded by checks Box applies itself, so Box derives
-read roots and grants them. Box derives no exec literal from a runtime's own dependency graph: the exec set is the resolved
-workload program, each `exec` entry, and each `#!` interpreter hop. The agent's sandbox adds the five
-aliases and one alias per declared MCP server. A probe that traced a runtime's
-dependency graph would have to import the code it is bounding, which runs third-party module-level
-code in whichever process probes, and a dynamic trace only ever sees the paths it took. The
-load-bearing reason holds however the closure is computed: the interesting helpers are universal over
-authored data (`/bin/sh`, `/usr/bin/env`, `git`, a bundled agent binary inside a package tree), and a
-derived allowlist would grant these with no operator decision. The cost is that a dependency which
-shells out to a helper fails at the moment of the call rather than at startup, with a kernel `EPERM`
-naming the path.
+Box keeps automatic dependency discovery and derives bounded runtime read roots.
+A dependency branch the workload can change requires existing content-read authority or existing trusted system-library allowances, subject to the floors.
+That restriction includes replaceable resolution paths and follows indirect dependencies.
+With a writable directory, Box also restricts multiply linked files because path checks cannot exclude a writable alias.
+Other chains outside the workload's write reach retain automatic derived reads.
+Box derives no exec permission from a dependency graph because it could authorize general-purpose helpers without an operator decision.
+The cost is additional Read entries for writable programs and for hard-linked files whose other names cannot be ruled out as writable.
+A previously malicious artifact that is now read-only can remain outside this restriction.
+The [dependency startup design](containment.md#dependency-read-startup-design) states the operator experience and the limits of static discovery.
 
 <a id="a-program-starts-through-its-route-and-is-granted-on-its-target"></a>
 ### A program starts through its route and is granted on its target
@@ -393,8 +401,16 @@ under a grant is now the operator's stated reach**, named on stderr by the grant
 The box defends the authority it loaded, and re-checks that by identity at every spawn, which
 `a_spawn_refuses_a_reach_whose_subtracted_authority_moved` pins.
 
-Three limits to plan around. On Linux a writable bind is also readable, so `write` without `read`
-holds on macOS only, and the disclosure names such an entry as readable too. On Linux, when the
+Three limits to plan around. Linux writable mounts also permit reads. Box therefore refuses each
+Linux write grant without explicit read coverage before any agent, tool, or local server runs.
+A matching file read or an enclosing directory read supplies that coverage. A child read cannot
+cover a parent write grant. macOS retains write-only access. The disclosure names complete and
+partial read-write access. `linux_rejects_write_only_before_any_process_runs` pins startup refusal.
+`explicit_read_write_succeeds_for_every_process_and_scope` pins explicit access and overlapping scopes.
+This accepted platform limitation avoids silently adding read permission. Landlock is the planned
+long-term approach; its implementation and qualification remain deferred.
+
+On Linux, when the
 authority directory sits more than one level below a write grant, the workload can rename the
 ancestor between them and create a fresh directory at the vacated path, which a later run whose
 `--config` names that path adopts; macOS refuses the ancestor rename, and
@@ -477,10 +493,13 @@ parses a harness's own configuration file to find one.
 
 A sandbox for a stdio MCP server is not optional. A `type = "stdio"` entry carries the same grant
 fields as any other process (`workspace`, `env`, `filesystem`), Box synthesizes one
-process spec from the entry, and it runs through the one translator, so the same floors apply. The
-startup disclosure does **not**: it prints for `[agent]` and each `[tool.<name>]`, and the boundary of an MCP
-server's sandbox is built when the server starts, so an `[mcp.<name>.filesystem]` grant is kernel
-reach that no `fs:*` decision covers and no disclosure names. A server that declares no grants still
+process spec from the entry, and it runs through the one translator, so the same floors apply.
+Box approves and discloses every server's direct filesystem grants before the agent starts.
+A server's command resolves only when the agent requests that server.
+Box then prints the full boundary disclosure before launching it, including its runtime and environment.
+This preserves lazy server startup without hiding direct filesystem reach.
+`a_box_declaring_many_mcp_servers_still_runs` pins unused declarations without installed server programs.
+A server that declares no grants still
 runs contained, on the baseline every tool's and MCP server's sandbox gets. One escape exists and it is network-only: `[mcp.<name>.network] contain_egress = false` gives
 that server's sandbox direct egress instead of the gateway-routed default, for a trusted client that
 cannot honour `HTTPS_PROXY`. See
@@ -965,9 +984,10 @@ closed choice, and never a wider one.
 Host detection, backend selection, support checks, validation, and the kernel apply all happen inside
 one call, and any error there means the workload does not run. There is no warning-only mode, no
 automatic weaker backend, and no uncontained fallback. Box also refuses to run when it cannot verify
-that the sandbox is in place for this box. The cost is on the operator: a platform or an architecture Box
-cannot enforce on stays unsupported until a mechanism covers it, and the operator gets a refusal rather
-than a degraded box.
+that the sandbox is in place for this box.
+The selected [dependency startup experience](containment.md#dependency-read-startup-design) requires grouped missing-read reports before launching the affected workload, with additive configuration guidance and explicit discovery limits.
+That guidance preserves existing entries and never suggests overriding explicit denials or protected paths.
+Operators must review additional access and retry, while platforms Box cannot enforce remain unsupported.
 
 <a id="the-linux-boundary-is-namespaces-not-landlock"></a>
 ### The Linux boundary is namespaces and a syscall filter, and never Landlock
@@ -1212,17 +1232,15 @@ disclosure: a tool or MCP server learns which paths exist across the operator ho
 <a id="a-leaf-runs-its-whole-toolchain-and-loads-what-it-builds"></a>
 #### A tool or MCP server runs its whole toolchain, and loads what it builds
 
-A permitted host binary re-execs helpers nobody can enumerate up front (a version control tool ships
-roughly 150 of them), and a build must load and run what it compiles. So on macOS the sandbox for a tool or
-MCP server renders broad exec, and over that sandbox's own writable grants one executable-mapping
-allow, so a build loads its own output. This applies only to that sandbox, and only after policy
-already admitted the one top-level program,
-which `a_leaf_carries_broad_exec_and_the_main_box_does_not` pins. Write-xor-execute still holds
-everywhere except that sandbox's own writable grants: the carve-out never covers the operator home,
-the system directories, or box state, and the agent's sandbox keeps the invariant whole. So a tool's
-or MCP server's sandbox is a bounded filesystem-and-network envelope inside which arbitrary native
-code can run. On Linux a
-read-only bind already confers execute, and the mount view bounds the exec set instead.
+A tool or MCP server must run helpers and load programs or libraries that it builds.
+After policy admits the top-level program, its sandbox permits execution from its readable and writable grants.
+macOS uses process-execution rules and executable mappings.
+Linux makes the corresponding file and directory mounts executable.
+Enumerating every helper or build output would prevent toolchains from selecting their own programs.
+
+The cost is that a tool can execute code it changes within its writable grants, while the agent retains its existing execution restrictions.
+Linux keeps automatic temporary mounts, refused paths, and protected files non-executable.
+`cn_x_04` tests execution and library loading from tool output, with agent denials on both platforms.
 
 <a id="native-egress-is-an-operator-declared-leaf-escape"></a>
 #### Native egress is an operator-declared escape from a tool's or server's sandbox, recorded as a downgrade
@@ -1328,7 +1346,13 @@ write. An in-memory effect re-resolves the token path under the same lock as the
 check and flushes through that descriptor, so a directory swapped inside the admission window cannot
 divert it, which
 `in_mount_admission_window.rs::a_directory_swapped_inside_the_admission_window_cannot_divert_a_host_write`
-pins.
+pins. The token is taken on the path with every symbolic link followed, and Box refuses it when the
+identity it pins is not that path, which
+`a_pin_whose_host_identity_is_not_the_spelling_is_unavailable` pins. The pin and the effect both reach
+the parent directory from the bind root one component at a time, refusing a symbolic link at every
+component, which `a_symlinked_ancestor_is_neither_pinned_nor_opened` pins. The cost: listing,
+metadata, `cd`, `readlink`, and `glob` act on the path again after the check, so a swap there can show
+names and metadata, and a swap of two real directories is not refused.
 
 <a id="host-backed-effects-refuse-what-a-write-cannot-produce"></a>
 ### On a shared inode, a host-backed effect is stricter than a write
@@ -1507,10 +1531,10 @@ sandboxing a host binary does not depend on remembering to wire the hook: absenc
 
 A tool makes raw filesystem syscalls, so its reach is a set of containment cells and not a set of
 policy decisions. Box grants no blanket project read and write. A tool's `filesystem` table holds six
-lists, `read`, `write`, `read_file`, `write_file`, `list`, and `deny`. A tool states no `metadata`
-list, because a tool's sandbox discovers existence and metadata across the operator home, and no `exec` list,
-because on macOS a tool's sandbox runs its whole toolchain through broad exec; Box refuses both names on a tool.
-On Linux a tool reaches a runnable binary through a `read` entry, which confers exec. A cell raises no
+lists, `read`, `write`, `read_file`, `write_file`, `list`, and `deny`.
+Box refuses `metadata` and `exec` lists on a tool.
+macOS supplies metadata discovery, and both platforms permit execution through the tool's readable and writable grants.
+A cell raises no
 `fs:*` decision and enters no temporal history, so inside a granted tree a tool can touch a file that
 the operator's per-path policy denies to the agent; Box discloses each cell at startup, and an operator
 must read that disclosure. No tool grant can name the box directory, which
