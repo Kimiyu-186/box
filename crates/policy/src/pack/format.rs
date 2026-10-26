@@ -24,6 +24,7 @@ pub(crate) struct PackFile {
 }
 
 /// The `[global]` table: options that come before the command words.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GlobalSpec {
@@ -32,6 +33,7 @@ pub(crate) struct GlobalSpec {
 }
 
 /// One `[shell.<action>]` table.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShellActionSpec {
@@ -47,6 +49,7 @@ pub(crate) struct ShellActionSpec {
 }
 
 /// One `options.<name>` entry.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OptionSpec {
@@ -68,6 +71,7 @@ pub(crate) struct OptionSpec {
 }
 
 /// One `operands.<name>` entry.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperandSpec {
@@ -84,6 +88,7 @@ pub(crate) struct OperandSpec {
 }
 
 /// One `when` pattern rule on an option or an operand.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WhenRule {
@@ -95,6 +100,7 @@ pub(crate) struct WhenRule {
 }
 
 /// One pattern or several.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Patterns {
@@ -103,6 +109,7 @@ pub(crate) enum Patterns {
 }
 
 /// One flag spelling or several.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Flags {
