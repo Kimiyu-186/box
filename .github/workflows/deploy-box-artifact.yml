@@ -379,6 +379,7 @@ jobs:
 
   sign-macos:
     name: Sign the macOS application
+    cache-mode: none
     needs: [scan, test, build]
     if: >-
       github.repository == 'strands-agents/box' &&
@@ -448,6 +449,7 @@ jobs:
 
   verify-macos:
     name: Test the signed macOS package
+    cache-mode: none
     needs: [scan, sign-macos]
     runs-on: macos-latest
     timeout-minutes: 30

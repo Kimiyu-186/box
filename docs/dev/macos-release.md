@@ -66,6 +66,7 @@ It also checks the hardened-runtime flag, signing timestamp, and unchanged signe
 Each request uses unique S3 object keys.
 
 A separate job extracts the final archive without AWS credentials.
+The signing and verification jobs cannot read or write GitHub Actions caches.
 It verifies the extracted application and runs its `box --version` entry point.
 It then runs the complete native test package against that same `box` path.
 Any signing, verification, or native-test failure blocks publication.
