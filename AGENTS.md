@@ -306,6 +306,10 @@ Each has one reader and one test for what belongs there. The `docs-writer`, `doc
 `.agents/explorations/`, `.agents/drafts/`, and `.agents/pocs/` hold local working material and are
 never committed. Add no doc a reader did not ask for.
 
+`team/designs/` holds the design documents that a human writes before a feature is built. A
+design document is a snapshot that is not kept in step with the code, so it is not one of the seven.
+An agent does not write, audit, or update one.
+
 #### What a change updates
 
 The left column is the observable surface the diff touches. Each row that matches names the page to
