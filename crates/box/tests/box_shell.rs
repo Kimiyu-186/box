@@ -133,6 +133,20 @@ fn a_permitted_command_routes_through_the_shim() {
     assert!(output.status.success(), "{output:?}");
 }
 
+#[test]
+fn shell_alias_forwards_piped_stdin_and_eof() {
+    if !fixture::namespace_launcher_is_usable() {
+        return;
+    }
+    let box_ = box_under(PERMISSIVE_POLICY, "shell-stdin");
+    let output = box_.bash(r#"printf 'alias stdin roundtrip' | zsh -c 'cat'"#);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout(&output).contains("alias stdin roundtrip"),
+        "{output:?}"
+    );
+}
+
 /// A temporal rule enforces a cap the request alone could not express.
 ///
 /// This is what Dogwood adds over Cedar: the 21st command is refused because of what

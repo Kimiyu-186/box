@@ -62,7 +62,10 @@ fn main() -> ExitCode {
             return ExitCode::from(SHELL_FAILURE_EXIT);
         }
     };
-    match runtime.block_on(run()) {
+    let outcome = runtime.block_on(run());
+    // A completed alias must not wait for a caller that still holds stdin open.
+    runtime.shutdown_background();
+    match outcome {
         Ok(status) => ExitCode::from(shell_status(status)),
         Err(error) => {
             eprintln!("strands-box-sock-alias: {error}");
@@ -74,13 +77,61 @@ fn main() -> ExitCode {
 /// Close every descriptor above stdio before doing anything else.
 #[cfg(unix)]
 fn close_inherited_descriptors() -> io::Result<()> {
-    let maximum = unsafe { libc::getdtablesize() };
-    if maximum < 0 {
-        return Err(io::Error::last_os_error());
+    #[cfg(target_os = "linux")]
+    {
+        // The limit is a ceiling, not the number of open descriptors. Container
+        // limits can exceed a billion; sweeping that range delays every shell
+        // invocation. Close the complete range, including descriptors above a
+        // subsequently lowered limit, before creating the async runtime.
+        // SAFETY: flags zero closes only this process's non-stdio descriptors.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(error);
+        }
+        close_proc_descriptors()
     }
-    for descriptor in (libc::STDERR_FILENO + 1)..maximum {
-        // SAFETY: close only receives a descriptor number. EBADF means the
-        // descriptor was already closed, which is the desired state.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let maximum = unsafe { libc::getdtablesize() };
+        if maximum < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for descriptor in (libc::STDERR_FILENO + 1)..maximum {
+            // SAFETY: close only receives a descriptor number. EBADF means the
+            // descriptor was already closed, which is the desired state.
+            if unsafe { libc::close(descriptor) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EBADF) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn close_proc_descriptors() -> io::Result<()> {
+    // This runs before any threads exist. Finish enumeration (and close its
+    // directory descriptor) before closing the snapshot. No new descriptors
+    // are opened in the loop; an already-closed entry is harmless.
+    let descriptors = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                .ok_or_else(|| io::Error::other("invalid proc descriptor entry"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    for descriptor in descriptors
+        .into_iter()
+        .filter(|fd| *fd > libc::STDERR_FILENO)
+    {
+        // SAFETY: each number came from this process's descriptor directory.
         if unsafe { libc::close(descriptor) } == -1 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EBADF) {
@@ -240,7 +291,7 @@ fn parse_script_alias(executable: &Path, arguments: Vec<OsString>) -> io::Result
 
 /// Pump one MCP server's traffic: stdin to the box, the box's output to stdout.
 async fn stream_mcp(mut stream: UnixStream, interpreter: Interpreter) -> io::Result<i32> {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     write_frame(
         &mut stream,
@@ -252,11 +303,44 @@ async fn stream_mcp(mut stream: UnixStream, interpreter: Interpreter) -> io::Res
     )
     .await?;
 
-    let (mut readable, mut writable) = stream.into_split();
+    let (mut readable, writable) = stream.into_split();
 
-    // stdin -> the box. Its own task, because the two directions are independent: a client may send
-    // a request while a previous answer is still arriving.
-    let inbound = tokio::spawn(async move {
+    let inbound = pump_stdin(writable);
+
+    // The box -> stdout.
+    let mut stdout = tokio::io::stdout();
+    let mut status = 0;
+    loop {
+        let frame = match read_frame::<Frame, _>(&mut readable).await {
+            Ok(Some(frame)) => frame,
+            // The box closed the connection, which is how a session ends.
+            Ok(None) | Err(_) => break,
+        };
+        match frame.body {
+            Body::Output { data, .. } => {
+                let bytes = decode_payload(&data)?;
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+            // A refusal is terminal and must not report a successful exit.
+            Body::Denied { reason, .. } => {
+                eprintln!("strands-box: {reason}");
+                return Ok(i32::from(SHELL_FAILURE_EXIT));
+            }
+            Body::Exit { status: reported } => {
+                status = reported;
+                break;
+            }
+            _ => {}
+        }
+    }
+    inbound.abort();
+    Ok(status)
+}
+
+fn pump_stdin(mut writable: tokio::net::unix::OwnedWriteHalf) -> tokio::task::JoinHandle<()> {
+    use tokio::io::AsyncReadExt as _;
+    tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buffer = [0_u8; 8192];
         loop {
@@ -284,38 +368,9 @@ async fn stream_mcp(mut stream: UnixStream, interpreter: Interpreter) -> io::Res
             },
         )
         .await;
-    });
-
-    // The box -> stdout.
-    let mut stdout = tokio::io::stdout();
-    let mut status = 0;
-    loop {
-        let frame = match read_frame::<Frame, _>(&mut readable).await {
-            Ok(Some(frame)) => frame,
-            // The box closed the connection, which is how a session ends.
-            Ok(None) | Err(_) => break,
-        };
-        match frame.body {
-            Body::Output { data, .. } => {
-                let bytes = decode_payload(&data)?;
-                stdout.write_all(&bytes).await?;
-                stdout.flush().await?;
-            }
-            // A refusal is a failure exit and is terminal. Printing the reason and looping left
-            // `status` at 0, so a refused MCP server closed the connection and the alias exited
-            Body::Denied { reason, .. } => {
-                eprintln!("strands-box: {reason}");
-                return Ok(i32::from(SHELL_FAILURE_EXIT));
-            }
-            Body::Exit { status: reported } => {
-                status = reported;
-                break;
-            }
-            _ => {}
-        }
-    }
-    inbound.abort();
-    Ok(status)
+        // Program stdin EOF does not close the transport before its Exit frame.
+        writable.forget();
+    })
 }
 
 /// Derive a socket path from the alias's grandparent, never from an argument.
@@ -367,15 +422,12 @@ async fn forward(socket: &Path, interpreter: Interpreter, source: String) -> io:
         return stream_mcp(stream, interpreter).await;
     }
 
-    // `InputEof` immediately after the Call, because this alias forwards no input: a harness
-    // invoking `zsh -c` gives the command nothing on stdin, and without the EOF the Program's stdin
     for body in [
         Body::Open { mode: interpreter },
         Body::Call {
             source,
             correlation: Box::new(call_correlation()),
         },
-        Body::InputEof,
     ] {
         tokio::time::timeout(
             SERVE_IO_TIMEOUT,
@@ -392,52 +444,57 @@ async fn forward(socket: &Path, interpreter: Interpreter, source: String) -> io:
         .map_err(|_| timed_out("write a transport frame"))??;
     }
 
-    // Relayed as it arrives rather than accumulated, so a long-running command is observable
-    // while it runs.
-    loop {
-        let frame =
-            tokio::time::timeout(SERVE_RESPONSE_TIMEOUT, read_frame::<Frame, _>(&mut stream))
-                .await
-                .map_err(|_| timed_out("read a transport frame"))??
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "the box broker closed")
-                })?;
-        match frame.body {
-            Body::Output {
-                stream: which,
-                data,
-            } => {
-                use std::io::Write as _;
-                let bytes = decode_payload(&data)?;
-                // Flushed per chunk, not at exit.
-                match which {
-                    Stream::Stdout => {
-                        let mut out = std::io::stdout();
-                        out.write_all(&bytes)?;
-                        out.flush()?;
-                    }
-                    Stream::Stderr => {
-                        let mut err = std::io::stderr();
-                        err.write_all(&bytes)?;
-                        err.flush()?;
+    let (mut readable, writable) = stream.into_split();
+    let inbound = pump_stdin(writable);
+    let outcome = async {
+        loop {
+            let frame = tokio::time::timeout(
+                SERVE_RESPONSE_TIMEOUT,
+                read_frame::<Frame, _>(&mut readable),
+            )
+            .await
+            .map_err(|_| timed_out("read a transport frame"))??
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the box broker closed"))?;
+            match frame.body {
+                Body::Output {
+                    stream: which,
+                    data,
+                } => {
+                    use std::io::Write as _;
+                    let bytes = decode_payload(&data)?;
+                    // Flushed per chunk, not at exit.
+                    match which {
+                        Stream::Stdout => {
+                            let mut out = std::io::stdout();
+                            out.write_all(&bytes)?;
+                            out.flush()?;
+                        }
+                        Stream::Stderr => {
+                            let mut err = std::io::stderr();
+                            err.write_all(&bytes)?;
+                            err.flush()?;
+                        }
                     }
                 }
-            }
-            Body::Exit { status } => return Ok(status),
-            // A transport refusal, including a version mismatch. Terminal, and reported as the
-            // boundary's own failure rather than as something the program did.
-            Body::Denied { reason, .. } => {
-                eprintln!("strands-box: {reason}");
-                return Ok(i32::from(SHELL_FAILURE_EXIT));
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("the box broker sent a client frame: {other:?}"),
-                ));
+                Body::Exit { status } => return Ok(status),
+                // A transport refusal, including a version mismatch. Terminal, and reported as the
+                // boundary's own failure rather than as something the program did.
+                Body::Denied { reason, .. } => {
+                    eprintln!("strands-box: {reason}");
+                    return Ok(i32::from(SHELL_FAILURE_EXIT));
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("the box broker sent a client frame: {other:?}"),
+                    ));
+                }
             }
         }
     }
+    .await;
+    inbound.abort();
+    outcome
 }
 
 /// One Call's correlation, read from `TRACEPARENT` and `TRACESTATE` and from no other variable.
@@ -468,6 +525,58 @@ mod tests {
     // REMOVED: `the_python_alias_names_match_the_layouts`.
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_linux_cleanup_paths_close_descriptors_above_a_lowered_limit() {
+        for cleanup in [close_inherited_descriptors, close_proc_descriptors] {
+            // SAFETY: the child owns all mutations and exits without returning.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                use std::os::fd::AsRawFd;
+                let file = std::fs::File::open("/dev/null").unwrap();
+                // SAFETY: duplicate an owned descriptor, then lower only this child's soft limit.
+                unsafe {
+                    let high = libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 128);
+                    if high < 128 {
+                        libc::_exit(10);
+                    }
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        libc::_exit(11);
+                    }
+                    limit.rlim_cur = 64;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        libc::_exit(12);
+                    }
+                    if cleanup().is_err() {
+                        libc::_exit(13);
+                    }
+                    if libc::fcntl(high, libc::F_GETFD) != -1
+                        || io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+                    {
+                        libc::_exit(14);
+                    }
+                    for stdio in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                        if libc::fcntl(stdio, libc::F_GETFD) == -1 {
+                            libc::_exit(15);
+                        }
+                    }
+                    libc::_exit(0);
+                }
+            }
+            let mut status = 0;
+            // SAFETY: wait only for the child created above.
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "non-stdio descriptors must all close"
+            );
+        }
+    }
 
     /// **The alias names no harness, and it reads no vendor variable.** `TRACEPARENT` and
     /// `TRACESTATE` are the only two names this image knows, because every harness spells those the
