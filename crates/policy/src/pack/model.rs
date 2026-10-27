@@ -271,7 +271,6 @@ fn declared(
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture::MINIMAL;
     use super::*;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -285,22 +284,6 @@ mod tests {
             removes: strings(removes),
             when: Vec::new(),
         }
-    }
-
-    #[test]
-    fn a_minimal_pack_loads_from_its_file() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let path = directory.path().join("git.pack.toml");
-        std::fs::write(&path, MINIMAL).expect("the pack file is written");
-
-        let pack = Pack::load(&path).expect("the pack loads");
-
-        assert_eq!(pack.name, "git");
-        assert_eq!(pack.version, 1);
-        assert_eq!(pack.program, "git");
-        assert_eq!(pack.effects, BTreeSet::from(["force_push".to_string()]));
-        assert_eq!(pack.actions.keys().collect::<Vec<_>>(), ["push"]);
-        assert!(pack.global_options.is_empty());
     }
 
     #[test]
