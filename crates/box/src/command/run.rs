@@ -207,49 +207,44 @@ async fn hosted(
             eprintln!("{}", grant.disclosure());
         }
     }
-    // PROTOTYPE(content-inspection): start the inspector leaf once, before the agent, in mode B.
-    if let (Some(inspector), Some(spec)) = (
-        hosted.inspector(),
-        locked
-            .record
-            .inspection
-            .as_ref()
-            .and_then(|i| i.leaf_spec()),
-    ) {
-        let table = "[inspection.content]";
-        let boundary = Boundary::translate(
-            &spec,
-            Launch {
-                table,
-                trailing: &[],
-                fallback_workspace: &locked.workspace,
-                shebang_interpreters: ShebangInterpreters::Granted,
-                runtime_reach: RuntimeReach::Leaf,
-                argument_zero: None,
-                egress: EgressMode::for_spec(&spec),
-                approved: hosted.approved().table(table),
-                // PROTOTYPE(content-inspection): `[inspection.content] gpu`.
-                gpu: locked
-                    .record
-                    .inspection
-                    .as_ref()
-                    .is_some_and(|inspection| inspection.content.gpu),
-            },
-            &site,
-        )?;
-        eprintln!("{}", boundary.disclosure());
-        let leaf = crate::run::contain::supervise::LeafBox::spawn_streaming(
-            boundary,
-            &locked.root,
-            #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))]
-            hosted.native_registration(),
-            true,
-        )
-        .await?;
-        let parts = leaf.into_parts().ok_or_else(|| ConfigError::Contract {
-            reason: "the inspector leaf exposed no stdio".to_string(),
-        })?;
-        inspector.adopt_leaf(parts);
+    // PROTOTYPE(content-inspection): start the inspector and run `capabilities`, before the agent.
+    if let (Some(inspector), Some(config)) = (hosted.inspector(), locked.record.inspection.as_ref()) {
+        let table = crate::record::config::prototype_inspection::TABLE;
+        let refuse = |reason: String| ConfigError::Contract {
+            reason: format!("{table}: {reason}"),
+        };
+        let mut parts = None;
+        if let Some(spec) = config.leaf_spec() {
+            let boundary = Boundary::translate(
+                &spec,
+                Launch {
+                    table,
+                    trailing: &[],
+                    fallback_workspace: &locked.workspace,
+                    shebang_interpreters: ShebangInterpreters::Granted,
+                    runtime_reach: RuntimeReach::Leaf,
+                    argument_zero: None,
+                    egress: EgressMode::for_spec(&spec),
+                    approved: hosted.approved().table(table),
+                    gpu: config.gpu,
+                },
+                &site,
+            )?;
+            eprintln!("{}", boundary.disclosure());
+            let leaf = crate::run::contain::supervise::LeafBox::spawn_streaming(
+                boundary,
+                &locked.root,
+                #[cfg(all(target_os = "macos", feature = "native-filesystem-policy"))]
+                hosted.native_registration(),
+                true,
+            )
+            .await?;
+            parts = Some(
+                leaf.into_parts()
+                    .ok_or_else(|| refuse("the inspector leaf exposed no stdio".to_string()))?,
+            );
+        }
+        inspector.start(parts).await.map_err(refuse)?;
     }
     let boundary = Boundary::translate(
         &agent,

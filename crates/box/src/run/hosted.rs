@@ -612,10 +612,13 @@ impl HostedBox {
                 ),
         ));
         // PROTOTYPE(content-inspection): the inspector the egress gate consults.
-        let inspector = record
-            .inspection
-            .as_ref()
-            .map(super::prototype_inspection::PrototypeInspector::from_config);
+        let inspector = record.inspection.as_ref().map(|config| {
+            super::prototype_inspection::PrototypeInspector::from_config(
+                config,
+                root.name(),
+                policy.uses_inspection(),
+            )
+        });
         let egress_policy = EgressPolicyInterceptor::into_handle_with_inspection(
             Arc::clone(&policy),
             Principal::agent(),

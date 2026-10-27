@@ -127,8 +127,9 @@ impl EgressPolicyInterceptor {
             eprintln!("inspection: {method} {url} refused: the policy uses Inspection::Content and no inspector is configured");
             return Err("content inspection: no inspector is configured".to_string());
         };
-        if body.len() > crate::MAXIMUM_INSPECTED_BODY {
-            eprintln!("inspection: {method} {url} refused: body of {} bytes is over the limit", body.len());
+        let limit = inspector.max_body_bytes();
+        if body.len() > limit {
+            eprintln!("inspection: {method} {url} refused: body of {} bytes is over the inspector's max_body_bytes {limit}", body.len());
             return Err("content inspection: body is over the inspection limit".to_string());
         }
         let request = crate::InspectionRequest {

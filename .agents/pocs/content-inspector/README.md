@@ -1,6 +1,6 @@
 # PROTOTYPE — throwaway: content inspector for the Box egress gateway
 
-Answers one question: can one NDJSON inspector protocol front several classification backends
+Answers one question: can one inspector protocol (`../egress-classification-protocol/SPEC.md`, draft 0.2) front several classification backends
 (regex, Presidio, Strands Decider), and what does each cost per request? No tests. Do not build on it.
 
 ## Setup (Linux aarch64, CPU only)
@@ -23,7 +23,7 @@ no Bedrock, and no AWS credentials.
 python3 -m venv .venv
 .venv/bin/pip install torch strands-decider     # the default macOS wheel has MPS
 cd ../content-inspection-e2e
-DEVICE=mps ./run-e2e.sh socket decider          # start with socket mode; stdio leaf is untested on macOS
+DEVICE=mps ./run-e2e.sh unix decider            # start with unix mode; stdio leaf is untested on macOS
 ```
 
 ## Run
@@ -34,7 +34,11 @@ DEVICE=mps ./run-e2e.sh socket decider          # start with socket mode; stdio 
 .venv/bin/python -I client.py --socket /tmp/insp.sock            # clean, pii, secret
 .venv/bin/python -I client.py --socket /tmp/insp.sock --body 'my ssn is 123-45-6789'
 
-# stdio (Box launches it in a leaf): NDJSON on stdin/stdout; all logs go to stderr
+# https on 127.0.0.1 only; the token comes from --token or $INSPECTOR_TOKEN
+.venv/bin/python -I inspector.py --https 127.0.0.1:8443 --cert leaf.pem --key leaf.key --token T
+.venv/bin/python -I client.py --https https://127.0.0.1:8443/v1/classify --cafile ca.pem --token T
+
+# stdio (Box launches it in a leaf): one message per line on stdin/stdout; all logs go to stderr
 .venv/bin/python -I inspector.py --stdio --backend regex < requests.ndjson
 ```
 
@@ -46,7 +50,7 @@ Decider flags: `--device cpu|cuda|mps|mlx`, `--threshold 0.5`, `--max-state-char
   concurrently, so correlate them by `id`.
 - `latency_ms` counts time spent waiting for the backend. For Decider that includes queueing
   behind the per-engine lock.
-- Bad JSON gives `{"id": null, "error": ...}`. A line longer than 16 MiB gives an error and closes the connection.
+- Bad JSON gives `{"id": null, "error": {"code": "invalid_request", ...}}`. A line longer than 16 MiB gives an error and closes the connection.
 - In stdio mode, fd 1 is pointed at stderr after startup, so library prints cannot corrupt the stream.
 - Decider gives no span, so its finding has `kind:"model"`, and the evidence is the probability,
   never the content. Presidio is PII only.

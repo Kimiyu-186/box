@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PROTOTYPE content inspector: NDJSON over a unix socket, pluggable backends."""
+"""PROTOTYPE content inspector: egress classification protocol draft 0.2 over stdio, unix, or https."""
 
 import argparse
 import asyncio
@@ -13,10 +13,19 @@ import threading
 import time
 from urllib.parse import parse_qsl, urlsplit
 
-PROTOCOL_V = 1
+PROTOCOL_V = "0.2"
 SUPPORTED = ("PII", "SECRET")
-BODY_CAP = 1 << 20
+BODY_CAP = 1 << 20  # advertised as subjects.http.max_body_bytes
 LINE_LIMIT = 16 << 20
+HTTP_STATUS = {
+    "invalid_request": 400,
+    "unsupported_version": 400,
+    "unsupported_subject": 400,
+    "unauthorized": 401,
+    "too_large": 413,
+    "rate_limited": 429,
+    "internal": 500,
+}
 
 
 def log(*a):
@@ -26,8 +35,8 @@ def log(*a):
 # ---------------------------------------------------------------- input
 
 
-def segments(req):
-    """(where, text) pairs: URL query values, header values, body (capped)."""
+def segments(req, raw=None):
+    """(where, text) pairs: URL query values, header values, body."""
     out = []
     url = req.get("url") or ""
     try:
@@ -39,9 +48,7 @@ def segments(req):
     for h in req.get("headers") or []:
         if isinstance(h, (list, tuple)) and len(h) == 2:
             out.append(("header", f"{h[0]}: {h[1]}"))
-    b64 = req.get("body_b64")
-    if b64:
-        raw = base64.b64decode(b64, validate=False)[:BODY_CAP]
+    if raw:
         out.append(("body", raw.decode("utf-8", errors="replace")))
     return out
 
@@ -124,6 +131,7 @@ def regex_secret(text):
 
 class RegexBackend:
     name = "regex"
+    labels = ("PII", "SECRET")
 
     def classify(self, segs, labels):
         out = []
@@ -161,6 +169,7 @@ DECIDER_CLASSIFIER = {
 
 class DeciderBackend:
     name = "decider"
+    labels = ("PII", "SECRET")
 
     def __init__(self, checkpoint, device, threshold, max_state_chars):
         from strands_decider.infer import load_engine
@@ -213,6 +222,7 @@ class PresidioBackend:
     """PII only; SECRET is not a Presidio concept and is reported as unsupported."""
 
     name = "presidio"
+    labels = ("PII",)
 
     def __init__(self):
         from presidio_analyzer import AnalyzerEngine
@@ -248,7 +258,13 @@ class PresidioBackend:
         return out
 
 
-# ---------------------------------------------------------------- server
+# ---------------------------------------------------------------- protocol
+
+
+class ProtocolError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
 def dedupe(findings):
@@ -261,46 +277,89 @@ def dedupe(findings):
     return out
 
 
-async def handle_line(backend, line):
+def capabilities(backend):
+    return {
+        "versions": [PROTOCOL_V],
+        "inspector": {"name": backend.name, "version": "0.2-prototype"},
+        "subjects": {"http": {"labels": list(backend.labels), "max_body_bytes": BODY_CAP}},
+    }
+
+
+def classify(backend, params, rid):
+    subject = params.get("subject")
+    if not isinstance(subject, dict):
+        raise ProtocolError("invalid_request", "params.subject is required")
+    if subject.get("kind") != "http":
+        raise ProtocolError("unsupported_subject", f"this inspector does not classify {subject.get('kind')!r}")
+    asked = params.get("labels")
+    if not isinstance(asked, list) or not asked or not all(isinstance(l, str) for l in asked):
+        raise ProtocolError("invalid_request", "params.labels must be a non-empty list of strings")
+    raw = b""
+    if subject.get("body_b64"):
+        try:
+            raw = base64.b64decode(subject["body_b64"], validate=True)
+        except ValueError:
+            raise ProtocolError("invalid_request", "body_b64 is not standard base64")
+    if len(raw) > BODY_CAP:
+        raise ProtocolError("too_large", f"body is {len(raw)} bytes, limit is {BODY_CAP}")
+    labels = [l for l in dict.fromkeys(asked) if l in backend.labels]
+    segs = segments(subject, raw)
+    t = time.monotonic()
+    findings = dedupe(backend.classify(segs, labels)) if labels and segs else []
+    ms = round((time.monotonic() - t) * 1000)
+    found = [l for l in dict.fromkeys(f["label"] for f in findings) if l in labels]
+    log(
+        f"{rid} classify {subject.get('method')} {subject.get('url')} "
+        f"headers={subject.get('headers')} asked={asked} -> {found} {ms}ms"
+    )
+    return {"labels": found, "findings": [f for f in findings if f["label"] in found]}
+
+
+def respond(backend, line):
+    """One request line (bytes or str) -> one response dict. Never raises."""
     rid = None
     try:
-        msg = json.loads(line)
-        rid = msg.get("id")
-        if msg.get("v") != PROTOCOL_V:
-            raise ValueError(f"unsupported protocol version {msg.get('v')!r}")
-        if not isinstance(rid, str):
-            raise ValueError("missing string id")
-        labels = [l for l in dict.fromkeys(msg.get("labels") or []) if l in SUPPORTED]
-        segs = segments(msg.get("request") or {})
-        t = time.monotonic()
-        raw = (
-            await asyncio.get_running_loop().run_in_executor(
-                None, backend.classify, segs, labels
-            )
-            if labels and segs
-            else []
-        )
-        ms = round((time.monotonic() - t) * 1000)
-        findings = dedupe(raw)
-        found = list(dict.fromkeys(f["label"] for f in findings))
-        return {
-            "v": PROTOCOL_V,
-            "id": rid,
-            "labels": found,
-            "findings": findings,
-            "backend": backend.name,
-            "latency_ms": ms,
-        }
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            raise ProtocolError("invalid_request", "the message is not JSON")
+        if not isinstance(msg, dict):
+            raise ProtocolError("invalid_request", "the message is not an object")
+        rid = msg.get("id") if isinstance(msg.get("id"), str) else None
+        if rid is None:
+            raise ProtocolError("invalid_request", "missing string id")
+        v = msg.get("v")
+        if not isinstance(v, str) or v.split(".")[0] != PROTOCOL_V.split(".")[0]:
+            raise ProtocolError("unsupported_version", f"unsupported protocol version {v!r}")
+        op, params = msg.get("op"), msg.get("params")
+        if not isinstance(params, dict):
+            raise ProtocolError("invalid_request", "params must be an object")
+        if op == "capabilities":
+            result = capabilities(backend)
+            log(f"{rid} capabilities")
+        elif op == "classify":
+            result = classify(backend, params, rid)
+        else:
+            raise ProtocolError("invalid_request", f"unknown op {op!r}")
+        return {"v": PROTOCOL_V, "id": rid, "result": result}
+    except ProtocolError as e:
+        log(f"{rid} error {e.code}: {e}")
+        return {"v": PROTOCOL_V, "id": rid, "error": {"code": e.code, "message": str(e)}}
     except Exception as e:  # noqa: BLE001 - prototype: every failure becomes a typed error
-        return {"v": PROTOCOL_V, "id": rid, "error": f"{type(e).__name__}: {e}"}
+        log(f"{rid} error internal: {type(e).__name__}: {e}")
+        return {"v": PROTOCOL_V, "id": rid, "error": {"code": "internal", "message": f"{type(e).__name__}: {e}"}}
+
+
+# ---------------------------------------------------------------- line bindings (stdio, unix)
 
 
 async def pump(backend, reader, emit):
-    """Read NDJSON lines, answer each concurrently; `emit(bytes)` is an async writer."""
+    """Read one message per line, answer each concurrently; `emit(bytes)` is an async writer."""
     lock = asyncio.Lock()
+    loop = asyncio.get_running_loop()
 
     async def one(line):
-        resp = await handle_line(backend, line)
+        resp = await loop.run_in_executor(None, respond, backend, line)
         async with lock:
             await emit((json.dumps(resp) + "\n").encode())
 
@@ -309,8 +368,9 @@ async def pump(backend, reader, emit):
         try:
             line = await reader.readline()
         except (ValueError, asyncio.LimitOverrunError):
+            err = {"v": PROTOCOL_V, "id": None, "error": {"code": "invalid_request", "message": "line over 16 MiB"}}
             async with lock:
-                await emit((json.dumps({"v": PROTOCOL_V, "id": None, "error": "line too long"}) + "\n").encode())
+                await emit((json.dumps(err) + "\n").encode())
             break
         if not line:
             break
@@ -348,6 +408,58 @@ async def serve_stdio(backend, out):
     await pump(backend, reader, emit)
 
 
+# ---------------------------------------------------------------- https binding
+
+
+def serve_https(backend, addr, cert, key, token):
+    import http.server
+    import ssl
+
+    host, _, port = addr.rpartition(":")
+    if host not in ("127.0.0.1", "localhost"):
+        raise SystemExit("--https binds 127.0.0.1 only")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            log("https", fmt % args)
+
+        def reply(self, resp):
+            body = json.dumps(resp).encode()
+            err = resp.get("error")
+            status = HTTP_STATUS.get(err["code"], 500) if err else 200
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > LINE_LIMIT:
+                self.close_connection = True
+                return self.reply({"v": PROTOCOL_V, "id": None, "error": {"code": "invalid_request", "message": "message over 16 MiB"}})
+            raw = self.rfile.read(length)
+            if token is not None and self.headers.get("Authorization") != f"Bearer {token}":
+                try:
+                    rid = json.loads(raw).get("id")
+                except Exception:  # noqa: BLE001
+                    rid = None
+                rid = rid if isinstance(rid, str) else None
+                log(f"{rid} error unauthorized: bad or missing bearer token")
+                return self.reply({"v": PROTOCOL_V, "id": rid, "error": {"code": "unauthorized", "message": "bad or missing bearer token"}})
+            self.reply(respond(backend, raw))
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    log(f"listening on https://127.0.0.1:{port} backend={backend.name} token={'set' if token else 'none'}")
+    server.serve_forever()
+
+
 def build_backend(args):
     if args.backend == "regex":
         return RegexBackend()
@@ -360,13 +472,18 @@ def build_backend(args):
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--socket", default=os.environ.get("INSPECTOR_SOCKET"))
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--stdio", action="store_true", help="one message per line on stdin/stdout")
+    mode.add_argument("--socket", default=os.environ.get("INSPECTOR_SOCKET"), help="unix socket path")
+    mode.add_argument("--https", metavar="HOST:PORT", help="https on 127.0.0.1 only")
+    ap.add_argument("--cert")
+    ap.add_argument("--key")
+    ap.add_argument("--token", default=os.environ.get("INSPECTOR_TOKEN"))
     ap.add_argument("--backend", choices=["regex", "decider", "presidio"], default="regex")
     ap.add_argument("--decider-model", default="StrandsAgents/strands-decider-2B-hobson-v19")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--max-state-chars", type=int, default=16384)
-    ap.add_argument("--stdio", action="store_true", help="NDJSON on stdin/stdout instead of a socket")
     args = ap.parse_args()
     if args.stdio:
         # Keep the real stdout for protocol lines only; anything else printing to fd 1
@@ -377,16 +494,28 @@ async def main():
         backend = build_backend(args)
         await serve_stdio(backend, out)
         return
+    if args.https:
+        if not (args.cert and args.key):
+            raise SystemExit("--https needs --cert and --key")
+        backend = build_backend(args)
+        await asyncio.get_running_loop().run_in_executor(
+            None, serve_https, backend, args.https, args.cert, args.key, args.token
+        )
+        return
     if not args.socket:
-        raise SystemExit("--socket or $INSPECTOR_SOCKET required")
+        raise SystemExit("one of --stdio, --socket PATH, or --https HOST:PORT is required")
     backend = build_backend(args)
     if os.path.exists(args.socket):
         os.unlink(args.socket)
-    server = await asyncio.start_unix_server(
-        lambda r, w: serve_conn(backend, r, w), path=args.socket, limit=LINE_LIMIT
-    )
+    old = os.umask(0o177)
+    try:
+        server = await asyncio.start_unix_server(
+            lambda r, w: serve_conn(backend, r, w), path=args.socket, limit=LINE_LIMIT
+        )
+    finally:
+        os.umask(old)
     os.chmod(args.socket, 0o600)
-    log(f"listening on {args.socket} backend={backend.name}")
+    log(f"listening on unix {args.socket} backend={backend.name}")
     async with server:
         await server.serve_forever()
 

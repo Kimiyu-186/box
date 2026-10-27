@@ -19,38 +19,52 @@ agent (curl) ──HTTPS──▶ egress gateway (MITM, body buffered)
                               │ policy uses Inspection::Content?  no ─▶ decide as usual
                               │ yes
                               ▼
-                        inspector  ◀── NDJSON: method, url, headers (auth redacted), body
-                              │      ──▶ {"labels":["PII"], "findings":[...]}
+                        inspector  ◀── protocol 0.2 `classify`: http subject (auth redacted), labels
+                              │      ──▶ {"result":{"labels":["PII"], "findings":[...]}}
                               ▼
                         Dogwood decides with the labels ─▶ 200 or 403
 ```
 
-- The inspector is any program that speaks the protocol. `../content-inspector/inspector.py`
+- The inspector is any program that speaks the protocol in
+  `../egress-classification-protocol/SPEC.md` (draft 0.2). `../content-inspector/inspector.py`
   wraps three backends: `regex`, `presidio`, and `decider` (Strands Decider, a local 2B model).
-- Box reaches the inspector in one of two ways:
-  - **socket**: the inspector runs outside the box, started by you, and can serve many boxes.
-  - **command**: Box starts the inspector once, in a contained leaf, and talks to it on stdio.
-    `gpu = true` lets that leaf use Metal on macOS.
-- If the inspector fails, times out, or the body is over 1 MiB, the request is denied.
+- Box reaches the inspector in one of three ways:
+  - **unix**: the inspector runs outside the box, started by you, on a socket you own that is not
+    group- or other-writable. Box keeps one connection and reconnects after it drops.
+  - **https**: the inspector runs outside the box. Box sends one POST per message, with a bearer
+    token that Box resolves through its credential vault.
+  - **command** (stdio): Box starts the inspector once, in a contained leaf, and talks to it on
+    stdio. `gpu = true` lets that leaf use Metal on macOS.
+- At startup Box sends `capabilities`. Box refuses to start if the inspector is unreachable, has no
+  `0.x` version, or does not list the `http` subject. Box prints the inspector's name and its http
+  labels, and warns about each policy label the inspector does not list.
+- If the inspector fails, times out, or the body is over the inspector's `max_body_bytes`, the
+  request is denied.
 - If the policy never calls `Inspection::Content`, the inspector is not called at all.
 - `authorization`, `proxy-authorization`, and `cookie` values are redacted before the inspector sees
   them.
 
 ## Configuration
 
+Set exactly one of `endpoint` and `command`.
+
 ```toml
-[inspection.content]
-provider = "local"                 # the only value in the prototype
-timeout_ms = 2000                  # per request; use 120000 for Decider on CPU
+[egress.inspector]
+timeout_ms = 2000                  # end to end, per call; use 120000 for Decider on CPU
 
-# Either: connect to an inspector that is already running.
-socket = "/abs/path/inspector.sock"
+# unix: connect to an inspector that is already running.
+endpoint = "unix:///abs/path/inspector.sock"
 
-# Or: Box starts it in a leaf.
+# https: POST to an inspector that is already running. `http://` is refused.
+# endpoint = "https://127.0.0.1:8443/v1/classify"
+# secret.ref = "env://INSPECTOR_TOKEN"   # a Box credential locator for the bearer token
+# ca_file = "/abs/path/ca.pem"           # optional extra trust root (prototype knob)
+
+# stdio: Box starts it in a leaf.
 # command = ["/path/to/python3", "/path/to/inspector.py", "--stdio", "--backend", "regex"]
 # env = { HOME = "/Users/you" }
 # gpu = true                       # macOS only: Metal for the leaf, and only this leaf
-# [inspection.content.filesystem]
+# [egress.inspector.filesystem]
 # read = ["/path/to/python/prefix", "/path/to/content-inspector"]
 ```
 
@@ -71,7 +85,7 @@ cd -
 The first Decider run downloads about 4.4 GB of weights from Hugging Face. No token or AWS
 credentials are needed.
 
-## Demo 1: a shared inspector on the GPU (socket)
+## Demo 1: a shared inspector on the GPU (unix)
 
 **Terminal 1** — start the inspector. Decider takes about 20 s to load; wait for the
 `decider loaded ... on mps` line.
@@ -101,9 +115,8 @@ env = { PATH = "/usr/bin:/bin", HOME = "$DEMO/home" }
 [agent.filesystem]
 read_file = ["/private/etc/ssl/openssl.cnf"]
 
-[inspection.content]
-provider = "local"
-socket = "/private/tmp/inspector.sock"
+[egress.inspector]
+endpoint = "unix:///private/tmp/inspector.sock"
 timeout_ms = 10000
 EOF
 cat "$DEMO/policy.dw"
@@ -130,7 +143,7 @@ What to point at on screen:
 
 - the clean request returns httpbin's echo and `status=200`;
 - the box prints one line per inspected request, for example
-  `inspection: POST https://httpbin.org/post labels=["PII"] backend=decider latency=1400ms`;
+  `inspection: POST https://httpbin.org/post labels=["PII"] backend=decider 0.2-prototype latency=1400ms`;
 - the PII and secret requests get `status=403` from the gateway, and the request never leaves
   the machine;
 - Terminal 1 logs each request it classified.
@@ -152,8 +165,8 @@ cp .agents/pocs/content-inspection-e2e/policy.dw "$DEMO/policy.dw"
 ```
 
 **Fail closed.** Stop the inspector in Terminal 1 (Ctrl-C), and send the clean request again.
-It gets 403. The response body says `http:request gate: content inspection failed: connect ...`,
-and the box prints `inspection: POST ... refused: inspector failed: connect ...`.
+It gets 403 if the box is already running; a new box refuses to start, because `capabilities`
+fails. The box prints `inspection: POST ... refused: inspector failed: ...`.
 
 ## Demo 2: Box starts the inspector in a contained leaf, on the GPU
 
@@ -169,7 +182,7 @@ cat box-stdio-b-pii.toml          # the generated config: command, filesystem gr
 
 On screen, the startup disclosure lists the leaf's grants, including
 `gpu  Metal (AGX, IOSurface, MTLCompilerService)`, and then
-`inspection: content inspector leaf started (pid ...)`.
+`inspection: inspector leaf started (pid ...)` and the capabilities line.
 
 To show that the GPU grant is what makes this work, run it without the grant. Case a fails with
 403, and the inspector's stderr shows `The MPS backend is supported on macOS 14.0+`:
@@ -190,10 +203,11 @@ GPU=0 DEVICE=mps ./run-e2e.sh stdio decider
 
 ```sh
 cd .agents/pocs/content-inspection-e2e
-./run-e2e.sh socket regex
-./run-e2e.sh stdio  regex
-DEVICE=mps ./run-e2e.sh socket decider
-DEVICE=mps ./run-e2e.sh stdio  decider
+./run-e2e.sh stdio regex
+./run-e2e.sh unix  regex
+./run-e2e.sh https regex     # makes a throwaway CA and a 127.0.0.1 cert with openssl
+DEVICE=mps ./run-e2e.sh unix  decider
+DEVICE=mps ./run-e2e.sh stdio decider
 ```
 
 On Linux, set nothing extra: the script exports `EXPERIMENTAL_LINUX_SUPPORT=TRUE`. `gpu = true`
@@ -213,7 +227,7 @@ is accepted there and does nothing.
 
 - A denial from inspection is not written to the policy history.
 - The leaf is not restarted if it exits; every request after that is denied.
-- `timeout_ms` is per read on the socket, not an end-to-end deadline.
+- No `dns` or `connect` subject, and no `cache_ttl_s`.
 - The inspector only sees request bodies. Responses, MCP tool arguments, and file writes are not
   inspected.
 - Decider's accuracy is not measured. In one smoke test it missed a GitHub token that the regex

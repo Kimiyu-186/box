@@ -115,9 +115,6 @@ impl ProviderResolver for InspectionResolver {
     }
 }
 
-/// PROTOTYPE(content-inspection): the largest body the inspector is asked about; a larger one is denied.
-pub const MAXIMUM_INSPECTED_BODY: usize = 1024 * 1024;
-
 /// PROTOTYPE(content-inspection): one outbound request handed to a content inspector.
 #[derive(Debug)]
 pub struct InspectionRequest<'a> {
@@ -138,9 +135,9 @@ pub struct InspectionRequest<'a> {
 pub struct InspectionVerdict {
     /// The labels found in the request.
     pub labels: Vec<String>,
-    /// The backend that classified the request.
+    /// The inspector that classified the request, as its capabilities name it.
     pub backend: String,
-    /// The inspector's own latency.
+    /// The end-to-end latency of the classify call.
     pub latency_ms: u64,
 }
 
@@ -148,4 +145,6 @@ pub struct InspectionVerdict {
 pub trait ContentInspector: Send + Sync {
     /// Classify one request.
     fn inspect(&self, request: &InspectionRequest<'_>) -> Result<InspectionVerdict, String>;
+    /// The largest body the inspector accepts; a larger one is denied, never truncated.
+    fn max_body_bytes(&self) -> usize;
 }

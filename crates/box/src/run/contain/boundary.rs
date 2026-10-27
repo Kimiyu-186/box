@@ -90,9 +90,9 @@ impl ApprovedReach {
                     .map(|reach| (table, reach))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        // PROTOTYPE(content-inspection): the inspector leaf's lists, in mode B.
+        // PROTOTYPE(content-inspection): the inspector leaf's lists, for `command`.
         if let Some(spec) = stored.inspection.as_ref().and_then(|i| i.leaf_spec()) {
-            let table = "[inspection.content]".to_string();
+            let table = crate::record::config::prototype_inspection::TABLE.to_string();
             let reach = judge_filesystem(&spec, &table, stored, protected_sources)?;
             tables.insert(table, reach);
         }

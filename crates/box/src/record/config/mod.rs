@@ -26,7 +26,7 @@ pub(crate) mod env;
 pub(crate) mod filesystem;
 pub(crate) mod mcp;
 pub(crate) mod process;
-// PROTOTYPE(content-inspection): `[inspection.content]`.
+// PROTOTYPE(content-inspection): `[egress.inspector]`.
 pub(crate) mod prototype_inspection;
 pub(crate) mod telemetry;
 
@@ -1117,8 +1117,8 @@ struct ConfigFile {
     #[serde(default)]
     telemetry: BTreeMap<String, telemetry::TelemetryEntry>,
 
-    /// PROTOTYPE(content-inspection): the outbound content inspector.
-    #[serde(default)]
+    /// PROTOTYPE(content-inspection): `[egress.inspector]`, lifted out of the `egress` map at parse.
+    #[serde(skip)]
     inspection: Option<prototype_inspection::InspectionConfig>,
 }
 
@@ -1133,10 +1133,21 @@ impl ConfigFile {
 
     fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
         refuse_removed_keys(text, path)?;
-        let file: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        let parse_error = |source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
-        })?;
+        };
+        // PROTOTYPE(content-inspection): `[egress.inspector]` is not an `[egress.<name>]` entry.
+        let mut table: toml::Table = text.parse().map_err(parse_error)?;
+        let inspector = table
+            .get_mut("egress")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|egress| egress.remove("inspector"));
+        let mut file: Self = toml::Value::Table(table).try_into().map_err(parse_error)?;
+        file.inspection = inspector
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(parse_error)?;
         file.validate()?;
         Ok(file)
     }
@@ -1187,7 +1198,7 @@ impl ConfigFile {
                 self.experimental_features.native_filesystem_policy,
             )?;
         }
-        // PROTOTYPE(content-inspection): validate `[inspection.content]`.
+        // PROTOTYPE(content-inspection): validate `[egress.inspector]`.
         if let Some(inspection) = &self.inspection {
             inspection.validate()?;
         }

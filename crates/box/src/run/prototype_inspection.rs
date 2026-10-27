@@ -1,41 +1,79 @@
-//! PROTOTYPE(content-inspection): the client for a local content inspector, over a socket or a leaf's stdio.
+//! PROTOTYPE(content-inspection): the client for a content inspector, speaking the egress
+//! classification protocol draft 0.2 over stdio, unix, or https.
 
-use std::collections::HashMap;
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::net::UnixStream;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use policy::{ContentInspector, InspectionRequest, InspectionVerdict};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-use crate::record::config::prototype_inspection::InspectionConfig;
+use crate::record::config::prototype_inspection::{Binding, InspectionConfig};
 
-// PROTOTYPE(content-inspection): header names whose values never reach the inspector.
+const PROTOCOL_VERSION: &str = "0.2";
+const MAX_MESSAGE_BYTES: usize = 16 << 20;
 const REDACTED_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
+const KNOWN_ERRORS: [&str; 7] = [
+    "invalid_request",
+    "unsupported_version",
+    "unsupported_subject",
+    "unauthorized",
+    "too_large",
+    "rate_limited",
+    "internal",
+];
 
-// PROTOTYPE(content-inspection): one queued stdio request and the channel its reply goes to.
-type Pending = (
-    String,
-    String,
-    std::sync::mpsc::Sender<Result<String, String>>,
-);
+type Reply = std::sync::mpsc::Sender<Result<Value, String>>;
+type Pending = (String, String, Reply);
 
-// PROTOTYPE(content-inspection): where requests go.
+/// PROTOTYPE(content-inspection): what `capabilities` reported for the `http` subject.
+#[derive(Debug)]
+struct Capabilities {
+    name: String,
+    http_labels: BTreeSet<String>,
+    max_body_bytes: usize,
+}
+
+/// PROTOTYPE(content-inspection): the bearer token, held by a Box credential vault.
+struct Bearer {
+    vault: credentials::Vault,
+    phantom: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
 enum Transport {
-    Socket(PathBuf),
-    Leaf(tokio::sync::mpsc::UnboundedSender<Pending>),
+    /// stdio or unix: one long-lived line stream multiplexed by `id`.
+    Lines {
+        sender: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Pending>>>,
+        reconnect: Option<PathBuf>,
+    },
+    Https {
+        client: reqwest::Client,
+        url: String,
+        bearer: Bearer,
+    },
+}
+
+struct Started {
+    runtime: tokio::runtime::Handle,
+    transport: Transport,
 }
 
 /// PROTOTYPE(content-inspection): the box's one content inspector.
 pub(crate) struct PrototypeInspector {
-    transport: OnceLock<Transport>,
+    config: InspectionConfig,
+    box_name: String,
+    requested: Option<BTreeSet<String>>,
     timeout: Duration,
     next_id: AtomicU64,
-    // PROTOTYPE(content-inspection): the leaf child and what must outlive it, in mode B.
+    started: OnceLock<Started>,
+    capabilities: OnceLock<Capabilities>,
     leaf: Mutex<Option<LeafHold>>,
 }
 
@@ -51,116 +89,249 @@ impl Drop for LeafHold {
 }
 
 impl PrototypeInspector {
-    /// PROTOTYPE(content-inspection): the inspector the record declares; a socket inspector is ready at once.
-    pub(crate) fn from_config(config: &InspectionConfig) -> Arc<Self> {
-        let inspector = Self {
-            transport: OnceLock::new(),
-            timeout: Duration::from_millis(config.content.timeout_ms),
+    /// PROTOTYPE(content-inspection): the inspector the record declares; `start` connects it.
+    pub(crate) fn from_config(
+        config: &InspectionConfig,
+        box_name: &str,
+        requested: Option<BTreeSet<String>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: config.clone(),
+            box_name: box_name.to_string(),
+            requested,
+            timeout: Duration::from_millis(config.timeout_ms),
             next_id: AtomicU64::new(1),
+            started: OnceLock::new(),
+            capabilities: OnceLock::new(),
             leaf: Mutex::new(None),
+        })
+    }
+
+    /// PROTOTYPE(content-inspection): connect the binding, then run `capabilities`, or refuse.
+    pub(crate) async fn start(
+        self: &Arc<Self>,
+        leaf: Option<crate::run::contain::supervise::StreamingLeafParts>,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::current();
+        let binding = self.config.binding();
+        let transport = match (&binding, leaf) {
+            (Binding::Stdio, Some(parts)) => {
+                let sender = spawn_lines(&runtime, parts.stdout, parts.stdin, "leaf");
+                eprintln!(
+                    "strands-box: inspection: inspector leaf started (pid {})",
+                    parts.leader
+                );
+                if let Ok(mut leaf) = self.leaf.lock() {
+                    *leaf = Some(LeafHold {
+                        child: parts.child,
+                        _retention: parts.retention,
+                    });
+                }
+                Transport::Lines {
+                    sender: Mutex::new(Some(sender)),
+                    reconnect: None,
+                }
+            }
+            (Binding::Stdio, None) => return Err("the inspector leaf did not start".to_string()),
+            (Binding::Unix(path), _) => Transport::Lines {
+                sender: Mutex::new(Some(connect_unix(&runtime, path)?)),
+                reconnect: Some(path.clone()),
+            },
+            (Binding::Https(url), _) => Transport::Https {
+                client: https_client(&self.config)?,
+                url: url.clone(),
+                bearer: open_bearer(&self.config, url)?,
+            },
         };
-        if let Some(socket) = &config.content.socket {
-            let _ = inspector.transport.set(Transport::Socket(socket.clone()));
-            eprintln!(
-                "strands-box: inspection: content inspector on socket {}",
-                socket.display()
-            );
-        }
-        Arc::new(inspector)
-    }
-
-    /// PROTOTYPE(content-inspection): adopt the leaf's stdio, in mode B.
-    pub(crate) fn adopt_leaf(&self, parts: crate::run::contain::supervise::StreamingLeafParts) {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Pending>();
-        let mut stdin = parts.stdin;
-        let mut lines = tokio::io::BufReader::new(parts.stdout).lines();
-        tokio::spawn(async move {
-            let mut waiting: HashMap<String, std::sync::mpsc::Sender<Result<String, String>>> =
-                HashMap::new();
-            loop {
-                tokio::select! {
-                    queued = receiver.recv() => {
-                        let Some((id, line, reply)) = queued else { break };
-                        if let Err(error) = stdin.write_all(line.as_bytes()).await {
-                            let _ = reply.send(Err(format!("write to inspector: {error}")));
-                            continue;
-                        }
-                        let _ = stdin.flush().await;
-                        waiting.insert(id, reply);
-                    }
-                    read = lines.next_line() => {
-                        match read {
-                            Ok(Some(line)) => {
-                                let id = serde_json::from_str::<serde_json::Value>(&line)
-                                    .ok()
-                                    .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_owned));
-                                if let Some(reply) = id.and_then(|id| waiting.remove(&id)) {
-                                    let _ = reply.send(Ok(line));
-                                }
-                            }
-                            Ok(None) | Err(_) => {
-                                eprintln!("strands-box: inspection: the inspector leaf closed its stdout");
-                                for (_, reply) in waiting.drain() {
-                                    let _ = reply.send(Err("inspector exited".to_string()));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        if let Ok(mut leaf) = self.leaf.lock() {
-            *leaf = Some(LeafHold {
-                child: parts.child,
-                _retention: parts.retention,
-            });
-        }
-        let _ = self.transport.set(Transport::Leaf(sender));
+        let _ = self.started.set(Started { runtime, transport });
+        let this = Arc::clone(self);
+        let capabilities = tokio::task::spawn_blocking(move || this.fetch_capabilities())
+            .await
+            .map_err(|error| format!("capabilities task: {error}"))??;
+        let mut labels: Vec<&str> = capabilities
+            .http_labels
+            .iter()
+            .map(String::as_str)
+            .collect();
+        labels.sort_unstable();
         eprintln!(
-            "strands-box: inspection: content inspector leaf started (pid {})",
-            parts.leader
+            "strands-box: inspection: inspector {} via {} http labels={:?} max_body_bytes={}",
+            capabilities.name,
+            describe(&binding),
+            labels,
+            capabilities.max_body_bytes
         );
-    }
-
-    fn exchange(&self, id: &str, line: String) -> Result<String, String> {
-        match self.transport.get() {
-            None => Err("the inspector is not started".to_string()),
-            Some(Transport::Socket(path)) => {
-                let stream = UnixStream::connect(path)
-                    .map_err(|e| format!("connect {}: {e}", path.display()))?;
-                stream
-                    .set_read_timeout(Some(self.timeout))
-                    .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
-                    .map_err(|e| e.to_string())?;
-                (&stream)
-                    .write_all(line.as_bytes())
-                    .map_err(|e| format!("write: {e}"))?;
-                let mut reader = BufReader::new(&stream);
-                let mut reply = String::new();
-                reader
-                    .read_line(&mut reply)
-                    .map_err(|e| format!("read: {e}"))?;
-                if reply.is_empty() {
-                    return Err("the inspector closed the connection".to_string());
-                }
-                Ok(reply)
-            }
-            Some(Transport::Leaf(sender)) => {
-                let (reply, wait) = std::sync::mpsc::channel();
-                sender
-                    .send((id.to_string(), line, reply))
-                    .map_err(|_| "the inspector leaf is gone".to_string())?;
-                wait.recv_timeout(self.timeout)
-                    .map_err(|_| format!("no reply within {} ms", self.timeout.as_millis()))?
+        if let Some(requested) = &self.requested {
+            let missing: Vec<&String> = requested.difference(&capabilities.http_labels).collect();
+            if !missing.is_empty() {
+                eprintln!(
+                    "strands-box: inspection: warning: the policy asks for {missing:?}, which the \
+                     inspector does not list for http; those labels are never found"
+                );
             }
         }
+        let _ = self.capabilities.set(capabilities);
+        Ok(())
+    }
+
+    fn fetch_capabilities(&self) -> Result<Capabilities, String> {
+        let deadline = Instant::now() + self.timeout;
+        let result = self
+            .call("capabilities", json!({}), deadline)
+            .map_err(|error| format!("capabilities: {error}"))?;
+        let versions: Vec<&str> = result
+            .get("versions")
+            .and_then(Value::as_array)
+            .ok_or("capabilities: no `versions`")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        if !versions.iter().any(|version| major(version) == Some("0")) {
+            return Err(format!(
+                "capabilities: the inspector speaks {versions:?}, and Box speaks major 0"
+            ));
+        }
+        let inspector = result.get("inspector");
+        let field = |key: &str| {
+            inspector
+                .and_then(|i| i.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        let http = result
+            .get("subjects")
+            .and_then(|subjects| subjects.get("http"))
+            .ok_or("capabilities: the inspector does not list the `http` subject")?;
+        let http_labels = http
+            .get("labels")
+            .and_then(Value::as_array)
+            .ok_or("capabilities: `subjects.http.labels` is absent")?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let max_body_bytes = http
+            .get("max_body_bytes")
+            .and_then(Value::as_u64)
+            .ok_or("capabilities: `subjects.http.max_body_bytes` is absent")?;
+        Ok(Capabilities {
+            name: format!("{} {}", field("name"), field("version")),
+            http_labels,
+            max_body_bytes: usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
+        })
+    }
+
+    /// One request and its response's `result`, or the reason the decision failed.
+    fn call(&self, op: &str, params: Value, deadline: Instant) -> Result<Value, String> {
+        let started = self.started.get().ok_or("the inspector is not started")?;
+        let id = format!("box-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let message = json!({ "v": PROTOCOL_VERSION, "id": id, "op": op, "params": params });
+        let mut line = message.to_string();
+        if line.len() > MAX_MESSAGE_BYTES {
+            return Err("the request is over the 16 MiB message limit".to_string());
+        }
+        let (reply, wait) = std::sync::mpsc::channel();
+        match &started.transport {
+            Transport::Lines { sender, reconnect } => {
+                line.push('\n');
+                let mut guard = sender.lock().map_err(|_| "inspector lock poisoned")?;
+                if guard.as_ref().is_none_or(|s| s.is_closed()) {
+                    *guard = None;
+                    match reconnect {
+                        Some(path) => *guard = Some(connect_unix(&started.runtime, path)?),
+                        None => return Err("the inspector leaf is gone".to_string()),
+                    }
+                }
+                guard
+                    .as_ref()
+                    .expect("set above")
+                    .send((id.clone(), line, reply))
+                    .map_err(|_| "the inspector connection is gone".to_string())?;
+            }
+            Transport::Https {
+                client,
+                url,
+                bearer,
+            } => {
+                let authorization = bearer.authorization(url, line.as_bytes())?;
+                let request = client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::AUTHORIZATION, authorization)
+                    .timeout(deadline.saturating_duration_since(Instant::now()))
+                    .body(line);
+                started.runtime.spawn(async move {
+                    let outcome = async {
+                        let response = request.send().await.map_err(|e| format!("POST: {e}"))?;
+                        let status = response.status();
+                        let body = response.bytes().await.map_err(|e| format!("read: {e}"))?;
+                        serde_json::from_slice::<Value>(&body)
+                            .map_err(|_| format!("HTTP {status} without a valid message body"))
+                    }
+                    .await;
+                    let _ = reply.send(outcome);
+                });
+            }
+        }
+        let response = wait
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| format!("no response within {} ms", self.timeout.as_millis()))??;
+        result_of(response, &id)
+    }
+}
+
+impl Bearer {
+    /// The `Authorization` value, with the vault's real secret in place of the phantom.
+    fn authorization(&self, url: &str, body: &[u8]) -> Result<String, String> {
+        let headers = vec![(
+            "authorization".to_string(),
+            format!("Bearer {}", self.phantom),
+        )];
+        let attachment = self
+            .vault
+            .attach_for(credentials::Outbound {
+                destination: credentials::Destination {
+                    host: &self.host,
+                    port: self.port,
+                    path: &self.path,
+                },
+                method: "POST",
+                url,
+                query: "",
+                headers: &headers,
+                body,
+            })
+            .map_err(|error| format!("inspector credential: {error}"))?
+            .ok_or("inspector credential: the vault governs no credential for the endpoint")?;
+        attachment
+            .set_headers()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.to_string())
+            .ok_or_else(|| "inspector credential: the vault set no authorization".to_string())
     }
 }
 
 impl ContentInspector for PrototypeInspector {
     fn inspect(&self, request: &InspectionRequest<'_>) -> Result<InspectionVerdict, String> {
-        let id = format!("box-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let begun = Instant::now();
+        let deadline = begun + self.timeout;
+        let capabilities = self
+            .capabilities
+            .get()
+            .ok_or("the inspector is not started")?;
+        let labels: Vec<&String> = request
+            .labels
+            .iter()
+            .filter(|label| capabilities.http_labels.contains(*label))
+            .collect();
+        if labels.is_empty() {
+            return Ok(InspectionVerdict {
+                labels: Vec::new(),
+                backend: capabilities.name.clone(),
+                latency_ms: 0,
+            });
+        }
         let headers: Vec<[String; 2]> = request
             .headers
             .iter()
@@ -174,54 +345,236 @@ impl ContentInspector for PrototypeInspector {
                 [lower, value]
             })
             .collect();
-        let message = serde_json::json!({
-            "v": 1,
-            "id": id,
-            "labels": request.labels,
-            "request": {
-                "method": request.method,
-                "url": request.url,
-                "headers": headers,
-                "body_b64": base64::engine::general_purpose::STANDARD.encode(request.body),
-            }
+        let mut subject = json!({
+            "kind": "http",
+            "method": request.method,
+            "url": request.url,
+            "headers": headers,
         });
-        let mut line = message.to_string();
-        line.push('\n');
-        let reply = self.exchange(&id, line)?;
-        let reply: serde_json::Value =
-            serde_json::from_str(reply.trim()).map_err(|e| format!("reply is not JSON: {e}"))?;
-        if reply.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
-            return Err("reply has no `v: 1`".to_string());
+        if !request.body.is_empty() {
+            subject["body_b64"] =
+                Value::String(base64::engine::general_purpose::STANDARD.encode(request.body));
         }
-        if reply.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
-            return Err("reply id does not match".to_string());
-        }
-        if let Some(error) = reply.get("error") {
-            return Err(format!("inspector error: {error}"));
-        }
-        let labels = reply
+        let params = json!({
+            "subject": subject,
+            "labels": labels,
+            "context": { "gateway": "strands-box", "box": self.box_name, "caller": "agent" },
+        });
+        let result = self.call("classify", params, deadline)?;
+        let found = result
             .get("labels")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "reply has no `labels`".to_string())?
+            .and_then(Value::as_array)
+            .ok_or("result has no `labels` array")?
             .iter()
             .map(|label| {
-                label
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "a label is not a string".to_string())
+                let label = label.as_str().ok_or("a label is not a string")?;
+                if labels.iter().any(|asked| asked.as_str() == label) {
+                    Ok(label.to_string())
+                } else {
+                    Err(format!(
+                        "the inspector returned {label:?}, which was not requested"
+                    ))
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(InspectionVerdict {
-            labels,
-            backend: reply
-                .get("backend")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            latency_ms: reply
-                .get("latency_ms")
-                .and_then(serde_json::Value::as_f64)
-                .map_or(0, |ms| ms as u64),
+            labels: found,
+            backend: capabilities.name.clone(),
+            latency_ms: u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
+
+    fn max_body_bytes(&self) -> usize {
+        self.capabilities
+            .get()
+            .map_or(0, |capabilities| capabilities.max_body_bytes)
+    }
+}
+
+fn major(version: &str) -> Option<&str> {
+    version.split_once('.').map(|(major, _)| major)
+}
+
+fn describe(binding: &Binding) -> String {
+    match binding {
+        Binding::Stdio => "stdio".to_string(),
+        Binding::Unix(path) => format!("unix {}", path.display()),
+        Binding::Https(url) => format!("https {url}"),
+    }
+}
+
+/// The `result` of a response to `id`, or the failed decision it stands for.
+fn result_of(response: Value, id: &str) -> Result<Value, String> {
+    let version = response
+        .get("v")
+        .and_then(Value::as_str)
+        .ok_or("response has no string `v`")?;
+    if major(version) != Some("0") {
+        return Err(format!("response version {version:?} is not major 0"));
+    }
+    if response.get("id").and_then(Value::as_str) != Some(id) {
+        return Err("response id does not match".to_string());
+    }
+    match (response.get("result"), response.get("error")) {
+        (Some(result), None) if result.is_object() => Ok(result.clone()),
+        (None, Some(error)) => {
+            let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+            if KNOWN_ERRORS.contains(&code) {
+                Err(format!("inspector error {code}: {message}"))
+            } else {
+                Err(format!(
+                    "inspector error internal (unknown code {code:?}): {message}"
+                ))
+            }
+        }
+        _ => Err("response has neither exactly one `result` object nor an `error`".to_string()),
+    }
+}
+
+/// A task that writes queued requests and pairs each response line with its request by `id`.
+fn spawn_lines<R, W>(
+    runtime: &tokio::runtime::Handle,
+    reader: R,
+    mut writer: W,
+    label: &'static str,
+) -> tokio::sync::mpsc::UnboundedSender<Pending>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Pending>();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    runtime.spawn(async move {
+        let mut waiting: HashMap<String, Reply> = HashMap::new();
+        loop {
+            tokio::select! {
+                queued = receiver.recv() => {
+                    let Some((id, line, reply)) = queued else { break };
+                    let written = async {
+                        writer.write_all(line.as_bytes()).await?;
+                        writer.flush().await
+                    }
+                    .await;
+                    if let Err(error) = written {
+                        let _ = reply.send(Err(format!("write to inspector: {error}")));
+                        break;
+                    }
+                    waiting.insert(id, reply);
+                }
+                read = lines.next_line() => {
+                    let Ok(Some(line)) = read else {
+                        eprintln!("strands-box: inspection: the inspector {label} closed its stream");
+                        break;
+                    };
+                    if line.len() > MAX_MESSAGE_BYTES {
+                        eprintln!("strands-box: inspection: dropped a response over 16 MiB");
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        eprintln!("strands-box: inspection: the inspector sent a line that is not JSON");
+                        continue;
+                    };
+                    match value.get("id").and_then(Value::as_str).map(str::to_owned) {
+                        Some(id) => {
+                            if let Some(reply) = waiting.remove(&id) {
+                                let _ = reply.send(Ok(value));
+                            }
+                        }
+                        None => eprintln!("strands-box: inspection: unpaired response: {line}"),
+                    }
+                }
+            }
+        }
+        for (_, reply) in waiting.drain() {
+            let _ = reply.send(Err("the inspector stream closed".to_string()));
+        }
+    });
+    sender
+}
+
+/// Check the socket's owner and mode (spec 3.2), then connect.
+fn connect_unix(
+    runtime: &tokio::runtime::Handle,
+    path: &std::path::Path,
+) -> Result<tokio::sync::mpsc::UnboundedSender<Pending>, String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let shown = path.display();
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {shown}: {e}"))?;
+    if !meta.file_type().is_socket() {
+        return Err(format!("{shown} is not a socket"));
+    }
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if meta.uid() != uid {
+        return Err(format!("{shown} is owned by uid {}, not {uid}", meta.uid()));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{shown} is writable by group or others (mode {:o})",
+            meta.mode() & 0o777
+        ));
+    }
+    let stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|e| format!("connect {shown}: {e}"))?;
+    stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let _entered = runtime.enter();
+    let stream = tokio::net::UnixStream::from_std(stream).map_err(|e| e.to_string())?;
+    let (reader, writer) = stream.into_split();
+    Ok(spawn_lines(runtime, reader, writer, "socket"))
+}
+
+fn https_client(config: &InspectionConfig) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(ca_file) = &config.ca_file {
+        let pem = std::fs::read(ca_file).map_err(|e| format!("read {}: {e}", ca_file.display()))?;
+        let ca = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| format!("ca_file {}: {e}", ca_file.display()))?;
+        builder = builder.add_root_certificate(ca);
+    }
+    builder.build().map_err(|e| format!("https client: {e}"))
+}
+
+/// Resolve `secret.ref` through a Box credential vault bound to the endpoint.
+fn open_bearer(config: &InspectionConfig, url: &str) -> Result<Bearer, String> {
+    let reference = &config
+        .secret
+        .as_ref()
+        .ok_or("an https endpoint needs `secret.ref`")?
+        .reference;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("endpoint: {e}"))?;
+    let host = parsed.host_str().ok_or("endpoint has no host")?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let destination = credentials::DestinationPattern::parse(&format!("{host}:{port}"))
+        .map_err(|e| format!("endpoint destination: {e}"))?;
+    let locator = credentials::Locator::parse_uri(reference).map_err(|e| e.to_string())?;
+    let inject = credentials::InjectMode::header("Bearer {}", None).map_err(|e| e.to_string())?;
+    let opened = credentials::Vault::open(
+        credentials::VaultConfig::new(
+            credentials::Backend::local(),
+            format!("strands-box-inspector-{}", std::process::id()),
+        )
+        .route(credentials::RouteSpec::opaque(destination, locator, inject))
+        .require_every_route(),
+    )
+    .map_err(|e| format!("`secret.ref` did not resolve: {e}"))?;
+    let phantom = match opened.phantoms() {
+        [phantom] => phantom.token().to_string(),
+        other => {
+            return Err(format!(
+                "`secret.ref` minted {} placeholders, expected one bearer token",
+                other.len()
+            ));
+        }
+    };
+    Ok(Bearer {
+        vault: opened.into_vault(),
+        phantom,
+        host,
+        port,
+        path: parsed.path().to_string(),
+    })
 }

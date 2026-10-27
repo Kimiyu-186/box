@@ -32,7 +32,7 @@ pub use adapters::script::{
 pub use adapters::shell::ShellPolicyInterceptor;
 // PROTOTYPE(content-inspection): the inspector seam.
 pub use prototype_inspection::{
-    ContentInspector, InspectionRequest, InspectionVerdict, MAXIMUM_INSPECTED_BODY,
+    ContentInspector, InspectionRequest, InspectionVerdict,
 };
 pub use catalog::{
     CatalogRefusal, CatalogStage, CompleteCatalog, DiscoveryFailure, ListPage, MAXIMUM_LIST_BYTES,
