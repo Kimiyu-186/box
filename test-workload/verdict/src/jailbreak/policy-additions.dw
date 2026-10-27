@@ -14,7 +14,7 @@ when { context.input.path == "/dev/null" };
 // when its policy carries them.
 @id("metadata_hosts")
 @description("Refuse the cloud metadata services by name, before resolution.")
-forbid (principal, action == Box::Action::"net:connect", resource)
+forbid (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when {
   context.input.host == "metadata.google.internal" ||
   context.input.host == "metadata.azure.internal"

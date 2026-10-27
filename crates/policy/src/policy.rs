@@ -58,7 +58,7 @@ pub struct PolicyEngine {
     effective: EffectivePolicy,
     observer: Option<Arc<dyn crate::observe::DecisionObserver>>,
     // PROTOTYPE(content-inspection): labels requested by the loaded policy.
-    inspection: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
+    inspection: std::sync::Mutex<crate::InspectionLabels>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -268,7 +268,9 @@ impl PolicyEngine {
         self.conclude(&identity, request, decision)
     }
 
-    /// PROTOTYPE(content-inspection): decide with inspector labels visible to `Inspection::Content`.
+    /// PROTOTYPE(content-inspection): decide with inspector labels visible to the provider the
+    /// request's action uses: `Inspection::Content` on `http:request`, `Inspection::Domain` on
+    /// `net:resolve`, and `Inspection::Address` on `net:connect`.
     #[must_use]
     pub fn decide_with_inspection(
         &self,
@@ -277,18 +279,23 @@ impl PolicyEngine {
         request: &Request<'_>,
         labels: &[String],
     ) -> Decision {
-        crate::prototype_inspection::with_labels(labels, || {
+        let key = match request {
+            Request::Resolve { .. } => crate::prototype_inspection::DOMAIN_KEY,
+            Request::Connect { .. } => crate::prototype_inspection::ADDRESS_KEY,
+            _ => crate::prototype_inspection::CONTENT_KEY,
+        };
+        crate::prototype_inspection::with_labels(key, labels, || {
             self.decide(governed, principal, request)
         })
     }
 
-    /// PROTOTYPE(content-inspection): the labels the loaded policy asks the inspector about, if any.
+    /// PROTOTYPE(content-inspection): the labels the loaded policy asks each provider about.
     #[must_use]
-    pub fn uses_inspection(&self) -> Option<std::collections::BTreeSet<String>> {
+    pub fn uses_inspection(&self) -> crate::InspectionLabels {
         self.inspection
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Name the request's resource on the verdict, then report it once.
@@ -403,8 +410,10 @@ impl PolicyEngine {
 
 /// The text the engine loads, shared by [`PolicyEngine::open`] and [`PolicyEngine::validate`].
 // PROTOTYPE(content-inspection): the `Inspection::Content` labels the sources request.
-fn inspection_labels(sources: &[Policy]) -> Option<std::collections::BTreeSet<String>> {
-    let service = crate::dogwood::service_schema().ok()?;
+fn inspection_labels(sources: &[Policy]) -> crate::InspectionLabels {
+    let Ok(service) = crate::dogwood::service_schema() else {
+        return crate::InspectionLabels::default();
+    };
     crate::prototype_inspection::requested_labels(&authored(sources), &service)
 }
 
@@ -504,7 +513,7 @@ mod tests {
                 policy_id: effective_policy_id(&sources),
             },
             observer: None,
-            inspection: std::sync::Mutex::new(None),
+            inspection: std::sync::Mutex::new(crate::InspectionLabels::default()),
         }
     }
 

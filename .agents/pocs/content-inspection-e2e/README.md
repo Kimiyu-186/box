@@ -36,8 +36,14 @@ agent (curl) ──HTTPS──▶ egress gateway (MITM, body buffered)
   - **command** (stdio): Box starts the inspector once, in a contained leaf, and talks to it on
     stdio. `gpu = true` lets that leaf use Metal on macOS.
 - At startup Box sends `capabilities`. Box refuses to start if the inspector is unreachable, has no
-  `0.x` version, or does not list the `http` subject. Box prints the inspector's name and its http
-  labels, and warns about each policy label the inspector does not list.
+  `0.x` version, or does not list the subject a provider in the policy needs (`http` for
+  `Inspection::Content`, `dns` for `Inspection::Domain`, `connect` for `Inspection::Address`). Box
+  prints the inspector's name and its labels per subject, and warns about each policy label the
+  inspector does not list for that subject.
+- `Inspection::Domain([...])` on `net:resolve` sends a `dns` subject before any DNS query leaves.
+  `Inspection::Address([...])` on `net:connect` sends a `connect` subject per resolved address.
+  Box reuses a `dns` or `connect` answer for its `cache_ttl_s` (in memory, at most 4096 entries),
+  and prints `cached` on the `inspection:` line. `policy-dns.dw` is the example.
 - If the inspector fails, times out, or the body is over the inspector's `max_body_bytes`, the
   request is denied.
 - If the policy never calls `Inspection::Content`, the inspector is not called at all.
@@ -172,7 +178,12 @@ fails. The box prints `inspection: POST ... refused: inspector failed: ...`.
 
 The leaf needs read grants for the Python interpreter, the venv, and the model cache, so the e2e
 script writes this config for you. It runs a clean POST (200), an SSN POST (403), and an SSN POST
-under the control policy (200, inspector not called).
+under the control policy (200, inspector not called). Then, under `policy-dns.dw`: (d) a GET to
+httpbin.org (200, `resolve` and `connect` lines with `labels=[]`), (e) a GET to a 40-hex-character
+subdomain (denied at resolve with `TUNNELING`, no `connect` line, curl exit 7, CONNECT 403), (f) a
+GET to a name in `--domain-blocklist` (denied with `MALICIOUS_DOMAIN`), (g) a GET with httpbin's
+address ranges in `--ip-blocklist` (denied at connect with `MALICIOUS_IP`), and (h) two GETs in one
+box (the second `resolve` line ends in `cached`). The `fake` backend runs only a to c.
 
 ```sh
 cd .agents/pocs/content-inspection-e2e
@@ -227,7 +238,9 @@ is accepted there and does nothing.
 
 - A denial from inspection is not written to the policy history.
 - The leaf is not restarted if it exits; every request after that is denied.
-- No `dns` or `connect` subject, and no `cache_ttl_s`.
+- `NEWLY_REGISTERED` is not implemented by `inspector.py`, so it is not advertised.
+- A provider used on another action than its own (for example `Inspection::Domain` in an
+  `http:request` rule) sees no labels.
 - The inspector only sees request bodies. Responses, MCP tool arguments, and file writes are not
   inspected.
 - Decider's accuracy is not measured. In one smoke test it missed a GitHub token that the regex

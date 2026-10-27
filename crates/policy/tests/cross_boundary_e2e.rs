@@ -58,7 +58,7 @@ fn proxy_port(handle: &MitmHandle) -> u16 {
 /// The rule below gates `http:request`; without these the connect would be refused first
 /// and the request leg would never be reached.
 const TRANSPORT: &str = r#"
-permit(principal == Box::Agent::"self", action == Box::Action::"net:connect", resource);
+permit(principal == Box::Agent::"self", action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);
 "#;
 
 /// Shell effects the workload needs in order to reach the secret at all.

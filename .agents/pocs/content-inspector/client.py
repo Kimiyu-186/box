@@ -26,8 +26,12 @@ def main():
     ap.add_argument("--labels", default="PII,SECRET")
     ap.add_argument("--body", help="custom body (overrides canned cases)")
     ap.add_argument("--url", default="https://api.example.com/x")
-    ap.add_argument("cases", nargs="*", default=list(CASES))
+    ap.add_argument("--dns", metavar="NAME", action="append", default=[], help="send a dns subject")
+    ap.add_argument("--connect", metavar="NAME=IP", action="append", default=[], help="send a connect subject")
+    ap.add_argument("cases", nargs="*", default=None)
     a = ap.parse_args()
+    if a.cases is None or not a.cases:
+        a.cases = [] if (a.dns or a.connect) else list(CASES)
     reqs = [("custom", ("POST", a.url, a.body))] if a.body is not None else [(c, CASES[c]) for c in a.cases]
     msgs = [("capabilities", {"v": "0.2", "id": "caps", "op": "capabilities", "params": {}})]
     for name, (method, url, body) in reqs:
@@ -47,6 +51,15 @@ def main():
                 "context": {"gateway": "client.py", "box": "none", "caller": "agent"},
             },
         }))
+    for name in a.dns:
+        msgs.append((f"dns {name}"[:12], {"v": "0.2", "id": f"dns-{name}", "op": "classify", "params": {
+            "subject": {"kind": "dns", "name": name, "port": 443},
+            "labels": ["MALICIOUS_DOMAIN", "TUNNELING"]}}))
+    for pair in a.connect:
+        name, _, ip = pair.partition("=")
+        msgs.append((f"conn {ip}"[:12], {"v": "0.2", "id": f"connect-{pair}", "op": "classify", "params": {
+            "subject": {"kind": "connect", "name": name, "ip": ip, "port": 443},
+            "labels": ["MALICIOUS_IP"]}}))
     if a.https:
         ctx = ssl.create_default_context(cafile=a.cafile)
         def send(msg):

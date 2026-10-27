@@ -375,7 +375,7 @@ Exactly one of `endpoint` and `command` is set.
 
 | Box action | Subject | Provider |
 |---|---|---|
-| `net:resolve` (proposed; today the first `net:connect`, without `ip`) | `dns` | `Inspection::Domain([...])` |
+| `net:resolve` (`host`, `port`; decided before any DNS query) | `dns` | `Inspection::Domain([...])` |
 | `net:connect` | `connect` | `Inspection::Address([...])` |
 | `http:request` | `http` | `Inspection::Content([...])` |
 
@@ -395,11 +395,12 @@ when { Inspection::Domain(["MALICIOUS_DOMAIN", "TUNNELING"]).labels.containsAny(
 | stdio binding | Implemented, to a contained leaf. One process for the run, multiplexed by `id` |
 | unix binding | Implemented. One long-lived connection, multiplexed by `id`, reconnected after it drops. Box checks that the socket is owned by the current user and is not group- or other-writable |
 | https binding | Implemented. One `POST` per message. The body is the source of truth over the status. `http://` is refused at configuration |
-| `capabilities` | Implemented, at startup only. Box refuses to start without a `0.x` version or the `http` subject. No refresh after an error |
-| `dns` and `connect` subjects | Not implemented. `http` only |
-| `Inspection::Domain`, `Inspection::Address`, `net:resolve` | Not implemented |
+| `capabilities` | Implemented, at startup only. Box refuses to start without a `0.x` version, or without the subject a provider in the policy needs (`http`, `dns`, or `connect`). No refresh after an error |
+| `dns` and `connect` subjects | Implemented. `name` is lower case, without a trailing dot, and in `xn--` form (through the `url` crate). An IP literal is sent as the address |
+| `Inspection::Domain`, `Inspection::Address`, `net:resolve` | Implemented. `net:resolve` has `host` and `port`; `net:connect` always carries `ip` from the gateway, and the schema keeps it optional |
 | `[egress.inspector] endpoint`, `command`, `secret.ref` | Implemented. `secret.ref` is a Box credential locator, for example `env://INSPECTOR_TOKEN`. A prototype `ca_file` adds a trust root for https |
 | Fail closed, deadline, header redaction, body limit | Implemented. `timeout_ms` is an end-to-end deadline per call. The body limit is `subjects.http.max_body_bytes` |
-| Ask only what is supported (8.4) | Implemented. Box sends only the labels the inspector lists for `http`, and warns once at startup about the others |
+| Ask only what is supported (8.4) | Implemented. Box sends only the labels the inspector lists for the subject kind, and warns once at startup about the others |
 | More than one inspector (8.5) | Not implemented. One inspector per box |
-| `cache_ttl_s` | Not implemented |
+| Only when needed (8.6) | Implemented. Box calls the inspector for a subject only when the policy uses that subject's provider |
+| `cache_ttl_s` (8.7) | Implemented for `dns` and `connect`. In memory, keyed on the normalized subject and the sorted labels, at most 4096 entries (expired entries are dropped first, then the cache is cleared). Never for `http` |

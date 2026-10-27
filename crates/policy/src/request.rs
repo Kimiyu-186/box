@@ -156,6 +156,14 @@ pub enum Request<'a> {
         /// `context.input.operation`.
         operation: FsOperation,
     },
+    /// PROTOTYPE(content-inspection): the host name lookup (`net:resolve`), decided before any
+    /// DNS query leaves.
+    Resolve {
+        /// Destination host as the workload named it.
+        host: &'a str,
+        /// Destination port the workload asked for.
+        port: u16,
+    },
     /// L4 TCP connect (`net:connect`) — the durable floor that holds even against an
     /// agent that links its own TLS. Distinct from [`Request::Http`].
     Connect {
@@ -256,7 +264,9 @@ impl Request<'_> {
     pub(crate) fn resource(&self) -> String {
         match self {
             Request::Fs { path, .. } => path.reported().into_owned(),
-            Request::Connect { host, port, .. } => format!("{host}:{port}"),
+            Request::Resolve { host, port } | Request::Connect { host, port, .. } => {
+                format!("{host}:{port}")
+            }
             Request::Http {
                 host, port, path, ..
             } => format!("{host}:{port}{path}"),

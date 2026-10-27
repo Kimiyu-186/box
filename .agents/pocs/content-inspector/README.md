@@ -44,6 +44,14 @@ DEVICE=mps ./run-e2e.sh unix decider            # start with unix mode; stdio le
 
 Decider flags: `--device cpu|cuda|mps|mlx`, `--threshold 0.5`, `--max-state-chars 16384`.
 
+Every backend also answers `dns` (`MALICIOUS_DOMAIN`, `TUNNELING`) and `connect` (`MALICIOUS_IP`)
+subjects, with `cache_ttl_s: 300`. `TUNNELING` is a heuristic: a name over 100 characters, a label
+of 30 or more characters with Shannon entropy of 3.5 or more, or two hex- or base32-looking labels.
+`MALICIOUS_DOMAIN` matches the name or a parent against a built-in list (`evil.example`,
+`malware.testing.google.test`, ...) and `--domain-blocklist FILE`. `MALICIOUS_IP` matches
+`--ip-blocklist FILE` (one address or CIDR per line). Both files are re-read when they change.
+`client.py --dns NAME --connect NAME=IP` sends those subjects.
+
 ## Protocol notes for the Box side
 
 - **Responses can arrive out of order.** Requests on one connection (or on stdin) run

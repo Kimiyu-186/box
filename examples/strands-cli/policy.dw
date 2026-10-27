@@ -1,6 +1,6 @@
 // Connect to Bedrock, and send it requests.
 @id("model_connect")
-permit (principal, action == Box::Action::"net:connect", resource)
+permit (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when { context.input.host == "bedrock-runtime.us-west-2.amazonaws.com" && context.input.port == 443 };
 
 @id("model_request")

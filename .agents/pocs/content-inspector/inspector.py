@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import math
 import os
@@ -258,6 +259,96 @@ class PresidioBackend:
         return out
 
 
+# ---------------------------------------------------------------- dns and connect (backend-independent)
+
+DNS_LABELS = ("MALICIOUS_DOMAIN", "TUNNELING")
+CONNECT_LABELS = ("MALICIOUS_IP",)
+NAME_CACHE_TTL_S = 300
+BUILTIN_DOMAINS = {"malware.testing.google.test", "evil.example", "phishing.example", "c2.example"}
+RE_HEXISH = re.compile(r"^(?:[0-9a-f]{16,}|[a-z2-7]{24,})$")
+
+
+class Blocklist:
+    """One entry per line; `#` starts a comment. Re-read when the file changes."""
+
+    def __init__(self, path, parse):
+        self.path, self.parse, self.stamp, self.entries = path, parse, None, []
+        self.lock = threading.Lock()
+
+    def get(self):
+        if not self.path:
+            return []
+        with self.lock:
+            try:
+                st = os.stat(self.path)
+                stamp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp = None
+            if stamp != self.stamp:
+                self.stamp, self.entries = stamp, []
+                if stamp is not None:
+                    with open(self.path) as f:
+                        for line in f:
+                            line = line.split("#", 1)[0].strip()
+                            if line:
+                                self.entries.append(self.parse(line))
+                log(f"loaded {len(self.entries)} entries from {self.path}")
+            return self.entries
+
+
+DOMAINS = Blocklist(None, lambda l: l.lower().rstrip("."))
+NETWORKS = Blocklist(None, lambda l: ipaddress.ip_network(l, strict=False))
+
+
+def tunneling(name):
+    labels = name.split(".")
+    if len(name) > 100:
+        return ("long_name", 0.8, f"{len(name)} characters")
+    for lab in labels:
+        if len(lab) >= 30 and entropy(lab) >= 3.5:
+            return ("high_entropy_label", 0.9, f"{len(lab)}-char label, entropy {entropy(lab):.2f}")
+    encoded = [lab for lab in labels[:-2] if RE_HEXISH.match(lab)]
+    if len(encoded) >= 2:
+        return ("encoded_labels", 0.7, f"{len(encoded)} hex/base32 labels")
+    return None
+
+
+def malicious_domain(name):
+    parts = name.split(".")
+    listed = BUILTIN_DOMAINS | set(DOMAINS.get())
+    for i in range(len(parts)):
+        if ".".join(parts[i:]) in listed:
+            return ("blocklist", 1.0, ".".join(parts[i:]))
+    return None
+
+
+def malicious_ip(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        raise ProtocolError("invalid_request", f"subject.ip {ip!r} is not an address")
+    for net in NETWORKS.get():
+        if addr.version == net.version and addr in net:
+            return ("blocklist", 1.0, str(net))
+    return None
+
+
+def classify_name(subject, labels):
+    name = subject.get("name")
+    if not isinstance(name, str) or not name:
+        raise ProtocolError("invalid_request", "subject.name is required")
+    out = []
+    if subject["kind"] == "dns":
+        if "TUNNELING" in labels and (f := tunneling(name)):
+            out.append(("TUNNELING", *f))
+        if "MALICIOUS_DOMAIN" in labels and (f := malicious_domain(name)):
+            out.append(("MALICIOUS_DOMAIN", *f))
+    else:
+        if "MALICIOUS_IP" in labels and (f := malicious_ip(subject.get("ip") or "")):
+            out.append(("MALICIOUS_IP", *f))
+    return out
+
+
 # ---------------------------------------------------------------- protocol
 
 
@@ -281,7 +372,11 @@ def capabilities(backend):
     return {
         "versions": [PROTOCOL_V],
         "inspector": {"name": backend.name, "version": "0.2-prototype"},
-        "subjects": {"http": {"labels": list(backend.labels), "max_body_bytes": BODY_CAP}},
+        "subjects": {
+            "http": {"labels": list(backend.labels), "max_body_bytes": BODY_CAP},
+            "dns": {"labels": list(DNS_LABELS)},
+            "connect": {"labels": list(CONNECT_LABELS)},
+        },
     }
 
 
@@ -289,11 +384,20 @@ def classify(backend, params, rid):
     subject = params.get("subject")
     if not isinstance(subject, dict):
         raise ProtocolError("invalid_request", "params.subject is required")
-    if subject.get("kind") != "http":
-        raise ProtocolError("unsupported_subject", f"this inspector does not classify {subject.get('kind')!r}")
+    kind = subject.get("kind")
+    if kind not in ("http", "dns", "connect"):
+        raise ProtocolError("unsupported_subject", f"this inspector does not classify {kind!r}")
     asked = params.get("labels")
     if not isinstance(asked, list) or not asked or not all(isinstance(l, str) for l in asked):
         raise ProtocolError("invalid_request", "params.labels must be a non-empty list of strings")
+    if kind != "http":
+        supported = DNS_LABELS if kind == "dns" else CONNECT_LABELS
+        labels = [l for l in dict.fromkeys(asked) if l in supported]
+        findings = dedupe(classify_name(subject, labels))
+        found = [l for l in dict.fromkeys(f["label"] for f in findings) if l in labels]
+        where = subject.get("name") if kind == "dns" else f"{subject.get('name')} {subject.get('ip')}"
+        log(f"{rid} classify {kind} {where}:{subject.get('port')} asked={asked} -> {found}")
+        return {"labels": found, "findings": findings, "cache_ttl_s": NAME_CACHE_TTL_S}
     raw = b""
     if subject.get("body_b64"):
         try:
@@ -484,7 +588,10 @@ async def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--max-state-chars", type=int, default=16384)
+    ap.add_argument("--domain-blocklist", help="MALICIOUS_DOMAIN names, one per line; re-read on change")
+    ap.add_argument("--ip-blocklist", help="MALICIOUS_IP addresses or CIDRs, one per line; re-read on change")
     args = ap.parse_args()
+    DOMAINS.path, NETWORKS.path = args.domain_blocklist, args.ip_blocklist
     if args.stdio:
         # Keep the real stdout for protocol lines only; anything else printing to fd 1
         # (libraries, C extensions) lands on stderr.

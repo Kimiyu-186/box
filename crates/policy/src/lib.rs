@@ -31,9 +31,6 @@ pub use adapters::script::{
 #[cfg(feature = "shell-adapter")]
 pub use adapters::shell::ShellPolicyInterceptor;
 // PROTOTYPE(content-inspection): the inspector seam.
-pub use prototype_inspection::{
-    ContentInspector, InspectionRequest, InspectionVerdict,
-};
 pub use catalog::{
     CatalogRefusal, CatalogStage, CompleteCatalog, DiscoveryFailure, ListPage, MAXIMUM_LIST_BYTES,
     MAXIMUM_LIST_PAGES, McpServerKind, ServerDiscovery, ToolCatalogs,
@@ -49,6 +46,10 @@ pub use outcome::{Delivery, FsResult, Outcome};
 pub use path::{ApprovedPath, PathRefusal, PathResolver};
 pub use policy::{
     ENGINE_ID, EffectivePolicy, Policy, PolicyEngine, SELF_DEFENDED_FILES, SchemaStage,
+};
+pub use prototype_inspection::{
+    ContentInspector, InspectionLabels, InspectionRequest, InspectionVerdict, NameInspection,
+    NameSubjectKind,
 };
 pub use request::{FsAccess, FsOperation, Principal, Request};
 pub use schema::GovernedBox;

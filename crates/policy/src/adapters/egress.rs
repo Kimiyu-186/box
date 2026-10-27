@@ -113,7 +113,7 @@ impl EgressPolicyInterceptor {
         body: &[u8],
         intercepted: bool,
     ) -> Result<Option<Vec<String>>, String> {
-        let Some(requested) = self.policy.uses_inspection() else {
+        let Some(requested) = self.policy.uses_inspection().content else {
             return Ok(None);
         };
         let scheme = if intercepted { "https" } else { "http" };
@@ -124,12 +124,17 @@ impl EgressPolicyInterceptor {
             format!("{scheme}://{host}:{port}{path}")
         };
         let Some(inspector) = &self.inspector else {
-            eprintln!("inspection: {method} {url} refused: the policy uses Inspection::Content and no inspector is configured");
+            eprintln!(
+                "inspection: {method} {url} refused: the policy uses Inspection::Content and no inspector is configured"
+            );
             return Err("content inspection: no inspector is configured".to_string());
         };
         let limit = inspector.max_body_bytes();
         if body.len() > limit {
-            eprintln!("inspection: {method} {url} refused: body of {} bytes is over the inspector's max_body_bytes {limit}", body.len());
+            eprintln!(
+                "inspection: {method} {url} refused: body of {} bytes is over the inspector's max_body_bytes {limit}",
+                body.len()
+            );
             return Err("content inspection: body is over the inspection limit".to_string());
         }
         let request = crate::InspectionRequest {
@@ -150,6 +155,77 @@ impl EgressPolicyInterceptor {
             Err(error) => {
                 eprintln!("inspection: {method} {url} refused: inspector failed: {error}");
                 Err(format!("content inspection failed: {error}"))
+            }
+        }
+    }
+
+    // PROTOTYPE(content-inspection): decide, with inspector labels when the policy uses them.
+    fn decide_inspected(&self, request: &Request<'_>, labels: Option<&[String]>) -> Decision {
+        match labels {
+            Some(labels) => {
+                self.policy
+                    .decide_with_inspection(&self.governed, &self.principal, request, labels)
+            }
+            None => self.policy.decide(&self.governed, &self.principal, request),
+        }
+    }
+
+    // PROTOTYPE(content-inspection): the inspector labels for one `dns` or `connect` subject, or
+    // the reason to deny it.
+    fn inspect_name(
+        &self,
+        kind: crate::NameSubjectKind,
+        host: &str,
+        ip: Option<std::net::IpAddr>,
+        port: u16,
+    ) -> Result<Option<Vec<String>>, String> {
+        let used = self.policy.uses_inspection();
+        let (requested, provider, shown) = match kind {
+            crate::NameSubjectKind::Dns => (
+                used.domain,
+                "Inspection::Domain",
+                format!("resolve {host}:{port}"),
+            ),
+            crate::NameSubjectKind::Connect => {
+                let address =
+                    ip.map_or_else(String::new, |ip| SocketAddr::new(ip, port).to_string());
+                (
+                    used.address,
+                    "Inspection::Address",
+                    format!("connect {host} {address}"),
+                )
+            }
+        };
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        let Some(inspector) = &self.inspector else {
+            eprintln!(
+                "inspection: {shown} refused: the policy uses {provider} and no inspector is configured"
+            );
+            return Err(format!("{provider}: no inspector is configured"));
+        };
+        let request = crate::NameInspection {
+            kind,
+            labels: requested.into_iter().collect(),
+            name: host,
+            ip,
+            port,
+        };
+        match inspector.inspect_name(&request) {
+            Ok(verdict) => {
+                eprintln!(
+                    "inspection: {shown} labels={:?} backend={} latency={}ms{}",
+                    verdict.labels,
+                    verdict.backend,
+                    verdict.latency_ms,
+                    if verdict.cached { " cached" } else { "" }
+                );
+                Ok(Some(verdict.labels))
+            }
+            Err(error) => {
+                eprintln!("inspection: {shown} refused: inspector failed: {error}");
+                Err(format!("{provider} failed: {error}"))
             }
         }
     }
@@ -246,44 +322,51 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
         let decision = match effect {
             // The host, decided before it is resolved. No address exists yet, so an address rule does
             // not apply here; it applies to the per-address `Connect` that follows.
-            EgressEffectAttempt::Resolve { host, port } => match self.policy.decide(
-                &self.governed,
-                &self.principal,
-                &Request::Connect {
-                    host,
-                    ip: None,
-                    port: *port,
-                },
-            ) {
-                Decision::Deny {
-                    reason: DenyReason::PolicyPending,
-                    ..
-                } if self.mcp_hosts.contains(*host) => Ok(()),
-                decision @ Decision::Deny { .. } => Err(decision.to_string()),
-                Decision::Allow { .. } => Ok(()),
-            },
+            EgressEffectAttempt::Resolve { host, port } => {
+                let request = Request::Resolve { host, port: *port };
+                // PROTOTYPE(content-inspection): classify the name before any DNS query leaves.
+                match self.inspect_name(crate::NameSubjectKind::Dns, host, None, *port) {
+                    Err(reason) => Err(format!("net:resolve gate: {reason}")),
+                    Ok(labels) => match self.decide_inspected(&request, labels.as_deref()) {
+                        Decision::Deny {
+                            reason: DenyReason::PolicyPending,
+                            ..
+                        } if self.mcp_hosts.contains(*host) => Ok(()),
+                        decision @ Decision::Deny { .. } => Err(decision.to_string()),
+                        Decision::Allow { .. } => Ok(()),
+                    },
+                }
+            }
             EgressEffectAttempt::Connect {
                 host,
                 port,
                 address,
                 ..
-            } => match self.policy.decide(
-                &self.governed,
-                &self.principal,
-                &Request::Connect {
+            } => {
+                let request = Request::Connect {
                     host,
                     ip: Some(address.ip()),
                     port: *port,
-                },
-            ) {
-                // Unreachable: a `Connect` never carries `PolicyPending`, so this arm never fires.
-                Decision::Deny {
-                    reason: DenyReason::PolicyPending,
-                    ..
-                } if self.mcp_hosts.contains(*host) => Ok(()),
-                decision @ Decision::Deny { .. } => Err(decision.to_string()),
-                Decision::Allow { .. } => Ok(()),
-            },
+                };
+                // PROTOTYPE(content-inspection): classify the address before the socket opens.
+                match self.inspect_name(
+                    crate::NameSubjectKind::Connect,
+                    host,
+                    Some(address.ip()),
+                    *port,
+                ) {
+                    Err(reason) => Err(format!("net:connect gate: {reason}")),
+                    Ok(labels) => match self.decide_inspected(&request, labels.as_deref()) {
+                        // Unreachable: a `Connect` never carries `PolicyPending`, so this arm never fires.
+                        Decision::Deny {
+                            reason: DenyReason::PolicyPending,
+                            ..
+                        } if self.mcp_hosts.contains(*host) => Ok(()),
+                        decision @ Decision::Deny { .. } => Err(decision.to_string()),
+                        Decision::Allow { .. } => Ok(()),
+                    },
+                }
+            }
             EgressEffectAttempt::HttpRequest {
                 host,
                 port,
@@ -320,7 +403,9 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
                         &request,
                         labels,
                     ),
-                    None => self.policy.decide(&self.governed, &self.principal, &request),
+                    None => self
+                        .policy
+                        .decide(&self.governed, &self.principal, &request),
                 };
                 match decided {
                     // Unreachable: an `Http` request never carries `PolicyPending`, so this arm never
@@ -1380,8 +1465,8 @@ mod tests {
     #[test]
     fn a_host_forbid_refuses_resolution() {
         let fixture = interceptor(
-            r#"permit(principal, action == Box::Action::"net:connect", resource);
-               forbid(principal, action == Box::Action::"net:connect", resource)
+            r#"permit(principal, action == Box::Action::"net:resolve", resource);
+               forbid(principal, action == Box::Action::"net:resolve", resource)
                when { context.input.host == "exfil.attacker.test" };"#,
         );
         assert!(
@@ -1396,7 +1481,7 @@ mod tests {
         );
     }
 
-    /// With no `net:connect` permit, every name is refused before it is resolved.
+    /// With no `net:resolve` permit, every name is refused before it is resolved.
     #[test]
     fn default_deny_refuses_resolution() {
         let fixture =
@@ -1413,7 +1498,7 @@ mod tests {
     #[test]
     fn an_address_forbid_decides_the_connect_not_the_resolution() {
         let fixture = interceptor(
-            r#"permit(principal, action == Box::Action::"net:connect", resource);
+            r#"permit(principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);
                forbid(principal, action == Box::Action::"net:connect", resource)
                when { context.input has ip && context.input.ip like "10.*" };"#,
         );
@@ -1760,8 +1845,8 @@ mod tests {
         );
 
         let request = |port, body_bytes| EgressEffectAttempt::HttpRequest {
-        headers: &[],
-        body: &[],
+            headers: &[],
+            body: &[],
             host: "api.github.com",
             port,
             method: "POST",

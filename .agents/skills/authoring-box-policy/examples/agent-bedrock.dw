@@ -7,7 +7,7 @@
 // ── Reaching the model ───────────────────────────────────────────────────────
 // The connect leg is scoped to the port; the request leg names the real host after TLS.
 @id("bedrock_connect")
-permit (principal, action == Box::Action::"net:connect", resource)
+permit (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when { context.input.port == 443 };
 
 @id("bedrock_request")

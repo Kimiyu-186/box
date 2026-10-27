@@ -1,6 +1,6 @@
 // Connect to Bedrock, and send it requests.
 @id("model_connect")
-permit (principal, action == Box::Action::"net:connect", resource)
+permit (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when { context.input.host == "bedrock-runtime.us-west-2.amazonaws.com" && context.input.port == 443 };
 
 @id("model_request")
@@ -46,7 +46,7 @@ forbid (principal, action == Box::Action::"fs:delete", resource);
 
 @id("metadata_hosts")
 @description("Refuse the cloud metadata services by name, before resolution.")
-forbid (principal, action == Box::Action::"net:connect", resource)
+forbid (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when {
   context.input.host == "metadata.google.internal" ||
   context.input.host == "metadata.azure.internal"

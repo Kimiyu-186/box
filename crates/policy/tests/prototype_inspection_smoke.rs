@@ -12,16 +12,29 @@ when { Inspection::Content(["PII", "SECRET"]).labels.containsAny(["PII", "SECRET
 fn inspection_labels_drive_the_forbid() {
     let dir = tempfile::tempdir().unwrap();
     let engine = PolicyEngine::open(
-        vec![Policy { origin: "p.dw".into(), text: SOURCE.to_string() }],
+        vec![Policy {
+            origin: "p.dw".into(),
+            text: SOURCE.to_string(),
+        }],
         &dir.path().join("h.redb"),
     )
     .expect("opens");
     assert_eq!(
-        engine.uses_inspection().unwrap().into_iter().collect::<Vec<_>>(),
+        engine
+            .uses_inspection()
+            .content
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec!["PII".to_string(), "SECRET".to_string()]
     );
     let request = Request::Http {
-        host: "h", port: 443, method: "POST", path: "/", body_bytes: 1, intercepted: true,
+        host: "h",
+        port: 443,
+        method: "POST",
+        path: "/",
+        body_bytes: 1,
+        intercepted: true,
     };
     let g = GovernedBox::assigned("b");
     let p = Principal::agent();

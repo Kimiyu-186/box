@@ -8,7 +8,7 @@
 // One outbound call is two decisions. The connect leg sees a host and a port before
 // TLS, so it is scoped to the port; the request leg sees the real host after TLS.
 @id("anthropic_connect")
-permit (principal, action == Box::Action::"net:connect", resource)
+permit (principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource)
 when { context.input.port == 443 };
 
 @id("anthropic_request")

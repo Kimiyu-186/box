@@ -1,4 +1,7 @@
 // PROTOTYPE(content-inspection): control, no inspection rule.
+permit (principal, action == Box::Action::"net:resolve", resource)
+when { context.input.host == "httpbin.org" && context.input.port == 443 };
+
 permit (principal, action == Box::Action::"net:connect", resource)
 when { context.input.host == "httpbin.org" && context.input.port == 443 };
 

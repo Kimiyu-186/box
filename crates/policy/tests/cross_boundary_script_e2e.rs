@@ -56,7 +56,7 @@ const BOX_NAME: &str = "cross-boundary-script";
 
 /// Permit the transport legs the cross-boundary rule does not govern.
 const TRANSPORT: &str = r#"
-permit(principal == Box::Agent::"self", action == Box::Action::"net:connect", resource);
+permit(principal == Box::Agent::"self", action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);
 "#;
 
 /// The reads a Python script needs in order to reach the file at all.

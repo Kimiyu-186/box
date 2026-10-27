@@ -38,7 +38,7 @@ const BUDGET_POLICY: &str = include_str!("policies/egress_byte_budget_e2e.dw");
 /// budget-only policy would deny the connect and the test would never reach an HTTP
 /// request. These two rules exist to isolate the temporal decision to `http:request`.
 const TRANSPORT_POLICY: &str = r#"
-permit(principal == Box::Agent::"self", action == Box::Action::"net:connect", resource);
+permit(principal == Box::Agent::"self", action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);
 "#;
 
 fn proxy_port(handle: &MitmHandle) -> u16 {

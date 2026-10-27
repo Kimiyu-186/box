@@ -977,6 +977,10 @@ fn request_fields(request: &Request<'_>) -> Vec<(&'static str, Value)> {
                 (attr::OPERATION, fs_operation_value(*operation)),
             ]
         }
+        Request::Resolve { host, port } => vec![
+            (attr::HOST, Value::String((*host).to_string())),
+            (attr::PORT, Value::Int(i64::from(*port))),
+        ],
         Request::Connect { host, ip, port } => {
             let mut fields = vec![
                 (attr::HOST, Value::String((*host).to_string())),

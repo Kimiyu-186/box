@@ -153,7 +153,13 @@ action "fs:other" appliesTo {
 // ── Network ──────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The L4 connect input. `ip` is the pinned address after resolution, absent before it.
+// The name lookup input, decided before any DNS query leaves.
+type NetworkResolveInput = {
+  host: String,
+  port: Long
+};
+
+// The L4 connect input. `ip` is the pinned address after resolution.
 type NetworkConnectInput = {
   host: String,
   ip?: String,
@@ -179,6 +185,14 @@ type NetworkRequestInput = {
 // and got no reply, so a rule on `output.status` does not match it.
 type NetworkResponseOutput = {
   status: Long
+};
+
+// The name lookup, raised once per destination before the gateway resolves the host. A
+// refused name is never resolved.
+action "net:resolve" appliesTo {
+  principal: Agent,
+  resource: Resource,
+  context: { input: NetworkResolveInput }
 };
 
 // The L4 connect, raised once per pinned address. Holds even against an agent that

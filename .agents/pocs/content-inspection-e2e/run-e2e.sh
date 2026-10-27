@@ -7,7 +7,10 @@
 #
 # Protocol: .agents/pocs/egress-classification-protocol/SPEC.md (draft 0.2).
 # Cases: (a) clean POST -> 200, (b) POST with an SSN -> 403, (c) SSN POST under a policy with no
-# inspection rule -> 200, and the inspector is not called.
+# inspection rule -> 200, and the inspector is not called. Under policy-dns.dw (not with `fake`):
+# (d) GET httpbin.org -> 200 with a clean resolve and connect, (e) a tunneling-shaped name -> denied
+# at resolve, no connect, (f) a blocklisted name -> denied at resolve, (g) httpbin's addresses in the
+# IP blocklist -> denied at connect, (h) two GETs in one box -> the second resolve is cached.
 set -uo pipefail
 
 MODE="${1:-stdio}"
@@ -21,6 +24,11 @@ INSPECTOR_DIR="$REPO/.agents/pocs/content-inspector"
 # PROTOTYPE(content-inspection): canonical, because macOS reaches /var through a /private symlink.
 WORK="$(cd "$(mktemp -d /var/tmp/ci-e2e.XXXXXX)" && pwd -P)"
 SOCK="$WORK/inspector.sock"
+# PROTOTYPE(content-inspection): blocklists the inspector re-reads when they change.
+LISTS="$WORK/lists"
+mkdir -p "$LISTS"
+echo "blocked.httpbin.org" > "$LISTS/domains"
+: > "$LISTS/ips"
 URL="https://httpbin.org/post"
 export EXPERIMENTAL_LINUX_SUPPORT=TRUE
 # The https bearer token: Box resolves it through its credential vault (`env://INSPECTOR_TOKEN`), and
@@ -39,7 +47,7 @@ if [ "$BACKEND" = fake ]; then
 else
   PY="$INSPECTOR_DIR/.venv/bin/python"
   SCRIPT="$INSPECTOR_DIR/inspector.py"
-  INSPECTOR_ARGS=(--backend "$BACKEND")
+  INSPECTOR_ARGS=(--backend "$BACKEND" --domain-blocklist "$LISTS/domains" --ip-blocklist "$LISTS/ips")
   # DEVICE=mps on an Apple Silicon Mac, DEVICE=cuda on an NVIDIA host.
   [ "$BACKEND" = decider ] && INSPECTOR_ARGS+=(--device "${DEVICE:-cpu}")
   # The venv python links to the system (mise) interpreter, so the leaf reads both trees.
@@ -101,7 +109,7 @@ write_config() { # $1 = policy file, $2 = config path, $3 = state dir
       # PROTOTYPE(content-inspection): MPS needs the leaf's GPU grant; GPU=0 leaves it out.
       [ "${DEVICE:-cpu}" = mps ] && [ "${GPU:-1}" = 1 ] && echo "gpu = true"
       echo "[egress.inspector.filesystem]"
-      echo "read = $(toml_list "${PY_READS[@]}" "$(dirname "$SCRIPT")")"
+      echo "read = $(toml_list "${PY_READS[@]}" "$(dirname "$SCRIPT")" "$LISTS")"
       [ -n "${LEAF_TMP:-}" ] && echo "write = $(toml_list "$LEAF_TMP")"
       ;;
     esac
@@ -158,4 +166,70 @@ else
   echo "    PASS: no inspection line under the no-rule policy"
 fi
 [ "$MODE" != stdio ] && echo "--- inspector classify lines before/after case c: $calls_before/$(grep -c " classify " "$INSPECTOR_LOG" || true)"
+
+# PROTOTYPE(content-inspection): dns and connect subjects. $1 = name, $2 = expect (200 or deny),
+# then curl URLs. The status is curl's %{http_code}, the CONNECT reply, and curl's exit code.
+run_get() {
+  local name="$1" expect="$2" state="$WORK/state-$1" config="$WORK/box-$1.toml" out args=() u rc
+  shift 2
+  for u in "$@"; do args+=(-o /dev/null "$u"); done
+  write_config "$HERE/policy-dns.dw" "$config" "$state"
+  cp "$config" "$HERE/box-$MODE-$name.toml"
+  out="$("$BOX" run --config "$config" -- -sS -w 'status=%{http_code} connect=%{http_connect}\n' \
+        "${args[@]}" 2> "$WORK/$name.stderr")"
+  rc=$?
+  local statuses; statuses="$(sed -n 's/^status=\([0-9]*\).*/\1/p' <<<"$out" | tr '\n' ' ')"
+  echo "--- case $name: expect $expect, got: $(tr '\n' ';' <<<"$out") curl exit=$rc"
+  grep -E 'inspection:|gate|forbid|denied' "$WORK/$name.stderr" | grep -v 'strands-box: inspection: inspector' | sed 's/^/    /'
+  local ok=1
+  if [ "$expect" = 200 ]; then
+    for u in "$@"; do :; done
+    [ "$(tr -d ' ' <<<"$statuses")" = "$(printf '200%.0s' "$@")" ] || ok=0
+  else
+    grep -q ' 200' <<<" $statuses" && ok=0
+    [ "$rc" = 0 ] && ok=0
+  fi
+  CASE_OK=$ok
+}
+check() { # $1 = description, then a command that must succeed
+  local what="$1"; shift
+  if "$@"; then echo "    PASS: $what"; else echo "    FAIL: $what"; fi
+}
+has() { grep -qE "$2" "$WORK/$1.stderr"; }
+hasnt() { ! grep -qE "$2" "$WORK/$1.stderr"; }
+
+if [ "$BACKEND" != fake ]; then
+  run_get d-dns-clean 200 https://httpbin.org/get
+  check "status 200" [ "$CASE_OK" = 1 ]
+  check "resolve inspected with labels=[]" has d-dns-clean '^inspection: resolve httpbin.org:443 labels=\[\]'
+  check "connect inspected with labels=[]" has d-dns-clean '^inspection: connect httpbin.org [0-9.:]+ labels=\[\]'
+
+  TUNNEL="$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n').httpbin.org"
+  run_get e-dns-tunnel deny "https://$TUNNEL/get"
+  check "denied" [ "$CASE_OK" = 1 ]
+  check "resolve labelled TUNNELING" has e-dns-tunnel "^inspection: resolve $TUNNEL:443 labels=\[\"TUNNELING\"\]"
+  check "never reached connect (no DNS query)" hasnt e-dns-tunnel '^inspection: connect'
+
+  run_get f-dns-blocked deny https://blocked.httpbin.org/get
+  check "denied" [ "$CASE_OK" = 1 ]
+  check "resolve labelled MALICIOUS_DOMAIN" has f-dns-blocked '^inspection: resolve blocked.httpbin.org:443 labels=\["MALICIOUS_DOMAIN"\]'
+  check "never reached connect" hasnt f-dns-blocked '^inspection: connect'
+
+  # Every /16 that httpbin.org resolves to here, so a rotated address is still listed.
+  python3 -c 'import ipaddress, socket
+for a in sorted({i[4][0] for i in socket.getaddrinfo("httpbin.org", 443)}):
+    ip = ipaddress.ip_address(a)
+    print(ipaddress.ip_network(f"{a}/{16 if ip.version == 4 else 48}", strict=False))' > "$LISTS/ips"
+  echo "--- ip blocklist for case g: $(tr '\n' ' ' < "$LISTS/ips")"
+  run_get g-connect-blocked deny https://httpbin.org/get
+  : > "$LISTS/ips"
+  check "denied" [ "$CASE_OK" = 1 ]
+  check "resolve passed with labels=[]" has g-connect-blocked '^inspection: resolve httpbin.org:443 labels=\[\]'
+  check "connect labelled MALICIOUS_IP" has g-connect-blocked '^inspection: connect httpbin.org [0-9.:]+ labels=\["MALICIOUS_IP"\]'
+
+  run_get h-dns-cached 200 https://httpbin.org/get https://httpbin.org/anything
+  check "both 200" [ "$CASE_OK" = 1 ]
+  check "first resolve not cached" has h-dns-cached '^inspection: resolve httpbin.org:443 labels=\[\] .*ms$'
+  check "second resolve cached" has h-dns-cached '^inspection: resolve httpbin.org:443 labels=\[\] .* cached$'
+fi
 echo "work dir: $WORK"

@@ -8,13 +8,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use policy::{ContentInspector, InspectionRequest, InspectionVerdict};
+use policy::{
+    ContentInspector, InspectionLabels, InspectionRequest, InspectionVerdict, NameInspection,
+    NameSubjectKind,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 use crate::record::config::prototype_inspection::{Binding, InspectionConfig};
 
 const PROTOCOL_VERSION: &str = "0.2";
+const CACHE_ENTRIES: usize = 4096;
 const MAX_MESSAGE_BYTES: usize = 16 << 20;
 const REDACTED_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
 const KNOWN_ERRORS: [&str; 7] = [
@@ -30,12 +34,25 @@ const KNOWN_ERRORS: [&str; 7] = [
 type Reply = std::sync::mpsc::Sender<Result<Value, String>>;
 type Pending = (String, String, Reply);
 
-/// PROTOTYPE(content-inspection): what `capabilities` reported for the `http` subject.
+/// PROTOTYPE(content-inspection): what `capabilities` reported, per subject kind.
 #[derive(Debug)]
 struct Capabilities {
     name: String,
-    http_labels: BTreeSet<String>,
+    http: Option<HttpSubject>,
+    dns: Option<BTreeSet<String>>,
+    connect: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug)]
+struct HttpSubject {
+    labels: BTreeSet<String>,
     max_body_bytes: usize,
+}
+
+/// PROTOTYPE(content-inspection): one cached `dns` or `connect` answer.
+struct Cached {
+    expires: Instant,
+    labels: Vec<String>,
 }
 
 /// PROTOTYPE(content-inspection): the bearer token, held by a Box credential vault.
@@ -69,8 +86,9 @@ struct Started {
 pub(crate) struct PrototypeInspector {
     config: InspectionConfig,
     box_name: String,
-    requested: Option<BTreeSet<String>>,
+    requested: InspectionLabels,
     timeout: Duration,
+    cache: Mutex<HashMap<String, Cached>>,
     next_id: AtomicU64,
     started: OnceLock<Started>,
     capabilities: OnceLock<Capabilities>,
@@ -93,13 +111,14 @@ impl PrototypeInspector {
     pub(crate) fn from_config(
         config: &InspectionConfig,
         box_name: &str,
-        requested: Option<BTreeSet<String>>,
+        requested: InspectionLabels,
     ) -> Arc<Self> {
         Arc::new(Self {
             config: config.clone(),
             box_name: box_name.to_string(),
             requested,
             timeout: Duration::from_millis(config.timeout_ms),
+            cache: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             started: OnceLock::new(),
             capabilities: OnceLock::new(),
@@ -148,25 +167,53 @@ impl PrototypeInspector {
         let capabilities = tokio::task::spawn_blocking(move || this.fetch_capabilities())
             .await
             .map_err(|error| format!("capabilities task: {error}"))??;
-        let mut labels: Vec<&str> = capabilities
-            .http_labels
-            .iter()
-            .map(String::as_str)
-            .collect();
-        labels.sort_unstable();
+        let show = |labels: Option<&BTreeSet<String>>| {
+            labels.map_or_else(|| "absent".to_string(), |labels| format!("{labels:?}"))
+        };
         eprintln!(
-            "strands-box: inspection: inspector {} via {} http labels={:?} max_body_bytes={}",
+            "strands-box: inspection: inspector {} via {} http labels={} max_body_bytes={} dns labels={} connect labels={}",
             capabilities.name,
             describe(&binding),
-            labels,
-            capabilities.max_body_bytes
+            show(capabilities.http.as_ref().map(|http| &http.labels)),
+            capabilities
+                .http
+                .as_ref()
+                .map_or(0, |http| http.max_body_bytes),
+            show(capabilities.dns.as_ref()),
+            show(capabilities.connect.as_ref()),
         );
-        if let Some(requested) = &self.requested {
-            let missing: Vec<&String> = requested.difference(&capabilities.http_labels).collect();
+        let subjects = [
+            (
+                "Inspection::Content",
+                "http",
+                self.requested.content.as_ref(),
+                capabilities.http.as_ref().map(|http| &http.labels),
+            ),
+            (
+                "Inspection::Domain",
+                "dns",
+                self.requested.domain.as_ref(),
+                capabilities.dns.as_ref(),
+            ),
+            (
+                "Inspection::Address",
+                "connect",
+                self.requested.address.as_ref(),
+                capabilities.connect.as_ref(),
+            ),
+        ];
+        for (provider, kind, requested, supported) in subjects {
+            let Some(requested) = requested else { continue };
+            let Some(supported) = supported else {
+                return Err(format!(
+                    "the policy uses {provider}, and the inspector does not list the `{kind}` subject"
+                ));
+            };
+            let missing: Vec<&String> = requested.difference(supported).collect();
             if !missing.is_empty() {
                 eprintln!(
                     "strands-box: inspection: warning: the policy asks for {missing:?}, which the \
-                     inspector does not list for http; those labels are never found"
+                     inspector does not list for {kind}; those labels are never found"
                 );
             }
         }
@@ -199,26 +246,48 @@ impl PrototypeInspector {
                 .unwrap_or("unknown")
                 .to_string()
         };
-        let http = result
+        let subjects = result
             .get("subjects")
-            .and_then(|subjects| subjects.get("http"))
-            .ok_or("capabilities: the inspector does not list the `http` subject")?;
-        let http_labels = http
-            .get("labels")
-            .and_then(Value::as_array)
-            .ok_or("capabilities: `subjects.http.labels` is absent")?
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect();
-        let max_body_bytes = http
-            .get("max_body_bytes")
-            .and_then(Value::as_u64)
-            .ok_or("capabilities: `subjects.http.max_body_bytes` is absent")?;
+            .and_then(Value::as_object)
+            .ok_or("capabilities: `subjects` is absent")?;
+        let labels_of = |kind: &str| -> Result<Option<BTreeSet<String>>, String> {
+            let Some(subject) = subjects.get(kind) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                subject
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .ok_or(format!("capabilities: `subjects.{kind}.labels` is absent"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        };
+        let http = match labels_of("http")? {
+            None => None,
+            Some(labels) => {
+                let max_body_bytes = subjects["http"]
+                    .get("max_body_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or("capabilities: `subjects.http.max_body_bytes` is absent")?;
+                Some(HttpSubject {
+                    labels,
+                    max_body_bytes: usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
+                })
+            }
+        };
+        let dns = labels_of("dns")?;
+        let connect = labels_of("connect")?;
+        if http.is_none() && dns.is_none() && connect.is_none() {
+            return Err("capabilities: the inspector lists no subject Box sends".to_string());
+        }
         Ok(Capabilities {
             name: format!("{} {}", field("name"), field("version")),
-            http_labels,
-            max_body_bytes: usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
+            http,
+            dns,
+            connect,
         })
     }
 
@@ -320,16 +389,20 @@ impl ContentInspector for PrototypeInspector {
             .capabilities
             .get()
             .ok_or("the inspector is not started")?;
+        let http = capabilities
+            .http
+            .as_ref()
+            .ok_or("the inspector does not list the `http` subject")?;
         let labels: Vec<&String> = request
             .labels
             .iter()
-            .filter(|label| capabilities.http_labels.contains(*label))
+            .filter(|label| http.labels.contains(*label))
             .collect();
         if labels.is_empty() {
             return Ok(InspectionVerdict {
                 labels: Vec::new(),
                 backend: capabilities.name.clone(),
-                latency_ms: 0,
+                ..InspectionVerdict::default()
             });
         }
         let headers: Vec<[String; 2]> = request
@@ -361,34 +434,158 @@ impl ContentInspector for PrototypeInspector {
             "context": { "gateway": "strands-box", "box": self.box_name, "caller": "agent" },
         });
         let result = self.call("classify", params, deadline)?;
-        let found = result
-            .get("labels")
-            .and_then(Value::as_array)
-            .ok_or("result has no `labels` array")?
-            .iter()
-            .map(|label| {
-                let label = label.as_str().ok_or("a label is not a string")?;
-                if labels.iter().any(|asked| asked.as_str() == label) {
-                    Ok(label.to_string())
-                } else {
-                    Err(format!(
-                        "the inspector returned {label:?}, which was not requested"
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let found = found_labels(&result, &labels)?;
         Ok(InspectionVerdict {
             labels: found,
             backend: capabilities.name.clone(),
-            latency_ms: u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX),
+            latency_ms: elapsed_ms(begun),
+            cached: false,
         })
     }
 
     fn max_body_bytes(&self) -> usize {
         self.capabilities
             .get()
-            .map_or(0, |capabilities| capabilities.max_body_bytes)
+            .and_then(|capabilities| capabilities.http.as_ref())
+            .map_or(0, |http| http.max_body_bytes)
     }
+
+    fn inspect_name(&self, request: &NameInspection<'_>) -> Result<InspectionVerdict, String> {
+        let begun = Instant::now();
+        let deadline = begun + self.timeout;
+        let capabilities = self
+            .capabilities
+            .get()
+            .ok_or("the inspector is not started")?;
+        let (kind, supported) = match request.kind {
+            NameSubjectKind::Dns => ("dns", capabilities.dns.as_ref()),
+            NameSubjectKind::Connect => ("connect", capabilities.connect.as_ref()),
+        };
+        let supported =
+            supported.ok_or_else(|| format!("the inspector does not list the `{kind}` subject"))?;
+        let mut labels: Vec<&String> = request
+            .labels
+            .iter()
+            .filter(|label| supported.contains(*label))
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        let backend = capabilities.name.clone();
+        if labels.is_empty() {
+            return Ok(InspectionVerdict {
+                backend,
+                ..InspectionVerdict::default()
+            });
+        }
+        let name = normalize_name(request.name)?;
+        let mut subject = json!({ "kind": kind, "name": name, "port": request.port });
+        if let Some(ip) = request.ip {
+            subject["ip"] = Value::String(ip.to_string());
+        }
+        let key = format!("{subject}|{labels:?}");
+        if let Some(found) = self.cached(&key) {
+            return Ok(InspectionVerdict {
+                labels: found,
+                backend,
+                latency_ms: elapsed_ms(begun),
+                cached: true,
+            });
+        }
+        let params = json!({
+            "subject": subject,
+            "labels": labels,
+            "context": { "gateway": "strands-box", "box": self.box_name, "caller": "agent" },
+        });
+        let result = self.call("classify", params, deadline)?;
+        let found = found_labels(&result, &labels)?;
+        if let Some(ttl) = result.get("cache_ttl_s").and_then(Value::as_u64)
+            && ttl > 0
+        {
+            self.remember(key, found.clone(), Duration::from_secs(ttl));
+        }
+        Ok(InspectionVerdict {
+            labels: found,
+            backend,
+            latency_ms: elapsed_ms(begun),
+            cached: false,
+        })
+    }
+}
+
+impl PrototypeInspector {
+    fn cached(&self, key: &str) -> Option<Vec<String>> {
+        let mut cache = self.cache.lock().ok()?;
+        match cache.get(key) {
+            Some(entry) if entry.expires > Instant::now() => Some(entry.labels.clone()),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember(&self, key: String, labels: Vec<String>, ttl: Duration) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        if cache.len() >= CACHE_ENTRIES {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires > now);
+            if cache.len() >= CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            Cached {
+                expires: Instant::now() + ttl,
+                labels,
+            },
+        );
+    }
+}
+
+/// The `name` of a `dns` or `connect` subject: lower case, no trailing dot, IDN in `xn--` form.
+fn normalize_name(host: &str) -> Result<String, String> {
+    let trimmed = host.trim_end_matches('.');
+    if let Ok(ip) = trimmed
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        return Ok(ip.to_string());
+    }
+    let url = reqwest::Url::parse(&format!("http://{trimmed}/"))
+        .map_err(|error| format!("host {host:?} is not a valid name: {error}"))?;
+    let name = url
+        .host_str()
+        .ok_or_else(|| format!("host {host:?} has no name"))?;
+    Ok(name.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// The requested labels a classify `result` found, or the reason the decision failed.
+fn found_labels(result: &Value, asked: &[&String]) -> Result<Vec<String>, String> {
+    result
+        .get("labels")
+        .and_then(Value::as_array)
+        .ok_or("result has no `labels` array")?
+        .iter()
+        .map(|label| {
+            let label = label.as_str().ok_or("a label is not a string")?;
+            if asked.iter().any(|asked| asked.as_str() == label) {
+                Ok(label.to_string())
+            } else {
+                Err(format!(
+                    "the inspector returned {label:?}, which was not requested"
+                ))
+            }
+        })
+        .collect()
+}
+
+fn elapsed_ms(begun: Instant) -> u64 {
+    u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn major(version: &str) -> Option<&str> {

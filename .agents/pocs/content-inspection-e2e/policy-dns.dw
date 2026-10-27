@@ -1,0 +1,26 @@
+// PROTOTYPE(content-inspection): allow httpbin and its subdomains, forbid a name the inspector labels
+// malicious or tunneling before it is resolved, and an address it labels malicious before connect.
+permit (principal, action == Box::Action::"net:resolve", resource)
+when {
+  (context.input.host == "httpbin.org" || context.input.host like "*.httpbin.org") &&
+  context.input.port == 443
+};
+
+permit (principal, action == Box::Action::"net:connect", resource)
+when {
+  (context.input.host == "httpbin.org" || context.input.host like "*.httpbin.org") &&
+  context.input.port == 443
+};
+
+permit (principal, action == Box::Action::"http:request", resource)
+when { context.input.host == "httpbin.org" };
+
+@id("no_bad_names")
+forbid (principal, action == Box::Action::"net:resolve", resource)
+when {
+  Inspection::Domain(["MALICIOUS_DOMAIN", "TUNNELING"]).labels.containsAny(["MALICIOUS_DOMAIN", "TUNNELING"])
+};
+
+@id("no_bad_addresses")
+forbid (principal, action == Box::Action::"net:connect", resource)
+when { Inspection::Address(["MALICIOUS_IP"]).labels.containsAny(["MALICIOUS_IP"]) };

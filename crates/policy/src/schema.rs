@@ -104,6 +104,8 @@ pub(crate) mod action {
     /// naming `fs:other`, so an unmapped verb never inherits a read/write/delete/move
     /// permit.
     pub(crate) const FS_OTHER: &str = "fs:other";
+    /// `net:resolve` — the host name lookup, decided before any DNS query.
+    pub(crate) const NET_RESOLVE: &str = "net:resolve";
     /// `net:connect` — L4 TCP connect (the durable floor).
     pub(crate) const NET_CONNECT: &str = "net:connect";
     /// `http:request` — the L7 HTTP decision; its one `::response` carries the reply's `status`.
@@ -408,6 +410,7 @@ const ACTION_IDS: &[&str] = &[
     action::FS_DELETE,
     action::FS_MOVE,
     action::FS_OTHER,
+    action::NET_RESOLVE,
     action::NET_CONNECT,
     action::HTTP_REQUEST,
     action::SHELL_EXEC,
@@ -420,6 +423,7 @@ const ACTION_IDS: &[&str] = &[
 pub(crate) fn action_id(req: &Request<'_>) -> &'static str {
     match req {
         Request::Fs { operation, .. } => fs_action_id(*operation),
+        Request::Resolve { .. } => action::NET_RESOLVE,
         Request::Connect { .. } => action::NET_CONNECT,
         Request::Http { .. } => action::HTTP_REQUEST,
         Request::ShellExec { .. } => action::SHELL_EXEC,
@@ -495,6 +499,16 @@ fn context_for(
             fields.push((attr::OPERATION.to_string(), fs_operation_expr(*operation)?));
             fields
         }
+        Request::Resolve { host, port } => vec![
+            (
+                attr::HOST.to_string(),
+                RestrictedExpression::new_string((*host).to_string()),
+            ),
+            (
+                attr::PORT.to_string(),
+                RestrictedExpression::new_long(i64::from(*port)),
+            ),
+        ],
         Request::Connect { host, ip, port } => {
             let mut fields = vec![
                 (

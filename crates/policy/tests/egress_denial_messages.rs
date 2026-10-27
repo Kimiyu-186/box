@@ -20,7 +20,7 @@ use policy::{EgressPolicyInterceptor, GovernedBox, Policy, Principal, generate_m
 use serde_json::{Value, json};
 
 const HOST: &str = "denial.test";
-const CONNECT: &str = r#"permit(principal, action == Box::Action::"net:connect", resource);"#;
+const CONNECT: &str = r#"permit(principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);"#;
 const HTTP: &str = r#"permit(principal, action == Box::Action::"http:request", resource);"#;
 const MCP: &str = r#"permit(principal, action == Box::Action::"mcp:call", resource);"#;
 /// The resource each expected message names, filled in per gateway.
@@ -114,7 +114,7 @@ fn raw_response(stream: &mut (impl Read + Write), request: &str) -> String {
 #[test]
 fn connect_refusals_reach_tcp_and_unix_workloads_without_opening_upstream() {
     let mut correlations = HashSet::new();
-    for (source, expected) in cases(r#"Box::Action::"net:connect""#) {
+    for (source, expected) in cases(r#"Box::Action::"net:resolve""#) {
         for transport in ["connect", "plain", "unix"] {
             let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
             upstream.set_nonblocking(true).unwrap();
@@ -381,7 +381,7 @@ fn remote_mcp_refusals_form_rpc_errors_only_for_valid_request_ids() {
 }
 
 const DUPLICATE_KEY_POLICY: &str = r#"
-permit(principal, action == Box::Action::"net:connect", resource);
+permit(principal, action in [Box::Action::"net:resolve", Box::Action::"net:connect"], resource);
 permit(principal, action == Box::Action::"http:request", resource);
 permit(principal, action == Box::Action::"mcp:call", resource);
 @id("blocked-tool")
