@@ -776,10 +776,14 @@ pub(crate) struct SyscallPolicy {
 
 impl SyscallPolicy {
     /// Derive the policy from one request.
-    pub(crate) fn for_config(_network: &Network, backend: &BackendOverride) -> Self {
-        Self {
-            container: matches!(backend, &BackendOverride::LinuxContainer),
-        }
+    pub(crate) fn for_config(_network: &Network) -> Self {
+        Self { container: false }
+    }
+
+    /// Select the permits for the chosen backend.
+    pub(crate) fn with_backend(mut self, backend: &BackendOverride) -> Self {
+        self.container = matches!(backend, BackendOverride::LinuxContainer);
+        self
     }
 
     /// Compile every filter before containment starts.
@@ -1156,7 +1160,7 @@ mod tests {
 
     #[test]
     fn every_mediated_syscall_has_a_rule() {
-        let filters = SyscallPolicy::for_config(&localhost(), &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&localhost())
             .compile()
             .expect("the shipped table must compile");
         for entry in MEDIATED {
@@ -1321,7 +1325,7 @@ mod tests {
     #[test]
     fn every_network_mode_permits_only_unix_and_inet() {
         for network in [Network::Blocked, localhost(), Network::AllowAll] {
-            let policy = SyscallPolicy::for_config(&network, &BackendOverride::None);
+            let policy = SyscallPolicy::for_config(&network);
             let rules = policy.socket_rules().expect("socket rules compile");
             assert_eq!(rules.len(), 1);
             let filters = policy.compile().expect("filters compile");
@@ -1341,7 +1345,7 @@ mod tests {
     fn socketpair_permits_only_unix() {
         let rules = unix_socketpair_rules().expect("socketpair rules compile");
         assert_eq!(rules.len(), 1);
-        let filters = SyscallPolicy::for_config(&Network::Blocked, &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
             .compile()
             .expect("filters compile");
         let socketpair_number = u32::try_from(libc::SYS_socketpair).expect("small");
@@ -1419,7 +1423,7 @@ mod tests {
                 .any(|entry| entry.name == "getrusage" && entry.number == libc::SYS_getrusage)
         );
         assert!(!MEDIATED.iter().any(|entry| entry.name == "getrusage"));
-        let filters = SyscallPolicy::for_config(&Network::Blocked, &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
             .compile()
             .expect("filters compile");
         let number = u32::try_from(libc::SYS_getrusage).expect("syscall numbers are small");
@@ -1452,7 +1456,7 @@ mod tests {
             );
             assert!(!MEDIATED.iter().any(|entry| entry.name == required));
         }
-        let filters = SyscallPolicy::for_config(&Network::Blocked, &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
             .compile()
             .expect("filters compile");
         for number in [
@@ -1484,7 +1488,7 @@ mod tests {
                 .any(|entry| entry.name == "dup" && entry.number == libc::SYS_dup)
         );
         assert!(!MEDIATED.iter().any(|entry| entry.name == "dup"));
-        let filters = SyscallPolicy::for_config(&Network::Blocked, &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
             .compile()
             .expect("filters compile");
         let number = u32::try_from(libc::SYS_dup).expect("syscall numbers are small");
@@ -1506,7 +1510,7 @@ mod tests {
                 .any(|entry| entry.name == "umask" && entry.number == libc::SYS_umask)
         );
         assert!(!MEDIATED.iter().any(|entry| entry.name == "umask"));
-        let filters = SyscallPolicy::for_config(&Network::Blocked, &BackendOverride::None)
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
             .compile()
             .expect("filters compile");
         let number = u32::try_from(libc::SYS_umask).expect("syscall numbers are small");
@@ -1591,7 +1595,7 @@ mod tests {
 
     #[test]
     fn an_argument_scoped_entry_without_a_rule_is_refused() {
-        let policy = SyscallPolicy::for_config(&localhost(), &BackendOverride::None);
+        let policy = SyscallPolicy::for_config(&localhost());
         let bogus = MediatedSyscall {
             name: "fictional",
             number: libc::SYS_getpid,

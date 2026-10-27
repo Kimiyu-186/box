@@ -62,10 +62,7 @@ fn main() -> ExitCode {
             return ExitCode::from(SHELL_FAILURE_EXIT);
         }
     };
-    let outcome = runtime.block_on(run());
-    // A completed alias must not wait for a caller that still holds stdin open.
-    runtime.shutdown_background();
-    match outcome {
+    match runtime.block_on(run()) {
         Ok(status) => ExitCode::from(shell_status(status)),
         Err(error) => {
             eprintln!("strands-box-sock-alias: {error}");
@@ -291,7 +288,7 @@ fn parse_script_alias(executable: &Path, arguments: Vec<OsString>) -> io::Result
 
 /// Pump one MCP server's traffic: stdin to the box, the box's output to stdout.
 async fn stream_mcp(mut stream: UnixStream, interpreter: Interpreter) -> io::Result<i32> {
-    use tokio::io::AsyncWriteExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     write_frame(
         &mut stream,
@@ -303,44 +300,11 @@ async fn stream_mcp(mut stream: UnixStream, interpreter: Interpreter) -> io::Res
     )
     .await?;
 
-    let (mut readable, writable) = stream.into_split();
+    let (mut readable, mut writable) = stream.into_split();
 
-    let inbound = pump_stdin(writable);
-
-    // The box -> stdout.
-    let mut stdout = tokio::io::stdout();
-    let mut status = 0;
-    loop {
-        let frame = match read_frame::<Frame, _>(&mut readable).await {
-            Ok(Some(frame)) => frame,
-            // The box closed the connection, which is how a session ends.
-            Ok(None) | Err(_) => break,
-        };
-        match frame.body {
-            Body::Output { data, .. } => {
-                let bytes = decode_payload(&data)?;
-                stdout.write_all(&bytes).await?;
-                stdout.flush().await?;
-            }
-            // A refusal is terminal and must not report a successful exit.
-            Body::Denied { reason, .. } => {
-                eprintln!("strands-box: {reason}");
-                return Ok(i32::from(SHELL_FAILURE_EXIT));
-            }
-            Body::Exit { status: reported } => {
-                status = reported;
-                break;
-            }
-            _ => {}
-        }
-    }
-    inbound.abort();
-    Ok(status)
-}
-
-fn pump_stdin(mut writable: tokio::net::unix::OwnedWriteHalf) -> tokio::task::JoinHandle<()> {
-    use tokio::io::AsyncReadExt as _;
-    tokio::spawn(async move {
+    // stdin -> the box. Its own task, because the two directions are independent: a client may send
+    // a request while a previous answer is still arriving.
+    let inbound = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buffer = [0_u8; 8192];
         loop {
@@ -368,9 +332,38 @@ fn pump_stdin(mut writable: tokio::net::unix::OwnedWriteHalf) -> tokio::task::Jo
             },
         )
         .await;
-        // Program stdin EOF does not close the transport before its Exit frame.
-        writable.forget();
-    })
+    });
+
+    // The box -> stdout.
+    let mut stdout = tokio::io::stdout();
+    let mut status = 0;
+    loop {
+        let frame = match read_frame::<Frame, _>(&mut readable).await {
+            Ok(Some(frame)) => frame,
+            // The box closed the connection, which is how a session ends.
+            Ok(None) | Err(_) => break,
+        };
+        match frame.body {
+            Body::Output { data, .. } => {
+                let bytes = decode_payload(&data)?;
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+            // A refusal is a failure exit and is terminal. Printing the reason and looping left
+            // `status` at 0, so a refused MCP server closed the connection and the alias exited
+            Body::Denied { reason, .. } => {
+                eprintln!("strands-box: {reason}");
+                return Ok(i32::from(SHELL_FAILURE_EXIT));
+            }
+            Body::Exit { status: reported } => {
+                status = reported;
+                break;
+            }
+            _ => {}
+        }
+    }
+    inbound.abort();
+    Ok(status)
 }
 
 /// Derive a socket path from the alias's grandparent, never from an argument.
@@ -422,12 +415,15 @@ async fn forward(socket: &Path, interpreter: Interpreter, source: String) -> io:
         return stream_mcp(stream, interpreter).await;
     }
 
+    // `InputEof` immediately after the Call, because this alias forwards no input: a harness
+    // invoking `zsh -c` gives the command nothing on stdin, and without the EOF the Program's stdin
     for body in [
         Body::Open { mode: interpreter },
         Body::Call {
             source,
             correlation: Box::new(call_correlation()),
         },
+        Body::InputEof,
     ] {
         tokio::time::timeout(
             SERVE_IO_TIMEOUT,
@@ -444,57 +440,52 @@ async fn forward(socket: &Path, interpreter: Interpreter, source: String) -> io:
         .map_err(|_| timed_out("write a transport frame"))??;
     }
 
-    let (mut readable, writable) = stream.into_split();
-    let inbound = pump_stdin(writable);
-    let outcome = async {
-        loop {
-            let frame = tokio::time::timeout(
-                SERVE_RESPONSE_TIMEOUT,
-                read_frame::<Frame, _>(&mut readable),
-            )
-            .await
-            .map_err(|_| timed_out("read a transport frame"))??
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the box broker closed"))?;
-            match frame.body {
-                Body::Output {
-                    stream: which,
-                    data,
-                } => {
-                    use std::io::Write as _;
-                    let bytes = decode_payload(&data)?;
-                    // Flushed per chunk, not at exit.
-                    match which {
-                        Stream::Stdout => {
-                            let mut out = std::io::stdout();
-                            out.write_all(&bytes)?;
-                            out.flush()?;
-                        }
-                        Stream::Stderr => {
-                            let mut err = std::io::stderr();
-                            err.write_all(&bytes)?;
-                            err.flush()?;
-                        }
+    // Relayed as it arrives rather than accumulated, so a long-running command is observable
+    // while it runs.
+    loop {
+        let frame =
+            tokio::time::timeout(SERVE_RESPONSE_TIMEOUT, read_frame::<Frame, _>(&mut stream))
+                .await
+                .map_err(|_| timed_out("read a transport frame"))??
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "the box broker closed")
+                })?;
+        match frame.body {
+            Body::Output {
+                stream: which,
+                data,
+            } => {
+                use std::io::Write as _;
+                let bytes = decode_payload(&data)?;
+                // Flushed per chunk, not at exit.
+                match which {
+                    Stream::Stdout => {
+                        let mut out = std::io::stdout();
+                        out.write_all(&bytes)?;
+                        out.flush()?;
+                    }
+                    Stream::Stderr => {
+                        let mut err = std::io::stderr();
+                        err.write_all(&bytes)?;
+                        err.flush()?;
                     }
                 }
-                Body::Exit { status } => return Ok(status),
-                // A transport refusal, including a version mismatch. Terminal, and reported as the
-                // boundary's own failure rather than as something the program did.
-                Body::Denied { reason, .. } => {
-                    eprintln!("strands-box: {reason}");
-                    return Ok(i32::from(SHELL_FAILURE_EXIT));
-                }
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("the box broker sent a client frame: {other:?}"),
-                    ));
-                }
+            }
+            Body::Exit { status } => return Ok(status),
+            // A transport refusal, including a version mismatch. Terminal, and reported as the
+            // boundary's own failure rather than as something the program did.
+            Body::Denied { reason, .. } => {
+                eprintln!("strands-box: {reason}");
+                return Ok(i32::from(SHELL_FAILURE_EXIT));
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the box broker sent a client frame: {other:?}"),
+                ));
             }
         }
     }
-    .await;
-    inbound.abort();
-    outcome
 }
 
 /// One Call's correlation, read from `TRACEPARENT` and `TRACESTATE` and from no other variable.
