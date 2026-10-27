@@ -13,6 +13,8 @@ use crate::model::{ObjectIdentity, ObjectPin, Operation, Scope};
 use super::MECHANISM;
 use crate::backend::dependencies::{MissingReads, folded, require_not_refused, workload_writable};
 
+mod targets;
+
 /// What provides an entry's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MountKind {
@@ -593,8 +595,12 @@ impl MountView {
 
         match entry.kind {
             MountKind::Fresh { fstype } => {
-                std::fs::create_dir_all(&target)
-                    .map_err(|e| refusal(format!("creating '{}': {e}", target.display())))?;
+                let pinned = targets::MountTarget::prepare(self, entry, root, true)?;
+                let previous = targets::mount_ids()?;
+                #[cfg(test)]
+                if entry.origin == MountOrigin::Refusal {
+                    targets::after_open();
+                }
                 // `nosuid` and `nodev` on every fresh filesystem: a setuid bit or a device node the
                 // workload created would be authority the plan never granted.
                 let mut fresh_flags = if fstype == "proc" {
@@ -610,7 +616,7 @@ impl MountView {
                 }
                 mount_syscall(
                     Some(Path::new(fstype)),
-                    &target,
+                    &pinned.path(),
                     Some(fstype),
                     fresh_flags,
                     None,
@@ -621,6 +627,11 @@ impl MountView {
                         target.display()
                     ))
                 })?;
+                #[cfg(test)]
+                if entry.origin == MountOrigin::Refusal {
+                    targets::after_mount();
+                }
+                pinned.require_new_mount(&target, &previous)?;
             }
             MountKind::EmptyFile => {
                 let source = root.join(EMPTY_FILE_NAME);
@@ -636,49 +647,22 @@ impl MountView {
                             ))
                         })?;
                 }
-                // The mountpoint is the refused file itself when a bind encloses it, or a fresh file
-                // in the view's own tree when nothing does. Never created through a bind: that
-                // would create it on the host.
-                match std::fs::symlink_metadata(&target) {
-                    Ok(metadata) if metadata.is_file() => {}
-                    Ok(_) => {
-                        return Err(refusal(format!(
-                            "refused file mountpoint '{}' is not a regular file",
+                let pinned = targets::MountTarget::prepare(self, entry, root, false)?;
+                let previous = targets::mount_ids()?;
+                #[cfg(test)]
+                targets::after_open();
+                mount_syscall(Some(&source), &pinned.path(), None, libc::MS_BIND, None).map_err(
+                    |e| {
+                        refusal(format!(
+                            "binding the empty file over '{}': {e}",
                             target.display()
-                        )));
-                    }
-                    Err(_) if self.enclosed_by_a_bind(&entry.target) => {
-                        return Err(refusal(format!(
-                            "refused file '{}' is absent from the tree bound over it, and a \
-                             mountpoint created there would be created on the host",
-                            entry.target.display()
-                        )));
-                    }
-                    Err(_) => {
-                        if let Some(parent) = target.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                refusal(format!("creating '{}': {e}", parent.display()))
-                            })?;
-                        }
-                        std::fs::OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .open(&target)
-                            .map_err(|e| {
-                                refusal(format!(
-                                    "creating the mountpoint '{}': {e}",
-                                    target.display()
-                                ))
-                            })?;
-                    }
-                }
-                mount_syscall(Some(&source), &target, None, libc::MS_BIND, None).map_err(|e| {
-                    refusal(format!(
-                        "binding the empty file over '{}': {e}",
-                        target.display()
-                    ))
-                })?;
-                remount_protected(&target)?;
+                        ))
+                    },
+                )?;
+                #[cfg(test)]
+                targets::after_mount();
+                let mounted = pinned.require_new_mount(&target, &previous)?;
+                remount_protected(&targets::descriptor_path(&mounted))?;
             }
             MountKind::Bind => {
                 let source = entry.source.as_deref().ok_or_else(|| {
@@ -1758,6 +1742,7 @@ fn refusal(reason: String) -> ContainmentError {
 #[cfg(test)]
 mod tests {
     mod loader_admission;
+    mod refusal;
     use super::*;
 
     /// **The escapes the kernel actually emits decode, and nothing else is touched.**
@@ -4011,21 +3996,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_empty_refusal_mountpoint_creation_refuses_the_view() {
+    fn failed_empty_refusal_target_opening_refuses_the_view() {
         establish_refuses(
             MountKind::EmptyFile,
             true,
             "/entry",
             libc::SYS_openat,
-            "creating the mountpoint",
+            "opening the staging root",
         );
     }
 
     #[test]
     fn failed_empty_refusal_parent_creation_refuses_the_view() {
-        #[cfg(target_arch = "x86_64")]
-        let call = libc::SYS_mkdir;
-        #[cfg(not(target_arch = "x86_64"))]
         let call = libc::SYS_mkdirat;
         establish_refuses(
             MountKind::EmptyFile,
@@ -4065,9 +4047,6 @@ mod tests {
 
     #[test]
     fn failed_fresh_mount_directory_creation_refuses_the_view() {
-        #[cfg(target_arch = "x86_64")]
-        let call = libc::SYS_mkdir;
-        #[cfg(not(target_arch = "x86_64"))]
         let call = libc::SYS_mkdirat;
         establish_refuses(
             MountKind::Fresh { fstype: "tmpfs" },
