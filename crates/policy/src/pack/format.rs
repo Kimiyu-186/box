@@ -24,7 +24,6 @@ pub(crate) struct PackFile {
 }
 
 /// The `[global]` table: options that come before the command words.
-#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GlobalSpec {
@@ -33,7 +32,6 @@ pub(crate) struct GlobalSpec {
 }
 
 /// One `[shell.<action>]` table.
-#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShellActionSpec {
@@ -49,14 +47,13 @@ pub(crate) struct ShellActionSpec {
 }
 
 /// One `options.<name>` entry.
-#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OptionSpec {
     #[serde(deserialize_with = "one_or_many")]
     pub(crate) flag: Vec<String>,
     #[serde(default)]
-    pub(crate) value: OptionValue,
+    pub(crate) value: ValueSpec,
     #[serde(default)]
     pub(crate) repeated: bool,
     #[serde(default, deserialize_with = "one_or_many")]
@@ -66,13 +63,12 @@ pub(crate) struct OptionSpec {
     #[serde(default)]
     pub(crate) removes: Vec<String>,
     #[serde(default)]
-    pub(crate) when: Vec<WhenRule>,
+    pub(crate) when: Vec<WhenSpec>,
     #[serde(default)]
     pub(crate) anywhere: bool,
 }
 
 /// One `operands.<name>` entry.
-#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperandSpec {
@@ -83,16 +79,15 @@ pub(crate) struct OperandSpec {
     #[serde(default)]
     pub(crate) removes: Vec<String>,
     #[serde(default)]
-    pub(crate) when: Vec<WhenRule>,
+    pub(crate) when: Vec<WhenSpec>,
     #[serde(default)]
     pub(crate) rest: bool,
 }
 
-/// One `when` pattern rule on an option or an operand.
-#[cfg_attr(test, derive(PartialEq))]
+/// One `when` entry on an option or an operand.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WhenRule {
+pub(crate) struct WhenSpec {
     #[serde(deserialize_with = "one_or_many")]
     pub(crate) like: Vec<String>,
     #[serde(default)]
@@ -116,9 +111,9 @@ fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>
 }
 
 /// Whether an option takes a value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OptionValue {
+pub(crate) enum ValueSpec {
     #[default]
     None,
     Required,

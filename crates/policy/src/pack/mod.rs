@@ -3,15 +3,15 @@
 //! | Module | Owns |
 //! |---|---|
 //! | `format` | the `*.pack.toml` document as written |
-//! | `validate` | the content checks a document passes after it deserializes |
+//! | `model` | the checked pack that loading builds from that document |
 
 mod format;
-mod validate;
+mod model;
 
-use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use format::{GlobalSpec, PackFile, ShellActionSpec};
+pub(crate) use model::Pack;
 
 /// The pack file formats this Box reads.
 const KNOWN_FORMATS: &[i64] = &[1];
@@ -21,7 +21,7 @@ const KNOWN_FORMATS: &[i64] = &[1];
 #[error("tool pack {}: {refusal}", .origin.display())]
 pub(crate) struct PackError {
     origin: PathBuf,
-    refusal: PackRefusal,
+    refusal: Box<PackRefusal>,
 }
 
 /// Why Box refuses a tool pack file.
@@ -40,32 +40,49 @@ pub(crate) enum PackRefusal {
     #[error("`version = {0}` must be a positive integer")]
     BadVersion(String),
     #[error(
-        "{place} {name:?} is not an identifier (ASCII letters, digits, and `_`, not first a digit)"
+        "{place}: {name:?} is not an identifier (ASCII letters, digits, and `_`, not first a digit)"
     )]
-    NotIdentifier { place: String, name: String },
+    NotIdentifier { place: Place, name: String },
     #[error("`program = {0:?}` must be one program name, not a path")]
     BadProgram(String),
-    #[error(
-        "`[shell.{action}]` usage starts with {first:?}, but the pack's program is {program:?}"
-    )]
+    #[error("{place}: usage starts with {first:?}, but the pack's program is {program:?}")]
     UsageDisagrees {
-        action: String,
+        place: Place,
         first: String,
         program: String,
     },
-    #[error("{place} names effect {effect:?}, which `[effects]` does not declare")]
-    UndeclaredEffect { place: String, effect: String },
+    #[error("{place}: names effect {effect:?}, which `[effects]` does not declare")]
+    UndeclaredEffect { place: Place, effect: String },
 }
 
-/// One tool pack file, read and checked.
-#[derive(Debug)]
-pub(crate) struct Pack {
-    name: String,
-    version: u32,
-    program: String,
-    effects: BTreeMap<String, String>,
-    global: GlobalSpec,
-    shell: BTreeMap<String, ShellActionSpec>,
+/// One location in a tool pack file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Place {
+    Pack,
+    Effect(String),
+    GlobalOption(String),
+    Action(String),
+    ActionAdds(String),
+    ActionOption { action: String, option: String },
+    Operand { action: String, operand: String },
+}
+
+impl fmt::Display for Place {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pack => write!(formatter, "`pack`"),
+            Self::Effect(effect) => write!(formatter, "`[effects] {effect}`"),
+            Self::GlobalOption(option) => write!(formatter, "`[global] options.{option}`"),
+            Self::Action(action) => write!(formatter, "`[shell.{action}]`"),
+            Self::ActionAdds(action) => write!(formatter, "`[shell.{action}] adds`"),
+            Self::ActionOption { action, option } => {
+                write!(formatter, "`[shell.{action}] options.{option}`")
+            }
+            Self::Operand { action, operand } => {
+                write!(formatter, "`[shell.{action}] operands.{operand}`")
+            }
+        }
+    }
 }
 
 impl Pack {
@@ -73,11 +90,11 @@ impl Pack {
     pub(crate) fn load(path: &Path) -> Result<Self, PackError> {
         let text = std::fs::read_to_string(path).map_err(|error| PackError {
             origin: path.to_path_buf(),
-            refusal: PackRefusal::Unreadable(error.to_string()),
+            refusal: Box::new(PackRefusal::Unreadable(error.to_string())),
         })?;
         Self::parse(&text).map_err(|refusal| PackError {
             origin: path.to_path_buf(),
-            refusal,
+            refusal: Box::new(refusal),
         })
     }
 
@@ -89,25 +106,7 @@ impl Pack {
             Some(toml::Value::Integer(format)) if KNOWN_FORMATS.contains(format) => {}
             Some(other) => return Err(PackRefusal::UnknownFormat(other.to_string())),
         }
-        let file: PackFile = toml::from_str(text).map_err(malformed)?;
-
-        let version = match &file.version {
-            None => return Err(PackRefusal::MissingVersion),
-            Some(toml::Value::Integer(version)) if *version >= 1 => {
-                u32::try_from(*version).map_err(|_| PackRefusal::BadVersion(version.to_string()))?
-            }
-            Some(other) => return Err(PackRefusal::BadVersion(other.to_string())),
-        };
-        validate::check(&file)?;
-
-        Ok(Self {
-            name: file.pack,
-            version,
-            program: file.program,
-            effects: file.effects,
-            global: file.global,
-            shell: file.shell,
-        })
+        Self::read(toml::from_str(text).map_err(malformed)?)
     }
 }
 
@@ -143,149 +142,14 @@ operands.refspec = { like = "+*", adds = ["force_push"] }
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{MINIMAL, refusal, with};
+    use super::fixture::{refusal, with};
     use super::*;
 
-    #[test]
-    fn a_minimal_pack_loads_from_its_file() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let path = directory.path().join("git.pack.toml");
-        std::fs::write(&path, MINIMAL).expect("the pack file is written");
-
-        let pack = Pack::load(&path).expect("the pack loads");
-
-        assert_eq!(pack.name, "git");
-        assert_eq!(pack.version, 1);
-        assert_eq!(pack.program, "git");
-        assert_eq!(pack.effects.keys().collect::<Vec<_>>(), ["force_push"]);
-        assert_eq!(pack.shell.keys().collect::<Vec<_>>(), ["push"]);
-        assert!(pack.global.options.is_empty());
-    }
-
-    #[test]
-    fn every_nested_field_reads_into_its_own_place() {
-        use format::{OperandSpec, OptionSpec, OptionValue, WhenRule};
-
-        let text = r#"
-pack = "git"
-program = "git"
-format = 1
-version = 2
-
-[effects]
-force_push = "Replaces commits on a remote branch"
-network = "Contacts a remote repository"
-override_config = "Overrides git configuration for this one command"
-
-[global]
-options.config = { flag = "-c", value = "required", repeated = true, adds = ["override_config"] }
-options.directory = { flag = "-C", value = "many", anywhere = true }
-
-[shell.push]
-usage = "git [global options] push [options] [<remote> [<refspec>...]]"
-aliases = ["send"]
-adds = ["network"]
-options.lease = { flag = ["--force-with-lease"], value = "optional", like = ["*:*", "*"], when = [{ like = "*", adds = ["force_push"], removes = ["network"] }] }
-options.dry_run = { flag = ["-n", "--dry-run"], removes = ["force_push"] }
-operands.refspec = { like = "+*", adds = ["force_push"], removes = ["network"], when = [{ like = ["a", "b"] }], rest = true }
-"#;
-        let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
-        let config = OptionSpec {
-            flag: strings(&["-c"]),
-            value: OptionValue::Required,
-            repeated: true,
-            like: Vec::new(),
-            adds: strings(&["override_config"]),
-            removes: Vec::new(),
-            when: Vec::new(),
-            anywhere: false,
-        };
-        let directory = OptionSpec {
-            flag: strings(&["-C"]),
-            value: OptionValue::Many,
-            repeated: false,
-            like: Vec::new(),
-            adds: Vec::new(),
-            removes: Vec::new(),
-            when: Vec::new(),
-            anywhere: true,
-        };
-        let lease = OptionSpec {
-            flag: strings(&["--force-with-lease"]),
-            value: OptionValue::Optional,
-            repeated: false,
-            like: strings(&["*:*", "*"]),
-            adds: Vec::new(),
-            removes: Vec::new(),
-            when: vec![WhenRule {
-                like: strings(&["*"]),
-                adds: strings(&["force_push"]),
-                removes: strings(&["network"]),
-            }],
-            anywhere: false,
-        };
-        let dry_run = OptionSpec {
-            flag: strings(&["-n", "--dry-run"]),
-            value: OptionValue::None,
-            repeated: false,
-            like: Vec::new(),
-            adds: Vec::new(),
-            removes: strings(&["force_push"]),
-            when: Vec::new(),
-            anywhere: false,
-        };
-        let refspec = OperandSpec {
-            like: strings(&["+*"]),
-            adds: strings(&["force_push"]),
-            removes: strings(&["network"]),
-            when: vec![WhenRule {
-                like: strings(&["a", "b"]),
-                adds: Vec::new(),
-                removes: Vec::new(),
-            }],
-            rest: true,
-        };
-        let push = ShellActionSpec {
-            usage: "git [global options] push [options] [<remote> [<refspec>...]]".to_string(),
-            aliases: strings(&["send"]),
-            adds: strings(&["network"]),
-            options: BTreeMap::from([
-                ("dry_run".to_string(), dry_run),
-                ("lease".to_string(), lease),
-            ]),
-            operands: BTreeMap::from([("refspec".to_string(), refspec)]),
-        };
-
-        let pack = Pack::parse(text).expect("the pack loads");
-
-        assert_eq!(pack.version, 2);
-        assert_eq!(
-            pack.effects,
-            BTreeMap::from([
-                (
-                    "force_push".to_string(),
-                    "Replaces commits on a remote branch".to_string()
-                ),
-                (
-                    "network".to_string(),
-                    "Contacts a remote repository".to_string()
-                ),
-                (
-                    "override_config".to_string(),
-                    "Overrides git configuration for this one command".to_string()
-                ),
-            ])
-        );
-        assert_eq!(
-            pack.global,
-            GlobalSpec {
-                options: BTreeMap::from([
-                    ("config".to_string(), config),
-                    ("directory".to_string(), directory),
-                ]),
-            }
-        );
-        assert_eq!(pack.shell, BTreeMap::from([("push".to_string(), push)]));
+    fn in_push(option: &str) -> Place {
+        Place::ActionOption {
+            action: "push".to_string(),
+            option: option.to_string(),
+        }
     }
 
     #[test]
@@ -308,7 +172,7 @@ operands.refspec = { like = "+*", adds = ["force_push"], removes = ["network"], 
         let error = Pack::load(&directory.path().join("absent.pack.toml"))
             .expect_err("the pack is refused");
 
-        assert!(matches!(error.refusal, PackRefusal::Unreadable(_)));
+        assert!(matches!(*error.refusal, PackRefusal::Unreadable(_)));
     }
 
     #[test]
@@ -395,5 +259,162 @@ operands.refspec = { like = "+*", adds = ["force_push"], removes = ["network"], 
                 "version = {version}"
             );
         }
+    }
+
+    #[test]
+    fn a_pack_name_that_is_not_an_identifier_is_refused() {
+        for name in ["git-lfs", "1git", "in", ""] {
+            assert_eq!(
+                refusal(&with("pack = \"git\"", &format!("pack = {name:?}"))),
+                PackRefusal::NotIdentifier {
+                    place: Place::Pack,
+                    name: name.to_string(),
+                },
+                "pack = {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_name_that_is_not_an_identifier_is_refused() {
+        assert_eq!(
+            refusal(&with("[shell.push]", "[shell.\"force-push\"]")),
+            PackRefusal::NotIdentifier {
+                place: Place::Action("force-push".to_string()),
+                name: "force-push".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_effect_name_that_is_not_an_identifier_is_refused() {
+        assert_eq!(
+            refusal(&with("force_push = \"", "\"force push\" = \"")),
+            PackRefusal::NotIdentifier {
+                place: Place::Effect("force push".to_string()),
+                name: "force push".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_option_or_operand_name_that_is_not_an_identifier_is_refused() {
+        assert_eq!(
+            refusal(&with("options.dry_run", "options.dry-run")),
+            PackRefusal::NotIdentifier {
+                place: in_push("dry-run"),
+                name: "dry-run".to_string(),
+            }
+        );
+        assert_eq!(
+            refusal(&with("operands.refspec", "operands.\"ref spec\"")),
+            PackRefusal::NotIdentifier {
+                place: Place::Operand {
+                    action: "push".to_string(),
+                    operand: "ref spec".to_string(),
+                },
+                name: "ref spec".to_string(),
+            }
+        );
+        let global = with(
+            "[shell.push]",
+            "[global]\noptions.\"no-pager\" = { flag = \"-P\" }\n\n[shell.push]",
+        );
+        assert_eq!(
+            refusal(&global),
+            PackRefusal::NotIdentifier {
+                place: Place::GlobalOption("no-pager".to_string()),
+                name: "no-pager".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_program_that_is_a_path_is_refused() {
+        assert_eq!(
+            refusal(&with("program = \"git\"", "program = \"/usr/bin/git\"")),
+            PackRefusal::BadProgram("/usr/bin/git".to_string())
+        );
+    }
+
+    #[test]
+    fn a_usage_that_does_not_start_with_the_program_is_refused() {
+        assert_eq!(
+            refusal(&with("usage = \"git ", "usage = \"hub ")),
+            PackRefusal::UsageDisagrees {
+                place: Place::Action("push".to_string()),
+                first: "hub".to_string(),
+                program: "git".to_string(),
+            }
+        );
+        assert!(matches!(
+            refusal(&with("usage = \"git [-C", "usage = \"  [-C")),
+            PackRefusal::UsageDisagrees { first, .. } if first == "[-C"
+        ));
+    }
+
+    #[test]
+    fn an_effect_that_effects_does_not_declare_is_refused() {
+        let undeclared = |place, effect: &str| PackRefusal::UndeclaredEffect {
+            place,
+            effect: effect.to_string(),
+        };
+        let refspec = || Place::Operand {
+            action: "push".to_string(),
+            operand: "refspec".to_string(),
+        };
+        let when = |key: &str, effect: &str| {
+            let entry =
+                format!("like = \"+*\", when = [{{ like = \"*\", {key} = [\"{effect}\"] }}], adds");
+            with("like = \"+*\", adds", &entry)
+        };
+
+        assert_eq!(
+            refusal(&with(
+                "removes = [\"force_push\"]",
+                "removes = [\"forced\"]"
+            )),
+            undeclared(in_push("dry_run"), "forced")
+        );
+        assert_eq!(refusal(&when("adds", "x")), undeclared(refspec(), "x"));
+        assert_eq!(refusal(&when("removes", "y")), undeclared(refspec(), "y"));
+        assert_eq!(
+            refusal(&with(
+                "options.force",
+                "adds = [\"network\"]\noptions.force"
+            )),
+            undeclared(Place::ActionAdds("push".to_string()), "network")
+        );
+        let global = with(
+            "[shell.push]",
+            "[global]\noptions.pager = { flag = \"-p\", adds = [\"paged\"] }\n\n[shell.push]",
+        );
+        assert_eq!(
+            refusal(&global),
+            undeclared(Place::GlobalOption("pager".to_string()), "paged")
+        );
+    }
+
+    #[test]
+    fn an_option_inside_a_shell_action_is_named_one_way_in_every_refusal() {
+        let named = refusal(&with("options.dry_run", "options.dry-run")).to_string();
+        let effect = refusal(&with(
+            "removes = [\"force_push\"]",
+            "removes = [\"forced\"]",
+        ))
+        .to_string();
+
+        assert_eq!(
+            in_push("dry_run").to_string(),
+            "`[shell.push] options.dry_run`"
+        );
+        assert!(
+            named.starts_with("`[shell.push] options.dry-run`: "),
+            "{named}"
+        );
+        assert!(
+            effect.starts_with("`[shell.push] options.dry_run`: "),
+            "{effect}"
+        );
     }
 }
