@@ -417,4 +417,78 @@ mod tests {
             "{effect}"
         );
     }
+
+    const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/packs");
+    const EXPECT: &str = "# expect:";
+
+    fn expected_message(text: &str) -> Option<String> {
+        let lines: Vec<&str> = text
+            .lines()
+            .map_while(|line| line.strip_prefix(EXPECT))
+            .map(str::trim)
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    fn operator_message(error: &PackError, path: &Path) -> String {
+        let message = error
+            .to_string()
+            .replace(&path.display().to_string(), "<file>");
+        message
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn corpus(kind: &str) -> Vec<PathBuf> {
+        let directory = Path::new(CORPUS).join(kind);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
+            .map(|entry| entry.expect("a corpus entry").path())
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "{} holds no pack", directory.display());
+        paths
+    }
+
+    #[test]
+    fn every_pack_in_the_corpus_loads_or_is_refused_as_it_expects() {
+        let mut failures = Vec::new();
+        for (kind, valid) in [("valid", true), ("invalid", false)] {
+            for path in corpus(kind) {
+                let file = format!("{kind}/{}", path.file_name().unwrap_or_default().display());
+                if !file.ends_with(".pack.toml") {
+                    failures.push(format!("{file}: is not named `*.pack.toml`"));
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("the corpus file reads");
+                let leading = text.lines().take_while(|line| line.starts_with(EXPECT));
+                if text
+                    .lines()
+                    .skip(leading.count())
+                    .any(|line| line.starts_with(EXPECT))
+                {
+                    failures.push(format!("{file}: has a `# expect:` line below the top"));
+                    continue;
+                }
+                let expected = expected_message(&text);
+                let loaded = Pack::load(&path).map_err(|error| operator_message(&error, &path));
+                let failure = match (valid, expected, loaded) {
+                    (true, None, Ok(_)) => continue,
+                    (true, Some(_), _) => "a valid pack carries a `# expect:` line".to_string(),
+                    (true, None, Err(message)) => format!("refused:\n{message}"),
+                    (false, None, _) => "an invalid pack has no `# expect:` line".to_string(),
+                    (false, Some(_), Ok(_)) => "loaded, but expected a refusal".to_string(),
+                    (false, Some(expected), Err(message)) if expected == message => continue,
+                    (false, Some(expected), Err(message)) => {
+                        format!("expected:\n{expected}\nbut got:\n{message}")
+                    }
+                };
+                failures.push(format!("{file}: {failure}"));
+            }
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+    }
 }
