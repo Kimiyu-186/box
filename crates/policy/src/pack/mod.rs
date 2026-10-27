@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn every_nested_field_reads_into_its_own_place() {
-        use format::{Flags, OperandSpec, OptionSpec, OptionValue, Patterns, WhenRule};
+        use format::{OperandSpec, OptionSpec, OptionValue, WhenRule};
 
         let text = r#"
 pack = "git"
@@ -191,55 +191,55 @@ operands.refspec = { like = "+*", adds = ["force_push"], removes = ["network"], 
 "#;
         let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
         let config = OptionSpec {
-            flag: Flags::One("-c".to_string()),
+            flag: strings(&["-c"]),
             value: OptionValue::Required,
             repeated: true,
-            like: None,
+            like: Vec::new(),
             adds: strings(&["override_config"]),
             removes: Vec::new(),
             when: Vec::new(),
             anywhere: false,
         };
         let directory = OptionSpec {
-            flag: Flags::One("-C".to_string()),
+            flag: strings(&["-C"]),
             value: OptionValue::Many,
             repeated: false,
-            like: None,
+            like: Vec::new(),
             adds: Vec::new(),
             removes: Vec::new(),
             when: Vec::new(),
             anywhere: true,
         };
         let lease = OptionSpec {
-            flag: Flags::Many(strings(&["--force-with-lease"])),
+            flag: strings(&["--force-with-lease"]),
             value: OptionValue::Optional,
             repeated: false,
-            like: Some(Patterns::Many(strings(&["*:*", "*"]))),
+            like: strings(&["*:*", "*"]),
             adds: Vec::new(),
             removes: Vec::new(),
             when: vec![WhenRule {
-                like: Patterns::One("*".to_string()),
+                like: strings(&["*"]),
                 adds: strings(&["force_push"]),
                 removes: strings(&["network"]),
             }],
             anywhere: false,
         };
         let dry_run = OptionSpec {
-            flag: Flags::Many(strings(&["-n", "--dry-run"])),
+            flag: strings(&["-n", "--dry-run"]),
             value: OptionValue::None,
             repeated: false,
-            like: None,
+            like: Vec::new(),
             adds: Vec::new(),
             removes: strings(&["force_push"]),
             when: Vec::new(),
             anywhere: false,
         };
         let refspec = OperandSpec {
-            like: Some(Patterns::One("+*".to_string())),
+            like: strings(&["+*"]),
             adds: strings(&["force_push"]),
             removes: strings(&["network"]),
             when: vec![WhenRule {
-                like: Patterns::Many(strings(&["a", "b"])),
+                like: strings(&["a", "b"]),
                 adds: Vec::new(),
                 removes: Vec::new(),
             }],

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// One `*.pack.toml` document.
 #[derive(Debug, Deserialize)]
@@ -53,13 +53,14 @@ pub(crate) struct ShellActionSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OptionSpec {
-    pub(crate) flag: Flags,
+    #[serde(deserialize_with = "one_or_many")]
+    pub(crate) flag: Vec<String>,
     #[serde(default)]
     pub(crate) value: OptionValue,
     #[serde(default)]
     pub(crate) repeated: bool,
-    #[serde(default)]
-    pub(crate) like: Option<Patterns>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub(crate) like: Vec<String>,
     #[serde(default)]
     pub(crate) adds: Vec<String>,
     #[serde(default)]
@@ -75,8 +76,8 @@ pub(crate) struct OptionSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperandSpec {
-    #[serde(default)]
-    pub(crate) like: Option<Patterns>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub(crate) like: Vec<String>,
     #[serde(default)]
     pub(crate) adds: Vec<String>,
     #[serde(default)]
@@ -92,29 +93,26 @@ pub(crate) struct OperandSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WhenRule {
-    pub(crate) like: Patterns,
+    #[serde(deserialize_with = "one_or_many")]
+    pub(crate) like: Vec<String>,
     #[serde(default)]
     pub(crate) adds: Vec<String>,
     #[serde(default)]
     pub(crate) removes: Vec<String>,
 }
 
-/// One pattern or several.
-#[cfg_attr(test, derive(PartialEq))]
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Patterns {
-    One(String),
-    Many(Vec<String>),
-}
-
-/// One flag spelling or several.
-#[cfg_attr(test, derive(PartialEq))]
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Flags {
-    One(String),
-    Many(Vec<String>),
+/// Read one string or a list of strings as a list.
+fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(value) => vec![value],
+        OneOrMany::Many(values) => values,
+    })
 }
 
 /// Whether an option takes a value.
